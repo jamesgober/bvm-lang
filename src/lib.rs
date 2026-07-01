@@ -113,7 +113,7 @@ mod tests {
     fn test_public_surface_runs_end_to_end() {
         let mut chunk = Chunk::new();
         let k = chunk.constant(Value::float(1.5)).expect("pool has room");
-        let _ = chunk.emit(Op::LoadConst { dst: 0, konst: k });
+        let _ = chunk.emit(Op::LoadConst { dst: 0, index: k });
         let _ = chunk.emit(Op::LoadInt { dst: 1, val: 2 });
         let _ = chunk.emit(Op::Add {
             dst: 0,

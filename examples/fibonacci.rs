@@ -39,9 +39,7 @@ fn fibonacci(n: i32) -> Chunk {
         lhs: 2,
         rhs: 4,
     }); // i += 1
-    chunk.emit(Op::Jump {
-        target: loop_top as u32,
-    });
+    chunk.emit(Op::Jump { target: loop_top });
 
     let exit = chunk.emit(Op::Return { src: 0 });
     // Now that the landing address is known, fix up the forward exit branch.
@@ -49,7 +47,7 @@ fn fibonacci(n: i32) -> Chunk {
         exit_branch,
         Op::JumpIfFalse {
             cond: 5,
-            target: exit as u32,
+            target: exit,
         },
     );
     assert!(patched, "exit branch address is valid");

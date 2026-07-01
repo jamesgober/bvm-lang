@@ -12,7 +12,7 @@
 //! of an `if`, the back-edge of a loop — are written with a placeholder target
 //! and later fixed up with [`patch`](Chunk::patch) once the destination is known.
 
-use crate::Op;
+use crate::{Addr, Op};
 use alloc::vec::Vec;
 use value_lang::Value;
 
@@ -50,10 +50,12 @@ impl Chunk {
 
     /// Append an instruction and return its address.
     ///
-    /// The returned address is the index the instruction occupies in the code
-    /// array — the same value a branch uses as its target, and the argument
-    /// [`patch`](Chunk::patch) takes to rewrite this slot later. Emitting widens
-    /// the register file to include every register the instruction names.
+    /// The returned [`Addr`] is where the instruction sits in the code array —
+    /// the same value a branch uses as its target, and the argument
+    /// [`patch`](Chunk::patch) takes to rewrite this slot later. Returning an
+    /// `Addr` lets an emitted address feed straight back into a `Jump`/`patch`
+    /// without a cast. Emitting widens the register file to include every
+    /// register the instruction names.
     ///
     /// # Examples
     ///
@@ -66,13 +68,16 @@ impl Chunk {
     /// // Naming register 0 sized the file to one slot.
     /// assert_eq!(chunk.registers(), 1);
     /// ```
-    pub fn emit(&mut self, op: Op) -> usize {
+    pub fn emit(&mut self, op: Op) -> Addr {
         if let Some(top) = max_register(op) {
             // `top` is the highest index named; the file must hold `top + 1`
             // slots. Saturating keeps the arithmetic total even at `u16::MAX`.
             self.registers = self.registers.max(top.saturating_add(1));
         }
-        let addr = self.code.len();
+        // A chunk cannot hold more than `u32::MAX` instructions in practice
+        // (the code alone would exceed addressable memory), so the address
+        // always fits an `Addr`.
+        let addr = self.code.len() as Addr;
         self.code.push(op);
         addr
     }
@@ -98,7 +103,7 @@ impl Chunk {
     ///
     /// let mut chunk = Chunk::new();
     /// let k = chunk.constant(Value::float(3.5)).expect("pool has room");
-    /// chunk.emit(Op::LoadConst { dst: 0, konst: k });
+    /// chunk.emit(Op::LoadConst { dst: 0, index: k });
     /// ```
     #[must_use = "the returned index is how the constant is later loaded"]
     pub fn constant(&mut self, value: Value) -> Option<u16> {
@@ -123,13 +128,13 @@ impl Chunk {
     /// let mut chunk = Chunk::new();
     /// // Emit a forward branch whose target is not yet known.
     /// let jump = chunk.emit(Op::Jump { target: 0 });
-    /// chunk.emit(Op::LoadInt { dst: 0, val: 1 });
-    /// let landing = chunk.len() as u32;
-    /// // Now patch the branch to skip the load.
+    /// chunk.emit(Op::LoadInt { dst: 0, val: 1 }); // skipped by the jump
+    /// let landing = chunk.emit(Op::Halt);         // where the jump should land
+    /// // Now patch the branch to skip the load. `landing` is already an `Addr`.
     /// assert!(chunk.patch(jump, Op::Jump { target: landing }));
     /// ```
-    pub fn patch(&mut self, addr: usize, op: Op) -> bool {
-        let Some(slot) = self.code.get_mut(addr) else {
+    pub fn patch(&mut self, addr: Addr, op: Op) -> bool {
+        let Some(slot) = self.code.get_mut(addr as usize) else {
             return false;
         };
         *slot = op;
@@ -247,7 +252,7 @@ mod tests {
         let mut c = Chunk::new();
         let at = c.emit(Op::Jump { target: 0 });
         assert!(c.patch(at, Op::Jump { target: 7 }));
-        assert_eq!(c.code()[at], Op::Jump { target: 7 });
+        assert_eq!(c.code()[at as usize], Op::Jump { target: 7 });
     }
 
     #[test]

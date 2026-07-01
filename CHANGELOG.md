@@ -21,6 +21,23 @@
 
 ---
 
+## [1.0.0] - 2026-07-01
+
+**API freeze.** The public surface is now stable under Semantic Versioning &mdash; no breaking change until `2.0.0`. See [`docs/STABILITY.md`](docs/STABILITY.md) for the frozen surface and the compatibility promise. A pre-freeze adversarial review of the API produced the two breaking changes below; everything else is unchanged from `0.2.5`.
+
+### Changed
+
+- **Breaking:** `Chunk::emit` now returns `Addr` (`u32`) instead of `usize`, and `Chunk::patch` now takes `addr: Addr` instead of `usize`. An emitted address feeds straight into a `Jump`/`patch` target with no cast. Migration: drop the `as u32` on back-patched branch targets; if you indexed `code()` with an emitted address, add `as usize`.
+- **Breaking:** the `Op::LoadConst` field `konst` was renamed to `index`. This is also the `serde` wire name. Migration: rename the field in `Op::LoadConst { .. }` literals and patterns.
+- Added `#[must_use]` to `Vm::run` &mdash; discarding a successful run's `Value` is almost always a mistake.
+
+### Added
+
+- [`docs/STABILITY.md`](docs/STABILITY.md) &mdash; the frozen public surface, what may still change additively within `1.x` (new `Op`/`VmError` variants, new methods), the `serde` wire-format promise, and the MSRV policy.
+- `docs/API.md` marked stable.
+
+---
+
 ## [0.2.5] - 2026-07-01
 
 Crate rename: **`vm-lang` &rarr; `bvm-lang`.** The name `vm-lang` was already taken on crates.io, so the crate is published as `bvm-lang` and the library imports as `bvm_lang`. No functional change from `0.2.0` &mdash; the API, semantics, and behavior are identical.
@@ -67,7 +84,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/jamesgober/bvm-lang/compare/v0.2.5...v1.0.0
 [0.2.5]: https://github.com/jamesgober/bvm-lang/compare/v0.2.0...v0.2.5
 [0.2.0]: https://github.com/jamesgober/bvm-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/bvm-lang/releases/tag/v0.1.0

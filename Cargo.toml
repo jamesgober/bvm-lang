@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bvm-lang"
-version = "0.2.5"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

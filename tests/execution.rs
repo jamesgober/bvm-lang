@@ -85,15 +85,13 @@ fn test_factorial_loop() {
         lhs: 1,
         rhs: 3,
     });
-    let _ = chunk.emit(Op::Jump {
-        target: cond as u32,
-    });
+    let _ = chunk.emit(Op::Jump { target: cond });
     let exit = chunk.emit(Op::Return { src: 0 });
     assert!(chunk.patch(
         exit_branch,
         Op::JumpIfFalse {
             cond: 4,
-            target: exit as u32,
+            target: exit,
         },
     ));
 
@@ -106,7 +104,7 @@ fn test_float_and_int_mixed_arithmetic() {
     let chunk = assemble(
         &[
             Op::LoadInt { dst: 0, val: 1 },
-            Op::LoadConst { dst: 1, konst: 0 },
+            Op::LoadConst { dst: 1, index: 0 },
             Op::LoadInt { dst: 2, val: 2 },
             Op::Mul {
                 dst: 1,

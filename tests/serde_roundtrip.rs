@@ -15,7 +15,7 @@ use bvm_lang::{Chunk, Op, Value, Vm, VmError};
 fn test_chunk_roundtrips_and_runs_identically() {
     let mut chunk = Chunk::new();
     let k = chunk.constant(Value::float(2.5)).unwrap();
-    let _ = chunk.emit(Op::LoadConst { dst: 0, konst: k });
+    let _ = chunk.emit(Op::LoadConst { dst: 0, index: k });
     let _ = chunk.emit(Op::LoadInt { dst: 1, val: 4 });
     let _ = chunk.emit(Op::Mul {
         dst: 0,

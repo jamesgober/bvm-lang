@@ -14,7 +14,7 @@
 </div>
 <br>
 
-> **Status: pre-1.0 (`v0.2.0`).** The execution core is implemented and documented here. The public surface is finalized across the 0.x series and frozen at `1.0.0`; see [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> **Status: stable (`v1.0.0`).** The public surface documented here is **frozen** under Semantic Versioning: no breaking change until a `2.0.0`. See [`STABILITY.md`](./STABILITY.md) for the exact frozen surface and the compatibility promise.
 
 `bvm-lang` is a register-based bytecode virtual machine. You assemble a program as a [`Chunk`](#chunk) of [`Op`](#op) instructions over a constant pool, then execute it with a [`Vm`](#vm), which returns a [`Value`](#value). Every register holds one `Value` &mdash; the eight-byte NaN-boxed type from [`value-lang`](https://docs.rs/value-lang). Bytecode is treated as untrusted input: a malformed program yields a typed [`VmError`](#vmerror), never a panic, and the crate forbids `unsafe`.
 
@@ -180,7 +180,7 @@ Three aliases name the roles operands play. They document intent at call sites; 
 use bvm_lang::{Addr, Const, Reg};
 
 let dst: Reg = 0;
-let konst: Const = 3;
+let index: Const = 3;
 let target: Addr = 12;
 ```
 
@@ -206,7 +206,7 @@ assert_eq!(chunk.registers(), 0);
 
 #### Building
 
-**`emit(&mut self, op: Op) -> usize`** &mdash; append `op` and return its address (its index in the code array). That address is what a branch targets and what [`patch`](#patch) rewrites.
+**`emit(&mut self, op: Op) -> Addr`** &mdash; append `op` and return its address (its index in the code array). The address is an [`Addr`](#type-aliases), so it feeds straight into a `Jump`/`patch` target with no cast. That address is what a branch targets and what [`patch`](#patch) rewrites.
 
 ```rust
 use bvm_lang::{Chunk, Op};
@@ -224,10 +224,10 @@ use bvm_lang::{Chunk, Op, Value};
 
 let mut chunk = Chunk::new();
 let k = chunk.constant(Value::float(3.5)).expect("pool has room");
-chunk.emit(Op::LoadConst { dst: 0, konst: k });
+chunk.emit(Op::LoadConst { dst: 0, index: k });
 ```
 
-**`patch(&mut self, addr: usize, op: Op) -> bool`** &mdash; overwrite the instruction at `addr`, typically to fill in a forward branch whose target was unknown when it was first emitted. Returns `true` if `addr` was in range. The register file is re-derived after a patch.
+**`patch(&mut self, addr: Addr, op: Op) -> bool`** &mdash; overwrite the instruction at `addr`, typically to fill in a forward branch whose target was unknown when it was first emitted. Returns `true` if `addr` was in range. The register file is re-derived after a patch.
 
 The forward-branch pattern &mdash; emit a placeholder, remember its address, patch it once the landing is known:
 
@@ -238,8 +238,7 @@ let mut chunk = Chunk::new();
 chunk.emit(Op::LoadBool { dst: 0, val: false });
 let branch = chunk.emit(Op::JumpIfFalse { cond: 0, target: 0 }); // target unknown
 chunk.emit(Op::LoadInt { dst: 1, val: 1 }); // skipped when r0 is false
-let landing = chunk.len() as u32;
-chunk.emit(Op::Return { src: 1 });
+let landing = chunk.emit(Op::Return { src: 1 }); // emit returns the landing address
 assert!(chunk.patch(branch, Op::JumpIfFalse { cond: 0, target: landing }));
 ```
 
@@ -368,7 +367,7 @@ All operands are register indices unless noted. `dst` is written; `lhs`/`rhs`/`s
 | Instruction | Effect |
 | --- | --- |
 | `Move { dst, src }` | `dst = src` |
-| `LoadConst { dst, konst }` | `dst = constants[konst]` |
+| `LoadConst { dst, index }` | `dst = constants[index]` |
 | `LoadNil { dst }` | `dst = nil` |
 | `LoadBool { dst, val }` | `dst = val` (inline `bool`) |
 | `LoadInt { dst, val }` | `dst = val` (inline `i32`) |
@@ -452,7 +451,7 @@ use bvm_lang::{Chunk, Op, Value, Vm};
 let mut chunk = Chunk::new();
 let half = chunk.constant(Value::float(0.5)).unwrap();
 chunk.emit(Op::LoadInt { dst: 0, val: 1 });
-chunk.emit(Op::LoadConst { dst: 1, konst: half });
+chunk.emit(Op::LoadConst { dst: 1, index: half });
 chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 });
 chunk.emit(Op::Return { src: 0 });
 assert_eq!(Vm::new().run(&chunk).unwrap().as_float(), Some(1.5));
@@ -485,9 +484,9 @@ let top = chunk.emit(Op::Le { dst: 4, lhs: 1, rhs: 2 });
 let exit_branch = chunk.emit(Op::JumpIfFalse { cond: 4, target: 0 });
 chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 }); // sum += i
 chunk.emit(Op::Add { dst: 1, lhs: 1, rhs: 3 }); // i += 1
-chunk.emit(Op::Jump { target: top as u32 });    // back-edge
+chunk.emit(Op::Jump { target: top });           // back-edge (top is already an Addr)
 let exit = chunk.emit(Op::Return { src: 0 });
-chunk.patch(exit_branch, Op::JumpIfFalse { cond: 4, target: exit as u32 });
+chunk.patch(exit_branch, Op::JumpIfFalse { cond: 4, target: exit });
 
 assert_eq!(Vm::new().run(&chunk).unwrap().as_int(), Some(15));
 ```
@@ -530,6 +529,8 @@ With `serde`, a chunk round-trips through any serde format:
 let json = serde_json::to_string(&chunk)?;
 let restored: bvm_lang::Chunk = serde_json::from_str(&json)?;
 ```
+
+The serialized form uses serde's default externally-tagged encoding, so the `Op` variant names and field names (`dst`, `src`, `lhs`, `rhs`, `index`, `val`, `target`, `cond`) are part of the format. That representation is stable within the `1.x` series for the instructions available at serialization time; a newer instruction added in a later `1.x` will not deserialize on an older version. See [`STABILITY.md`](./STABILITY.md).
 
 <hr>
 <br>

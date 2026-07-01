@@ -32,7 +32,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition).
     </p>
     <blockquote>
-        <strong>Status: pre-1.0, in active development (<code>v0.2.5</code>).</strong> The execution core is implemented; see <a href="./docs/API.md"><code>docs/API.md</code></a>. The public API is finalized across the 0.x series and frozen at <code>1.0.0</code>. See <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> and <a href="./dev/ROADMAP.md"><code>dev/ROADMAP.md</code></a>.
+        <strong>Status: stable (<code>v1.0.0</code>).</strong> The public API is <strong>frozen</strong> under Semantic Versioning &mdash; no breaking change until <code>2.0.0</code>. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for the frozen surface and the compatibility promise, and <a href="./docs/API.md"><code>docs/API.md</code></a> for the full reference.
     </blockquote>
 </div>
 
@@ -71,7 +71,7 @@ Numbers are indicative and hardware-dependent; run `cargo bench` to reproduce on
 
 ```toml
 [dependencies]
-bvm-lang = "0.2"
+bvm-lang = "1.0"
 ```
 
 Or:
@@ -84,7 +84,7 @@ To persist compiled bytecode, enable `serde`:
 
 ```toml
 [dependencies]
-bvm-lang = { version = "0.2", features = ["serde"] }
+bvm-lang = { version = "1.0", features = ["serde"] }
 ```
 
 <br>

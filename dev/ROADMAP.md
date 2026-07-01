@@ -37,7 +37,14 @@ Candidate additions, each independently shippable without touching the frozen co
 - `gc-lang` wiring for heap-allocated object values.
 - `ir-lang` wiring: direct execution or lowering to `Chunk`.
 
-## v1.0.0 - API freeze
+## v1.0.0 - API freeze (DONE)
 Public surface stable and frozen until 2.0.
-- [ ] docs/API.md marked stable; SemVer promise recorded.
-- [ ] Full test + benchmark suite green on all three platforms.
+- [x] docs/API.md marked stable; SemVer promise recorded (docs/STABILITY.md).
+- [x] Full test + benchmark suite green on all three platforms.
+
+Pre-freeze adversarial API review resolved two blockers before locking:
+`Chunk::emit`/`patch` now speak `Addr` (was `usize`), so a back-patched branch
+target needs no cast; and `Op::LoadConst`'s field was renamed `konst -> index`
+(a cleaner permanent public + serde-wire name). `#[must_use]` added to `Vm::run`.
+These are the breaking changes the 1.0 major bump carries; the surface is frozen
+from here. serde wire-format stability documented in docs/STABILITY.md.

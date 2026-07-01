@@ -65,13 +65,13 @@ fn loop_sum_chunk(limit: i32) -> Chunk {
         lhs: 1,
         rhs: 3,
     });
-    c.emit(Op::Jump { target: top as u32 });
+    c.emit(Op::Jump { target: top });
     let exit = c.emit(Op::Return { src: 0 });
     let _ = c.patch(
         exit_branch,
         Op::JumpIfFalse {
             cond: 4,
-            target: exit as u32,
+            target: exit,
         },
     );
     c

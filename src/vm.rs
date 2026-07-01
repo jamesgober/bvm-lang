@@ -103,6 +103,7 @@ impl Vm {
     /// let mut vm = Vm::new();
     /// assert_eq!(vm.run(&chunk), Err(VmError::DivideByZero));
     /// ```
+    #[must_use = "the run's result value is the point of executing the chunk"]
     pub fn run(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
         self.registers.clear();
         self.registers
@@ -144,10 +145,10 @@ impl Vm {
                     let v = self.get(src)?;
                     self.set(dst, v)?;
                 }
-                Op::LoadConst { dst, konst } => {
+                Op::LoadConst { dst, index } => {
                     let v = *constants
-                        .get(konst as usize)
-                        .ok_or(VmError::BadConstant(konst))?;
+                        .get(index as usize)
+                        .ok_or(VmError::BadConstant(index))?;
                     self.set(dst, v)?;
                 }
                 Op::LoadNil { dst } => self.set(dst, Value::nil())?,
@@ -268,7 +269,7 @@ mod tests {
     #[test]
     fn test_load_const_reads_pool() {
         let out = run(
-            &[Op::LoadConst { dst: 0, konst: 0 }, Op::Return { src: 0 }],
+            &[Op::LoadConst { dst: 0, index: 0 }, Op::Return { src: 0 }],
             &[Value::float(2.5)],
         )
         .unwrap();
@@ -350,15 +351,13 @@ mod tests {
             lhs: 1,
             rhs: 3,
         });
-        let _ = chunk.emit(Op::Jump {
-            target: cond_at as u32,
-        });
+        let _ = chunk.emit(Op::Jump { target: cond_at });
         let exit = chunk.emit(Op::Return { src: 0 });
         assert!(chunk.patch(
             exit_branch,
             Op::JumpIfFalse {
                 cond: 4,
-                target: exit as u32,
+                target: exit,
             },
         ));
 
@@ -382,7 +381,7 @@ mod tests {
     fn test_bad_constant_index_errors() {
         assert_eq!(
             run(
-                &[Op::LoadConst { dst: 0, konst: 3 }, Op::Return { src: 0 }],
+                &[Op::LoadConst { dst: 0, index: 3 }, Op::Return { src: 0 }],
                 &[]
             ),
             Err(VmError::BadConstant(3))

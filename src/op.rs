@@ -56,12 +56,12 @@ pub enum Op {
         /// Source register.
         src: Reg,
     },
-    /// Load the constant at pool index `konst` into `dst`.
+    /// Load the constant at pool position `index` into `dst`.
     LoadConst {
         /// Destination register.
         dst: Reg,
-        /// Constant-pool index.
-        konst: Const,
+        /// Constant-pool index (see [`Chunk::constant`](crate::Chunk::constant)).
+        index: Const,
     },
     /// Load `nil` into `dst`.
     LoadNil {
