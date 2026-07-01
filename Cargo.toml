@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "vm-lang"
-version = "0.1.0"
+version = "0.2.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -19,10 +19,10 @@ readme = "README.md"
 description = "Bytecode VM and interpreter loop."
 
 # Keywords (5 max)
-keywords = [language,runtime,vm,bytecode]
+keywords = ["language", "runtime", "vm", "bytecode"]
 
 # Categories
-categories = [development-tools,compilers]
+categories = ["development-tools", "compilers"]
 
 # Links
 homepage      = "https://github.com/jamesgober/vm-lang"
@@ -45,22 +45,28 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = []
-# Serialization support.
-serde = ["dep:serde"]
+std = ["value-lang/std"]
+# Serialization support for bytecode (`Op`, `Chunk`) and `Value`.
+serde = ["dep:serde", "value-lang/serde"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
+# Runtime operand type. `Value` is the eight-byte NaN-boxed value every
+# instruction reads and writes; the VM speaks the same value as the rest of the
+# language-construction family. Pinned to the published 1.x.
+value-lang = { version = "1", default-features = false }
 serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
 
 
 # DEV DEPENDENCIES
 # #################################
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
-proptest  = "1"
+criterion  = { version = "0.5", features = ["html_reports"] }
+proptest   = "1"
+# Concrete format for the `serde` round-trip tests (bytecode persistence).
+serde_json = "1"
 
 [target.'cfg(loom)'.dev-dependencies]
 loom = "0.7"
