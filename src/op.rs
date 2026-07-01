@@ -1,6 +1,6 @@
 //! The instruction set executed by the VM.
 //!
-//! `vm-lang` is a *register machine*: every instruction names the registers it
+//! `bvm-lang` is a *register machine*: every instruction names the registers it
 //! reads and writes explicitly, rather than pushing and popping an operand stack.
 //! A register machine issues far fewer instructions for the same work — a
 //! three-address `Add { dst, lhs, rhs }` replaces a push/push/add/pop sequence —

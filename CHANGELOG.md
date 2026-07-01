@@ -3,7 +3,7 @@
     <br><b>CHANGELOG</b>
 </h1>
 <p>
-  All notable changes to <code>vm-lang</code> will be documented in this file. The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
+  All notable changes to <code>bvm-lang</code> will be documented in this file. The format is based on <a href="https://keepachangelog.com/en/1.1.0/">Keep a Changelog</a>,
   and this project adheres to <a href="https://semver.org/spec/v2.0.0.html/">Semantic Versioning</a>.
 </p>
 
@@ -18,6 +18,17 @@
 ### Fixed
 
 ### Security
+
+---
+
+## [0.2.5] - 2026-07-01
+
+Crate rename: **`vm-lang` &rarr; `bvm-lang`.** The name `vm-lang` was already taken on crates.io, so the crate is published as `bvm-lang` and the library imports as `bvm_lang`. No functional change from `0.2.0` &mdash; the API, semantics, and behavior are identical.
+
+### Changed
+
+- Renamed the package from `vm-lang` to `bvm-lang` and the library from `vm_lang` to `bvm_lang`. Update imports to `use bvm_lang::...`.
+- Updated crate metadata, README, `docs/API.md`, and examples to the new name.
 
 ---
 
@@ -56,6 +67,7 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/vm-lang/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/jamesgober/vm-lang/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/jamesgober/vm-lang/releases/tag/v0.1.0
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/jamesgober/bvm-lang/compare/v0.2.0...v0.2.5
+[0.2.0]: https://github.com/jamesgober/bvm-lang/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/jamesgober/bvm-lang/releases/tag/v0.1.0

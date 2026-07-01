@@ -1,9 +1,9 @@
-//! # vm_lang
+//! # bvm_lang
 //!
 //! A small, fast bytecode virtual machine — the execution engine an interpreted
 //! language runs on once its source has been compiled down to instructions.
 //!
-//! `vm-lang` is a **register machine**. Instructions name the registers they read
+//! `bvm-lang` is a **register machine**. Instructions name the registers they read
 //! and write (`Add { dst, lhs, rhs }`) instead of shuffling an operand stack, so a
 //! program runs in far fewer dispatch steps than the stack-machine equivalent.
 //! Each [`Op`] is a fixed-size, already-decoded value; a program is a slice of
@@ -35,7 +35,7 @@
 //! Compile and run `(2 + 3) * 4`:
 //!
 //! ```
-//! use vm_lang::{Chunk, Op, Vm};
+//! use bvm_lang::{Chunk, Op, Vm};
 //!
 //! let mut chunk = Chunk::new();
 //! chunk.emit(Op::LoadInt { dst: 0, val: 2 });

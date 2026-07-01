@@ -7,8 +7,8 @@
 //!
 //! Run with `cargo bench`.
 
+use bvm_lang::{Chunk, Op, Vm};
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use vm_lang::{Chunk, Op, Vm};
 
 /// A straight-line arithmetic expression: `((7 * 6) + 100 - 8) / 2`.
 fn expression_chunk() -> Chunk {

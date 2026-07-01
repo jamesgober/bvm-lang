@@ -37,7 +37,7 @@ impl Chunk {
     /// # Examples
     ///
     /// ```
-    /// use vm_lang::Chunk;
+    /// use bvm_lang::Chunk;
     ///
     /// let chunk = Chunk::new();
     /// assert!(chunk.is_empty());
@@ -58,7 +58,7 @@ impl Chunk {
     /// # Examples
     ///
     /// ```
-    /// use vm_lang::{Chunk, Op};
+    /// use bvm_lang::{Chunk, Op};
     ///
     /// let mut chunk = Chunk::new();
     /// let first = chunk.emit(Op::LoadInt { dst: 0, val: 41 });
@@ -94,7 +94,7 @@ impl Chunk {
     /// # Examples
     ///
     /// ```
-    /// use vm_lang::{Chunk, Op, Value};
+    /// use bvm_lang::{Chunk, Op, Value};
     ///
     /// let mut chunk = Chunk::new();
     /// let k = chunk.constant(Value::float(3.5)).expect("pool has room");
@@ -118,7 +118,7 @@ impl Chunk {
     /// # Examples
     ///
     /// ```
-    /// use vm_lang::{Chunk, Op};
+    /// use bvm_lang::{Chunk, Op};
     ///
     /// let mut chunk = Chunk::new();
     /// // Emit a forward branch whose target is not yet known.

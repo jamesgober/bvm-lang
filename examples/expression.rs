@@ -6,7 +6,7 @@
 //!
 //! Run with `cargo run --example expression`.
 
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 fn main() {
     let mut chunk = Chunk::new();

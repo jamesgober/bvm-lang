@@ -6,7 +6,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use vm_lang::{Chunk, Op, Value, Vm, VmError};
+use bvm_lang::{Chunk, Op, Value, Vm, VmError};
 
 /// Assemble a chunk from an instruction slice and a constant slice.
 fn assemble(ops: &[Op], constants: &[Value]) -> Chunk {

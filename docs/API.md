@@ -1,6 +1,6 @@
 <h1 align="center" id="top">
     <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
-    <br><b>vm-lang</b><br>
+    <br><b>bvm-lang</b><br>
     <sub><sup>API REFERENCE</sup></sub>
 </h1>
 <div align="center">
@@ -16,7 +16,7 @@
 
 > **Status: pre-1.0 (`v0.2.0`).** The execution core is implemented and documented here. The public surface is finalized across the 0.x series and frozen at `1.0.0`; see [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
 
-`vm-lang` is a register-based bytecode virtual machine. You assemble a program as a [`Chunk`](#chunk) of [`Op`](#op) instructions over a constant pool, then execute it with a [`Vm`](#vm), which returns a [`Value`](#value). Every register holds one `Value` &mdash; the eight-byte NaN-boxed type from [`value-lang`](https://docs.rs/value-lang). Bytecode is treated as untrusted input: a malformed program yields a typed [`VmError`](#vmerror), never a panic, and the crate forbids `unsafe`.
+`bvm-lang` is a register-based bytecode virtual machine. You assemble a program as a [`Chunk`](#chunk) of [`Op`](#op) instructions over a constant pool, then execute it with a [`Vm`](#vm), which returns a [`Value`](#value). Every register holds one `Value` &mdash; the eight-byte NaN-boxed type from [`value-lang`](https://docs.rs/value-lang). Bytecode is treated as untrusted input: a malformed program yields a typed [`VmError`](#vmerror), never a panic, and the crate forbids `unsafe`.
 
 <br>
 
@@ -47,20 +47,20 @@ Add the crate to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-vm-lang = "0.2"
+bvm-lang = "0.2"
 ```
 
 Or from the terminal:
 
 ```bash
-cargo add vm-lang
+cargo add bvm-lang
 ```
 
 The default build depends only on `value-lang` (and its interner). To persist compiled bytecode, enable `serde`:
 
 ```toml
 [dependencies]
-vm-lang = { version = "0.2", features = ["serde"] }
+bvm-lang = { version = "0.2", features = ["serde"] }
 ```
 
 The crate is `no_std`-compatible (it needs `alloc`); disable default features to drop `std`.
@@ -75,7 +75,7 @@ The crate is `no_std`-compatible (it needs `alloc`); disable default features to
 Compile and run `(2 + 3) * 4`:
 
 ```rust
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 2 });
@@ -97,7 +97,7 @@ assert_eq!(result.as_int(), Some(20));
 
 ## Execution Model
 
-`vm-lang` is a **register machine**. Unlike a stack machine, which pushes and pops an implicit operand stack, every instruction names the registers it reads and writes. A three-address `Add { dst, lhs, rhs }` computes `dst = lhs + rhs` in one instruction, where a stack machine would issue push/push/add/store. Fewer instructions means fewer trips through the dispatch loop.
+`bvm-lang` is a **register machine**. Unlike a stack machine, which pushes and pops an implicit operand stack, every instruction names the registers it reads and writes. A three-address `Add { dst, lhs, rhs }` computes `dst = lhs + rhs` in one instruction, where a stack machine would issue push/push/add/store. Fewer instructions means fewer trips through the dispatch loop.
 
 - **Registers** are the VM's working storage, indexed from zero. A chunk's register file is sized automatically to the highest index any of its instructions names, so you never declare it.
 - **The constant pool** holds `Value`s too large or too varied to encode inline (arbitrary floats, interned symbols). Instructions read them by index with `LoadConst`.
@@ -120,7 +120,7 @@ The runtime value type is re-exported from [`value-lang`](https://docs.rs/value-
 Construct values with the associated functions, and read them back with the `as_*` accessors (which return `Option`) or by matching on [`Unpacked`]:
 
 ```rust
-use vm_lang::{Unpacked, Value};
+use bvm_lang::{Unpacked, Value};
 
 let a = Value::int(7);
 let b = Value::float(2.5);
@@ -142,7 +142,7 @@ assert_eq!(b.unpack(), Unpacked::Float(2.5));
 | `Value::float(f64)` | a double-precision float |
 | `Value::sym(Symbol)` | an interned symbol handle |
 
-See the [`value-lang` documentation](https://docs.rs/value-lang) for the full accessor and predicate set. `vm-lang` produces and consumes these values but does not add methods to them.
+See the [`value-lang` documentation](https://docs.rs/value-lang) for the full accessor and predicate set. `bvm-lang` produces and consumes these values but does not add methods to them.
 
 <br>
 
@@ -153,7 +153,7 @@ A single decoded instruction. `Op` is `Copy` and occupies 8 bytes; a program is 
 Construct instructions directly with struct-variant syntax and hand them to [`Chunk::emit`](#chunk):
 
 ```rust
-use vm_lang::{Chunk, Op};
+use bvm_lang::{Chunk, Op};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 10 });
@@ -177,7 +177,7 @@ Three aliases name the roles operands play. They document intent at call sites; 
 | `Addr` | `u32` | an absolute instruction address, used as a branch target |
 
 ```rust
-use vm_lang::{Addr, Const, Reg};
+use bvm_lang::{Addr, Const, Reg};
 
 let dst: Reg = 0;
 let konst: Const = 3;
@@ -197,7 +197,7 @@ The register-file size is tracked for you: every emitted instruction widens the 
 **`Chunk::new() -> Chunk`** &mdash; an empty chunk: no instructions, no constants, a zero-width register file.
 
 ```rust
-use vm_lang::Chunk;
+use bvm_lang::Chunk;
 
 let chunk = Chunk::new();
 assert!(chunk.is_empty());
@@ -209,7 +209,7 @@ assert_eq!(chunk.registers(), 0);
 **`emit(&mut self, op: Op) -> usize`** &mdash; append `op` and return its address (its index in the code array). That address is what a branch targets and what [`patch`](#patch) rewrites.
 
 ```rust
-use vm_lang::{Chunk, Op};
+use bvm_lang::{Chunk, Op};
 
 let mut chunk = Chunk::new();
 let addr = chunk.emit(Op::LoadInt { dst: 0, val: 41 });
@@ -220,7 +220,7 @@ assert_eq!(chunk.registers(), 1); // naming r0 sized the file to one slot
 **`constant(&mut self, value: Value) -> Option<u16>`** &mdash; add `value` to the constant pool and return its index for [`LoadConst`](#instruction-reference). Constants are not deduplicated. Returns `None` only if the pool is already at its 65 536-entry maximum.
 
 ```rust
-use vm_lang::{Chunk, Op, Value};
+use bvm_lang::{Chunk, Op, Value};
 
 let mut chunk = Chunk::new();
 let k = chunk.constant(Value::float(3.5)).expect("pool has room");
@@ -232,7 +232,7 @@ chunk.emit(Op::LoadConst { dst: 0, konst: k });
 The forward-branch pattern &mdash; emit a placeholder, remember its address, patch it once the landing is known:
 
 ```rust
-use vm_lang::{Chunk, Op};
+use bvm_lang::{Chunk, Op};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadBool { dst: 0, val: false });
@@ -266,7 +266,7 @@ The interpreter. A `Vm` owns a register file that is reset and reused on every r
 **`Vm::with_capacity(registers: u16) -> Vm`** &mdash; a VM whose register file is pre-allocated for at least `registers` slots, avoiding a growth reallocation on the first run of a chunk that size.
 
 ```rust
-use vm_lang::Vm;
+use bvm_lang::Vm;
 
 let mut vm = Vm::new();
 let mut primed = Vm::with_capacity(64);
@@ -277,7 +277,7 @@ let mut primed = Vm::with_capacity(64);
 **`run(&mut self, chunk: &Chunk) -> Result<Value, VmError>`** &mdash; execute `chunk` from its first instruction and return the value it yields. A `Return` yields its register's value; a `Halt` yields `nil`. The register file is reset to `nil` before execution, so a run never observes residue from a previous one.
 
 ```rust
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 6 });
@@ -292,7 +292,7 @@ assert_eq!(vm.run(&chunk).unwrap().as_int(), Some(42));
 Faults are returned, not panicked:
 
 ```rust
-use vm_lang::{Chunk, Op, Vm, VmError};
+use bvm_lang::{Chunk, Op, Vm, VmError};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 1 });
@@ -307,7 +307,7 @@ assert_eq!(vm.run(&chunk), Err(VmError::DivideByZero));
 One VM, many chunks &mdash; the register file is reused across calls:
 
 ```rust
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 let mut vm = Vm::new();
 for n in 1..=3 {
@@ -339,7 +339,7 @@ Errors split into two groups. **Runtime faults** come from executing a well-form
 Handling faults explicitly:
 
 ```rust
-use vm_lang::{Chunk, Op, Vm, VmError};
+use bvm_lang::{Chunk, Op, Vm, VmError};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadBool { dst: 0, val: true });
@@ -430,7 +430,7 @@ All operands are register indices unless noted. `dst` is written; `lhs`/`rhs`/`s
 **Numeric tower.** Arithmetic and ordering treat integers and floats as one tower. Two integers produce an integer; if either operand is a float, the result is a float. Integer results are **overflow-checked** &mdash; a fault is reported rather than a silent wrap.
 
 ```rust
-use vm_lang::{Chunk, Op, Vm, VmError};
+use bvm_lang::{Chunk, Op, Vm, VmError};
 
 // i32::MAX + 1 does not wrap; it faults.
 let mut chunk = Chunk::new();
@@ -446,7 +446,7 @@ assert_eq!(Vm::new().run(&chunk), Err(VmError::IntegerOverflow));
 **Mixed operands promote.** An integer combined with a float widens to float:
 
 ```rust
-use vm_lang::{Chunk, Op, Value, Vm};
+use bvm_lang::{Chunk, Op, Value, Vm};
 
 // 1 + 0.5 = 1.5
 let mut chunk = Chunk::new();
@@ -474,7 +474,7 @@ assert_eq!(Vm::new().run(&chunk).unwrap().as_float(), Some(1.5));
 Sum `1..=5` with a back-edge and a back-patched exit branch (result: `15`):
 
 ```rust
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 0 }); // sum
@@ -497,7 +497,7 @@ assert_eq!(Vm::new().run(&chunk).unwrap().as_int(), Some(15));
 `if 3 == 4 then 10 else 20` (result: `20`):
 
 ```rust
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 let mut chunk = Chunk::new();
 chunk.emit(Op::LoadInt { dst: 0, val: 3 });
@@ -528,7 +528,7 @@ With `serde`, a chunk round-trips through any serde format:
 
 ```rust,ignore
 let json = serde_json::to_string(&chunk)?;
-let restored: vm_lang::Chunk = serde_json::from_str(&json)?;
+let restored: bvm_lang::Chunk = serde_json::from_str(&json)?;
 ```
 
 <hr>

@@ -7,7 +7,7 @@
 //!
 //! Run with `cargo run --example fibonacci`.
 
-use vm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Chunk, Op, Vm};
 
 /// Assemble a chunk that returns the `n`th Fibonacci number (0-indexed).
 fn fibonacci(n: i32) -> Chunk {

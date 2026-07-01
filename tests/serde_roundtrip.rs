@@ -9,7 +9,7 @@
 #![cfg(feature = "serde")]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use vm_lang::{Chunk, Op, Value, Vm, VmError};
+use bvm_lang::{Chunk, Op, Value, Vm, VmError};
 
 #[test]
 fn test_chunk_roundtrips_and_runs_identically() {

@@ -27,7 +27,7 @@ use value_lang::Value;
 /// # Examples
 ///
 /// ```
-/// use vm_lang::{Chunk, Op, Value, Vm};
+/// use bvm_lang::{Chunk, Op, Value, Vm};
 ///
 /// // Compute 2 + 3 and return it.
 /// let mut chunk = Chunk::new();
@@ -60,7 +60,7 @@ impl Vm {
     /// # Examples
     ///
     /// ```
-    /// use vm_lang::Vm;
+    /// use bvm_lang::Vm;
     ///
     /// // A VM primed for chunks using up to 32 registers.
     /// let mut vm = Vm::with_capacity(32);
@@ -92,7 +92,7 @@ impl Vm {
     /// A division by zero surfaces as an error rather than a panic:
     ///
     /// ```
-    /// use vm_lang::{Chunk, Op, VmError, Vm};
+    /// use bvm_lang::{Chunk, Op, VmError, Vm};
     ///
     /// let mut chunk = Chunk::new();
     /// chunk.emit(Op::LoadInt { dst: 0, val: 1 });

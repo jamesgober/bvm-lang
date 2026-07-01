@@ -2,12 +2,12 @@
 //!
 //! Every way a run can go wrong — a division by zero, a checked-overflow, a type
 //! mismatch, a program that never terminates — comes back as a typed
-//! [`VmError`](vm_lang::VmError) from [`Vm::run`], never as a panic. Bytecode is
+//! [`VmError`](bvm_lang::VmError) from [`Vm::run`], never as a panic. Bytecode is
 //! treated as untrusted input.
 //!
 //! Run with `cargo run --example errors`.
 
-use vm_lang::{Chunk, Op, Value, Vm, VmError};
+use bvm_lang::{Chunk, Op, Value, Vm, VmError};
 
 /// Assemble a two-operand integer program: `<op> over (x, y)`, then return.
 fn binary(x: i32, y: i32, op: Op) -> Chunk {

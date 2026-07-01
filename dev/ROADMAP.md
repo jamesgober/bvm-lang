@@ -1,4 +1,4 @@
-﻿# vm-lang - Roadmap
+﻿# bvm-lang - Roadmap
 
 > Path from scaffold to a stable 1.0. Hard parts are front-loaded; each phase has hard exit criteria.
 > Master plan: ../../_strategy/LANG_COLLECTION.md

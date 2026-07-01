@@ -8,8 +8,8 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use bvm_lang::{Chunk, Op, Value, Vm, VmError};
 use proptest::prelude::*;
-use vm_lang::{Chunk, Op, Value, Vm, VmError};
 
 /// Build `LoadInt r0=x; LoadInt r1=y; <op> r0=r0,r1; Return r0` and run it.
 fn run_binary(x: i32, y: i32, op: fn(u16, u16, u16) -> Op) -> Result<Value, VmError> {

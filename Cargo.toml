@@ -1,9 +1,9 @@
 # =============================================================================
-#  R E P S   ·   vm-lang
+#  R E P S   ·   bvm-lang
 # =============================================================================
 [package]
-name    = "vm-lang"
-version = "0.2.0"
+name    = "bvm-lang"
+version = "0.2.5"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -25,9 +25,9 @@ keywords = ["language", "runtime", "vm", "bytecode"]
 categories = ["development-tools", "compilers"]
 
 # Links
-homepage      = "https://github.com/jamesgober/vm-lang"
-repository    = "https://github.com/jamesgober/vm-lang"
-documentation = "https://docs.rs/vm-lang"
+homepage      = "https://github.com/jamesgober/bvm-lang"
+repository    = "https://github.com/jamesgober/bvm-lang"
+documentation = "https://docs.rs/bvm-lang"
 
 # Authors
 authors = ["James Gober <me@jamesgober.com>"]
@@ -37,7 +37,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [lib]
-name = "vm_lang"
+name = "bvm_lang"
 path = "src/lib.rs"
 
 
