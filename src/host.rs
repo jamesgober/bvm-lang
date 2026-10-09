@@ -4,7 +4,14 @@
 //! The seam is deliberately small: a registry of named functions, a context
 //! that can read and create strings, and an error type. A host function runs
 //! to completion without re-entering the VM and without collection, so the
-//! values it receives stay valid for its whole call.
+//! values it receives stay valid for its whole call. Because no host function
+//! ever calls back into bytecode, no host frame can lie between a coroutine
+//! and its `yield` (LSB §5.13 rule 2): every frame a suspension captures is a
+//! bytecode frame.
+//!
+//! The registry also offers the VM's built-in scheduler as an import
+//! ([`Host::register_scheduler`]), which [`Vm::run_async`](crate::Vm::run_async)
+//! drives.
 
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
@@ -23,17 +30,20 @@ type HostFnDyn = dyn Fn(&mut HostCtx<'_>, &[Value]) -> Result<Value, HostError> 
 /// A registered host function (cheap to clone; shared by every program that
 /// binds it).
 #[derive(Clone)]
-pub(crate) struct HostFn(Arc<HostFnDyn>);
-
-impl HostFn {
-    pub(crate) fn call(&self, ctx: &mut HostCtx<'_>, args: &[Value]) -> Result<Value, HostError> {
-        (self.0)(ctx, args)
-    }
+pub(crate) enum HostFn {
+    /// A function the embedder registered.
+    User(Arc<HostFnDyn>),
+    /// The VM's built-in scheduler entry ([`Host::register_scheduler`]):
+    /// makes its coroutine argument a task and returns it as the handle.
+    Scheduler,
 }
 
 impl fmt::Debug for HostFn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("HostFn")
+        match self {
+            HostFn::User(_) => f.write_str("HostFn"),
+            HostFn::Scheduler => f.write_str("HostFn::Scheduler"),
+        }
     }
 }
 
@@ -99,7 +109,59 @@ impl Host {
         let f: Arc<HostFnDyn> = Arc::new(f);
         let _previous = self
             .funcs
-            .insert((module.to_string(), name.to_string()), HostFn(f));
+            .insert((module.to_string(), name.to_string()), HostFn::User(f));
+        self
+    }
+
+    /// Registers the VM's built-in scheduler as the import `module`.`name`,
+    /// whose signature must be `(dyn) -> dyn`. Bind it as the module's
+    /// `spawn` hook (`Hook::Spawn`, LSB §5.8) and `spawn` hands each new
+    /// coroutine to it; [`Vm::run_async`](crate::Vm::run_async) then drives
+    /// the tasks.
+    ///
+    /// The scheduler is deterministic and single-threaded: it makes its
+    /// argument (a coroutine) a task, queues it, and returns it as the task
+    /// handle; `await` of a task waits for it to finish. See
+    /// [`Vm::run_async`](crate::Vm::run_async) for the rules.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Callee, Hook, Inst, ModuleBuilder, Policy, Reg, ValType};
+    ///
+    /// let d = ValType::Dyn;
+    /// let mut host = Host::new();
+    /// host.register_scheduler("ls.async", "spawn");
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let sig = m.func_type(&[d], &[d]);
+    /// let spawn = m.import("ls.async", "spawn", sig);
+    /// m.hook(Hook::Spawn, Callee::Import(spawn));
+    /// // async fn double(x) { x + x }
+    /// let mut task = m.function("double", &[d], &[d]);
+    /// let r = task.reg(d);
+    /// task.emit(Inst::DAdd { dst: r, lhs: task.param(0), rhs: task.param(0), pol: Policy::new() });
+    /// task.ret(r);
+    /// let double = m.add_function(task).unwrap();
+    /// // async fn main() { await spawn double(21) }
+    /// let mut main = m.function("main", &[], &[d]);
+    /// let (f, out) = (main.reg(d), main.reg(d));
+    /// let w = main.regs(&[d, d]); // spawn's window: result, then the argument
+    /// main.emit(Inst::MakeClosure { dst: f, func: double });
+    /// main.emit(Inst::DLoadInt { dst: Reg(w.0 + 1), val: 21 });
+    /// main.emit(Inst::Spawn { dst: w, callee: f, argc: 1 });
+    /// main.emit(Inst::Await { dst: out, src: w });
+    /// main.ret(out);
+    /// let main = m.add_function(main).unwrap();
+    ///
+    /// let p = Program::load(m.finish().unwrap(), &host).unwrap();
+    /// assert_eq!(Vm::new(&p).run_async(main, &[]), Ok(Value::Int(42)));
+    /// ```
+    pub fn register_scheduler(&mut self, module: &str, name: &str) -> &mut Host {
+        let _previous = self
+            .funcs
+            .insert((module.to_string(), name.to_string()), HostFn::Scheduler);
         self
     }
 

@@ -112,12 +112,68 @@ Delivered:
   in a flat stack with explicit continuations (`Cont`), which is what stackful
   suspension needs: a suspended coroutine's frames move to the coroutine object.
 
-## v2.0.0-alpha.2 - Coroutines
-- [ ] Every instruction of LSB §5.13 with rules 1-14, keys and automatic keys,
-      `finally` across suspension, `CannotSuspend` across host frames.
-- [ ] Close on drop (LSB §10.9 decision) from a finalisation queue at safepoints.
-- [ ] Coroutine iteration (`iter_new`/`diter_new` over a coroutine).
-- [ ] Differential tests of generators and async against a reference.
+## v2.0.0-alpha.2 - Coroutines (DONE, prepared 2026-10-08)
+Every LSB instruction now executes.
+
+Delivered:
+- **The coroutine group** (`0xF0`..=`0xFC`, LSB §5.13 rules 1-14): stackful
+  suspension (frames copied into the coroutine on `yield`/`await`, back on
+  `resume`: LSB §10 question 7 answered as copy-on-suspend), suspension
+  through nested calls and hook frames, `resume`/`resume_throw` (including
+  on `created`), automatic and explicit keys (`yield_kv`, `coro_key`, rule 10
+  as written: the `map_push` rule), return values (`coro_result`),
+  `coro_close` with pending `finally` blocks, `CloseIgnored`, and `await`
+  during a close, `finally` blocks that suspend with their pending
+  completion, `coro_status`/`coro_current`, iteration over coroutines with
+  `iter_new`/`diter_new` (rule 7), `spawn` through hook 27 (`NoScheduler`
+  without it), coroutine frames counted against the depth limit and
+  suspended stacks against the memory budget, traps failing the running
+  chain. `coro_new` is checked at load like `call`.
+- **Close on drop** (rule 13 as decided in LSB §10 question 9): this heap is
+  traced, so the collection that finds a suspended coroutine unreachable
+  resurrects and queues it (creation order); queued coroutines close one at
+  a time at the next fuel charge point of a run (the fuel counter is set
+  aside while a close is pending, so the dispatch loop has no check of its
+  own), or from the host with `Vm::run_finalizers`. Drop signal `nil`;
+  outcomes discarded; at most once per coroutine. LSB §5.13 rule 13 and its
+  GC paragraph rewritten accordingly.
+- **Scheduler**: `Host::register_scheduler` (the built-in `spawn` import)
+  and `Vm::run_async` (FIFO tasks, `await` of tasks and values, deadlock
+  detection, one fuel budget).
+- **Fuel rule written into LSB** (new §5.14), including the backward-branch
+  and handler-entry charges alpha.1 added, the coroutine charges, and the
+  exact point each charge reports `OutOfFuel` at. Indirect calls to imports
+  now check arity before charging, as for bytecode callees.
+- **Tests**: `coroutines.rs`, `scheduler.rs`, `coroutine_gc.rs`; a
+  whole-module reference interpreter (`tests/common/full.rs`, segmented
+  coroutine stacks) and a differential property over random six-function
+  modules with calls (direct, indirect, dynamic, tail), closures, arrays,
+  maps, structs, strings, try/catch, try/finally (including `return` in
+  `finally` overriding a pending completion), and coroutines, under random
+  fuel and depth limits; mutation-checked (10 of 11 injected bugs caught by
+  it, the 11th by `coroutines.rs`).
+- **Benches**: generator iteration, coroutine creation, async ping-pong.
+
+### Dependency wiring
+- **bytecode-lang `0.2`**, unchanged: the coroutine instructions,
+  `CoroState`, `Hook::Spawn`, and the coroutine error kinds were already in
+  the format. LSB format 1 has no per-coroutine "close on drop" flag (the
+  decision says the format will carry one), so every suspended coroutine is
+  closed on drop; the flag arrives with a later format version.
+- **gc-lang**: still not wired (reasons under alpha.1). Close on drop needs
+  resurrection of unreachable objects during a collection, which the VM heap
+  now does and gc-lang 1 does not offer.
+- **host-lang**: not wired. Host functions still never call back into
+  bytecode, so no host frame can sit between a coroutine and its `yield`;
+  `CannotSuspend` across host frames becomes reachable only when host-lang
+  adds re-entrancy.
+
+### Known limitations (recorded, not deferred work of this milestone)
+- Rule 10 as written (the `map_push` rule) gives `-4` after only
+  `yield -5 => x`; PHP's generators give `0` (they start the counter at -1).
+  The VM follows LSB; whether LSB should change is an owner's call.
+- `call/fib25` measured 3-10% slower than alpha.1 in alternating runs on a
+  loaded machine; typed dispatch is at parity. Not isolated.
 
 ## v2.0.0 - Stable (per D18: after coroutines and a real consumer)
 - [ ] A real consumer runs end to end on it (Mox through the LexerSketch app).

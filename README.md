@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>bvm-lang</strong> is the virtual machine that runs <b>LSB</b>, the LexerSketch bytecode defined by <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>. Hand it a module &mdash; built in memory or decoded from bytes &mdash; and it checks it, binds its imports to your host functions, and runs it: typed code with unboxed integers and floats, dynamic code with PHP-style ordered hash-map arrays and language hooks, closures, structs with inheritance, exceptions with <code>finally</code>, and a tracing garbage collector.
+        <strong>bvm-lang</strong> is the virtual machine that runs <b>LSB</b>, the LexerSketch bytecode defined by <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>. Hand it a module &mdash; built in memory or decoded from bytes &mdash; and it checks it, binds its imports to your host functions, and runs it: typed code with unboxed integers and floats, dynamic code with PHP-style ordered hash-map arrays and language hooks, closures, structs with inheritance, exceptions with <code>finally</code>, stackful coroutines for generators, fibers, and async tasks, and a tracing garbage collector.
     </p>
     <p>
         It is a <em>register machine</em> executing decoded eight-byte instructions in one dispatch loop, and it is built to run code you do not trust: every index the interpreter uses is checked once at load time, every run has a fuel budget, a memory budget, and call-depth and stack limits, and every failure is a value carrying its error code, function, and instruction. Integer arithmetic follows the shared OPS specification bit for bit under every overflow, division-by-zero, shift, and float-conversion policy, including PHP's <code>promote</code>.
@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, one dependency from the family: <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>.
     </p>
     <blockquote>
-        <strong>2.0.0-alpha.1 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB. The coroutine instructions arrive in alpha.2; the API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what alpha.1 promises and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
+        <strong>2.0.0-alpha.2 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB, and alpha.2 executes all of it, the coroutine group included. The API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what the alphas promise and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
     </blockquote>
 </div>
 
@@ -40,7 +40,8 @@
 
 - A **[`Program`](./docs/API.md#program)** is a loaded module. [`Program::load`](./docs/API.md#programload) takes a `bytecode_lang::Module` (or [`Program::decode`](./docs/API.md#programdecode) its bytes), checks every fact the interpreter relies on, and binds each import to a function registered in a **[`Host`](./docs/API.md#host)**. It is immutable and shareable across threads.
 - A **[`Vm`](./docs/API.md#vm)** is an instance of a program: a garbage-collected heap, the globals, and the **[`Limits`](./docs/API.md#limits)** its runs execute under. [`Vm::run`](./docs/API.md#vmrun) calls a function with **[`Value`](./docs/API.md#value)** arguments and returns its result.
-- A **[`VmError`](./docs/API.md#vmerror)** is how a run ends without one: an uncaught error with its OPS/LSB code and location, an uncaught throw, a trap, or an instruction this release does not execute. A **[`LoadError`](./docs/API.md#loaderror)** says why a module was refused.
+- A **[`VmError`](./docs/API.md#vmerror)** is how a run ends without one: an uncaught error with its OPS/LSB code and location, an uncaught throw, or a trap. A **[`LoadError`](./docs/API.md#loaderror)** says why a module was refused.
+- **[`Vm::run_async`](./docs/API.md#vmrun_async)** runs a function as the main task of a small deterministic scheduler (registered with [`Host::register_scheduler`](./docs/API.md#hostregister_scheduler)) that drives the tasks `spawn` makes.
 
 <br>
 
@@ -48,9 +49,12 @@ What it guarantees, and how each guarantee is checked:
 
 | Guarantee | How it is held |
 |---|---|
-| Every LSB instruction except the coroutine group is implemented to LSB's semantics. | At least one conformance test per instruction in `tests/inst_*.rs` (each test names the instructions it covers); the coroutine group returns `Unsupported` with its pc, tested. |
+| Every LSB instruction is implemented to LSB's semantics. | At least one conformance test per instruction in `tests/inst_*.rs` and `tests/coroutines.rs` (each test names the instructions it covers). |
+| Coroutines follow LSB §5.13: stackful suspension through nested calls and hook frames, keys and return values, `resume_throw`, `coro_close` with pending `finally` blocks (including `CloseIgnored` and an `await` during the close), iteration, `CannotSuspend`, `InvalidCoroState`, `NoScheduler`. | `tests/coroutines.rs`: one or more tests per rule, `finally` across a suspension included, and the exact fuel each coroutine instruction costs. |
+| A dropped suspended coroutine is closed (LSB §5.13 rule 13): queued by the collection that finds it, closed oldest first at the next fuel charge point or by `Vm::run_finalizers`. | `tests/coroutine_gc.rs`: closes run once, in creation order, inside a run and from the host; refusals and errors are discarded; created and finished coroutines run nothing; self-referencing coroutines are freed; 100,000 dropped coroutines stay inside a 2 MiB budget; suspended stacks count against the budget. |
+| `spawn`/`await` work through the built-in scheduler, deterministically. | `tests/scheduler.rs`: FIFO interleaving, results and errors through `await`, deadlock detection, one fuel budget per `run_async`. |
 | Integer and float operations match OPS bit for bit under every policy. | `tests/ops_table.rs` runs every operation at every integer type under every policy combination over the edge values {0, ±1, ±2, ±7, MIN, MAX, MIN+1, MAX-1, ...} and every float operation over IEEE edge values (signed zeros, subnormals, ±MAX, ±inf, NaN, halves), against a reference written in `i128` and `f64` in the test itself. |
-| Random programs agree with an independent interpreter. | `tests/differential.rs`: thousands of random straight-line and branching programs (loops included) on the VM and on a reference interpreter in `tests/common/reference.rs`; results, error kinds and pcs, the whole final register file, and fuel used must match. Mutation-checked: breaking `floor_mod` or `promote` division makes it fail. |
+| Random programs agree with an independent interpreter. | `tests/differential.rs`: thousands of random straight-line and branching programs (loops included) against `tests/common/reference.rs`, and 3,000 random six-function modules (calls of every kind, closures, arrays, maps, structs, strings, try/catch, try/finally with `return` in `finally` overriding, generators, `resume`/`resume_throw`/`coro_close`, keys, iteration) against a separate whole-module reference in `tests/common/full.rs` that keeps a frame stack per coroutine; results, error kinds and locations, globals, and fuel used must match under random fuel and depth limits. Mutation-checked: 10 of 11 deliberate coroutine/exception/closure bugs fail it (the 11th, an automatic-key rule bug, is caught by `tests/coroutines.rs`). |
 | Maps behave like PHP arrays. | `tests/php_arrays.rs` checks random insert/push/delete sequences against a PHP 8.3 model, plus key kinds, signed zero and NaN keys, iteration while mutating, and value semantics through `dup`. |
 | `finally` works as LSB lowers it. | `tests/exceptions.rs` runs the canonical lowering for every exit (normal, return, throw, runtime error, break) with a plain finally, one that returns (overriding), and one that throws (replacing). |
 | Untrusted modules cannot panic, hang, or exhaust host memory. | `tests/untrusted.rs` runs random code over every opcode and randomly mutated encodings under tight limits; `tests/limits.rs` covers infinite loops without safepoints, infinite recursion, wide frames, hostile array lengths, and string doubling. |
@@ -63,7 +67,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-bvm-lang = "=2.0.0-alpha.1"
+bvm-lang = "=2.0.0-alpha.2"
 bytecode-lang = "0.2"
 ```
 
@@ -71,7 +75,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-bvm-lang = { version = "=2.0.0-alpha.1", default-features = false }
+bvm-lang = { version = "=2.0.0-alpha.2", default-features = false }
 ```
 
 <hr>
@@ -145,6 +149,44 @@ let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
 assert_eq!(Vm::new(&program).run(main, &[]), Ok(Value::Int(60)));
 ```
 
+### Generators
+
+A coroutine suspends at `yield`, at any depth of calls below its body, and
+`resume` continues it with a value:
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm};
+use bytecode_lang::{Inst, ModuleBuilder, Policy, ValType};
+
+let d = ValType::Dyn;
+let mut m = ModuleBuilder::new();
+// gen() { x = yield 1; return x + 1 }
+let mut g = m.function("gen", &[], &[d]);
+let (one, x) = (g.reg(d), g.reg(d));
+g.emit(Inst::DLoadInt { dst: one, val: 1 });
+g.emit(Inst::Yield { dst: x, src: one });
+g.emit(Inst::DAdd { dst: x, lhs: x, rhs: one, pol: Policy::new() });
+g.ret(x);
+let generator = m.add_function(g).unwrap();
+// main() { c = gen(); a = c.resume(nil); b = c.resume(41); return a + b }
+let mut f = m.function("main", &[], &[d]);
+let (c, a, b, sent) = (f.reg(d), f.reg(d), f.reg(d), f.reg(d));
+f.emit(Inst::CoroNew { dst: c, func: generator, argc: 0 });
+f.emit(Inst::Resume { dst: a, coro: c, src: sent }); // a = 1
+f.emit(Inst::DLoadInt { dst: sent, val: 41 });
+f.emit(Inst::Resume { dst: b, coro: c, src: sent }); // b = 42 (returned)
+f.emit(Inst::DAdd { dst: a, lhs: a, rhs: b, pol: Policy::new() });
+f.ret(a);
+let main = m.add_function(f).unwrap();
+
+let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+assert_eq!(Vm::new(&program).run(main, &[]), Ok(Value::Int(43)));
+```
+
+`foreach` over a generator is `diter_new` plus `iter_next`; async tasks are
+`spawn` and `await` under [`Vm::run_async`](./docs/API.md#vmrun_async). The
+[`coroutines`](./examples/coroutines.rs) example shows both.
+
 ### Untrusted code
 
 Budgets turn a hostile program into an error value with a location:
@@ -176,6 +218,7 @@ Runnable programs in [`examples/`](./examples):
 |---|---|
 | [`quickstart`](./examples/quickstart.rs) | Build, encode to bytes, decode, load, and run a typed loop. |
 | [`php_arrays`](./examples/php_arrays.rs) | Mox/PHP-style code: an ordered array, `$a[] = v`, `foreach`, and PHP's loose `==` supplied by the host as a hook. |
+| [`coroutines`](./examples/coroutines.rs) | A PHP generator with keys consumed by `foreach`, and two async tasks taking turns under `run_async`. |
 | [`untrusted`](./examples/untrusted.rs) | Fuel, memory, and error locations from the line table for hostile code. |
 
 <hr>
@@ -197,9 +240,14 @@ Measured with the benchmarks in [`benches/`](./benches), Windows x86_64, Rust st
 | `map/str_keys_2k_growing_set_get` | 2k inserts and 2k reads with distinct, growing string keys | ~1.0 ms | ~255 ns/operation (key building dominates) |
 | `string/concat_eq_slice_100k` | 100k rounds of concatenate, compare, UTF-8 slice | ~10.5 ms | ~105 ns/round |
 | `gc/alloc_1m_live_10k` | 1M short-lived arrays, 10k kept live in a map, 16 MiB budget | ~112 ms | ~112 ns/allocation, collection included |
-| `load/100k_instructions` | `Program::load` of 1,000 functions of 100 instructions | ~1.6 ms | ~16 ns/instruction |
+| `load/100k_instructions` | `Program::load` of 1,000 functions of 100 instructions | ~1.6-1.8 ms | ~16-18 ns/instruction |
+| `coroutine/generator_iter_100k` | `foreach` over a 100k-element generator (one resume and one yield per element) | ~6.5-6.9 ms | ~65-69 ns/element |
+| `coroutine/create_finish_100k` | 100k coroutines created, resumed to a yield, resumed to their return | ~19-20 ms | ~190-200 ns/coroutine, collection included |
+| `async/ping_pong_2x50k` | two tasks taking turns through the built-in scheduler, 100k `await`s | ~4.5-4.8 ms | ~45-48 ns/await, scheduler included |
 
 **Against 1.0.** The 1.0 `loop_sum/100000` benchmark runs the same five-instruction loop shape; run back to back with these on the same machine it measured ~0.78-0.83 ms when quiet and ~1.15-1.2 ms under load, against ~0.75-0.90 ms and ~1.15-1.47 ms for `typed_loop5`. Dispatch is therefore on par with 1.0's (within run-to-run noise for typed code, up to ~15% slower for dynamic code), while each instruction now carries its own OPS policy and fuel is charged on back edges. Ranges are the spread of several runs on a machine shared with other builds; the numbers are indicative, not a guarantee.
+
+**Against 2.0.0-alpha.1.** Coroutines add no test to the dispatch loop: closing dropped coroutines rides on the fuel counter's cold branch, and a coroutine's return goes through the existing continuation dispatch. Measured in alternating runs against an alpha.1 build, `typed_loop5` is at parity, and `call/fib25` was slower in every pair, by 3-10% (6.4-7.9 ms against 6.4-7.2 ms on a heavily loaded machine). The cause was not isolated: the remaining differences on the call path are the continuation check for a coroutine's body frame on return and the fuel counter living in the machine rather than in a local.
 
 ```bash
 cargo bench --bench bench
@@ -212,7 +260,9 @@ cargo bench --bench bench
 
 - **One 64-bit slot per register.** Every register, of every type, is a 64-bit word whose meaning comes from its declared LSB type. `dyn`, `str`, and `ref` registers share one encoding (LSB §2.1) in which the all-zero word is `nil`, so every LSB default (`false`, `0`, `+0.0`, `U+0000`, `nil`) is zero and new frames and objects are zero-filled.
 - **Load-time checks, run-time speed.** LSB's verifier is not written yet (bytecode-lang 0.5), and its decoder checks structure only. The loader therefore proves, once, every index the interpreter uses; the dispatch loop then indexes registers, globals, tables, and type lists without fallible lookups. It does not check the verifier's type discipline: a word of the wrong type decodes to *some* value, and heap accesses check object kinds, so an ill-typed module computes garbage or raises `TypeError` but cannot escape the VM.
-- **Fuel without a verifier.** LSB charges fuel at safepoints and calls and relies on the verifier to put one on every loop. Until it exists, the VM also charges taken backward branches and handler entries, which no loop can avoid.
+- **Fuel without a verifier.** LSB §5.14 charges fuel at safepoints, calls, hook invocations, taken backward branches, handler entries, and coroutine instructions, so no loop can avoid it, verified or not, and every tier reports `OutOfFuel` at the same pc.
+- **Coroutines copy on suspension.** A running coroutine's frames sit on the one flat frame stack above its resumer's; a `yield` moves them (registers included) into the coroutine object and a `resume` moves them back. The dispatch loop is unchanged (a register read is still one indexed load), and once a coroutine's buffers have grown to its deepest stack a switch allocates nothing.
+- **Close on drop from a finalization queue.** This heap is traced, so a coroutine's last reference going away is not observable when it happens. The collection that finds a suspended coroutine unreachable keeps it alive and queues it; while a close is queued, the fuel counter is set aside so the next charge takes its cold branch, which starts the close before that instruction. Closing costs nothing when nothing is queued.
 - **Precise errors.** A failing instruction breaks out before writing its destination, records its pc, and the unwinder searches that function's handlers in order, then each caller's at its call instruction.
 - **Copy-on-write aggregates.** Arrays and maps share their storage between `dup` copies and between loads of one constant; the first write copies. PHP's value semantics are a `dup` per assignment, O(1) until written.
 - **Hostile-input budgets everywhere.** Constant nesting (64), inheritance depth (256), call depth, register stack, heap bytes, and fuel are all bounded; collection and constant materialisation are iterative or depth-capped.

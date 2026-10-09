@@ -235,7 +235,10 @@ pub enum LoadErrorKind {
         /// The index.
         index: u32,
     },
-    /// A signature is not a `func` type, or has more than one result.
+    /// A signature is not a `func` type, or has more than one result, or an
+    /// import bound to the built-in scheduler
+    /// ([`Host::register_scheduler`](crate::Host::register_scheduler)) is not
+    /// `(dyn) -> dyn`.
     BadSignature,
     /// A function's registers do not begin with its signature's parameters.
     ParamMismatch,
@@ -243,8 +246,8 @@ pub enum LoadErrorKind {
     EmptyCode,
     /// A function's last instruction can fall through past the end.
     FallsThrough,
-    /// A direct call, tail call, or import call passes the wrong number of
-    /// arguments.
+    /// A direct call, tail call, import call, or `coro_new` passes the wrong
+    /// number of arguments.
     ArityMismatch {
         /// The callee's parameter count.
         expected: u32,
@@ -252,7 +255,8 @@ pub enum LoadErrorKind {
         found: u32,
     },
     /// A function with captures is the target of a direct call, a tail call,
-    /// the start function, or an entry point (it needs a closure).
+    /// or `coro_new`, the start function, or an entry point (it needs a
+    /// closure).
     CalleeHasCaptures,
     /// An instruction carries `overflow = promote` but does not write a `dyn`
     /// register (LSB V-T8).
@@ -878,6 +882,14 @@ impl<'m> Loader<'m> {
                     name: name.to_string(),
                 })
             })?;
+            // The built-in scheduler takes a coroutine and returns its task
+            // handle: the `spawn` hook's shape.
+            let scheduler_shape = params.len() == 1
+                && params.first() == Some(&ValType::Dyn)
+                && result == Some(ValType::Dyn);
+            if matches!(func, HostFn::Scheduler) && !scheduler_shape {
+                return Err(LoadError::new(LoadErrorKind::BadSignature));
+            }
             out.push(ImportInfo {
                 params,
                 result,
@@ -1161,8 +1173,14 @@ impl<'m> Loader<'m> {
             | Inst::CoroNewIndirect { dst, argc, .. }
             | Inst::Spawn { dst, argc, .. } => window(dst.index() + 1, usize::from(argc))?,
             Inst::CoroNew { dst, func, argc } => {
-                let _body = callee(func)?;
+                // As `call`: the window holds the body's arguments, and a
+                // body with captures needs a closure (`coro_new_indirect`).
+                let body = callee(func)?;
                 window(dst.index() + 1, usize::from(argc))?;
+                arity(body.nparams, argc)?;
+                if !body.captures.is_empty() {
+                    return Err(LoadErrorKind::CalleeHasCaptures);
+                }
             }
             Inst::CallImport { dst, import, argc } => {
                 let imp = imports

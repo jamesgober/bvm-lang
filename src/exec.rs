@@ -30,10 +30,15 @@
 //!
 //! **Fuel.** One unit is charged at every `safepoint`, every call-family
 //! instruction (calls, tail calls, host calls, hook invocations), every taken
-//! backward branch, and every handler entry. LSB's verifier will require a
-//! safepoint or call on every loop (V-CF6); until it exists, charging
-//! backward branches is what bounds a module that omits them, and no loop
-//! can avoid every one of these points.
+//! backward branch, every handler entry, every coroutine instruction, and
+//! every `iter_next` over a coroutine: the rule LSB §5.14 states for every
+//! tier. LSB's verifier will require a safepoint or call on every loop
+//! (V-CF6); until it exists, charging backward branches is what bounds a
+//! module that omits them, and no loop can avoid every one of these points.
+//!
+//! **Coroutines** live in [`coro`](crate::coro); the loop sees them only as
+//! frame changes (`Step::Frame`) and as unwinds that start in a frame other
+//! than the one that was executing (`Step::Unwind`).
 
 use alloc::vec::Vec;
 
@@ -41,6 +46,7 @@ use bytecode_lang::{Callee, ErrorKind, FloatTy, Hook, Inst, IntTy, ValType};
 
 use crate::coll::{self, index_of, not_a};
 use crate::conv::{self, prim_type};
+use crate::coro::{self, Entered};
 use crate::dynops::{self, DOp};
 use crate::dynv;
 use crate::error::VmError;
@@ -48,7 +54,7 @@ use crate::fault::Fault;
 use crate::fmath;
 use crate::heap::{ArrayObj, Callable, CellObj, FuncObj, MapObj, Object, StructObj};
 use crate::int::{self, Bin, Cmp, Un};
-use crate::machine::{Cont, Machine, Next};
+use crate::machine::{Charge, Cont, Driver, Machine, Next, Stop, Wake};
 use crate::program::{FuncInfo, Program, TypeInfo};
 
 const SIGN32: u64 = 0x8000_0000;
@@ -67,14 +73,12 @@ pub(crate) fn execute(
     // The interpreter owns the register stack while it runs (so its buffer
     // pointer lives in a register rather than behind `m`); the allocation
     // goes back to the machine afterwards to be reused.
-    let mut stack = core::mem::take(&mut m.stack);
-    stack.clear();
-    m.frames.clear();
+    let mut stack = begin(m, *fuel);
     let pushed = m.push_frame(&mut stack, prog, func, dynv::NIL, Cont::Entry);
     let base = match pushed {
         Ok(b) => b,
         Err(_) => {
-            m.stack = stack;
+            *fuel = end(m, stack, false);
             return Err(VmError::Raised {
                 kind: ErrorKind::StackOverflow,
                 func: bytecode_lang::FuncId(func),
@@ -85,13 +89,114 @@ pub(crate) fn execute(
     if let Some(dst) = stack.get_mut(base..base + args.len()) {
         dst.copy_from_slice(args);
     }
-    let mut local_fuel = *fuel;
-    let result = run(m, &mut stack, prog, &mut local_fuel);
-    *fuel = local_fuel;
+    let result = run(m, &mut stack, prog);
+    *fuel = end(m, stack, result.is_err());
+    result
+}
+
+/// Takes the pooled register stack for a run with `fuel`, with no frames and
+/// no running coroutine. A close queued before the run (by
+/// [`Vm::collect_garbage`](crate::Vm::collect_garbage)) is armed, so the
+/// run's first fuel charge starts it.
+fn begin(m: &mut Machine, fuel: u64) -> Vec<u64> {
+    let mut stack = core::mem::take(&mut m.stack);
+    stack.clear();
+    m.frames.clear();
+    m.coros.clear();
+    m.outcome = None;
+    m.fuel = fuel;
+    m.bank = None;
+    m.set_finalizing(false);
+    stack
+}
+
+/// Returns the register stack to the pool and the fuel left. A run that
+/// ended abnormally (a trap or an uncaught error) left its running
+/// coroutines without frames: they become `failed`.
+fn end(m: &mut Machine, mut stack: Vec<u64>, aborted: bool) -> u64 {
+    if aborted || !m.coros.is_empty() {
+        m.abort_coros();
+    }
     stack.clear();
     m.stack = stack;
     m.frames.clear();
-    result
+    m.set_finalizing(false);
+    m.unbank();
+    m.fuel
+}
+
+/// Resumes the coroutine `coro` from the host (the built-in scheduler):
+/// `wake` is the value sent or the error thrown in. Runs until it suspends
+/// or finishes and reports what it did. The caller has checked that it is
+/// resumable.
+pub(crate) fn drive(
+    m: &mut Machine,
+    prog: &Program,
+    coro: u64,
+    wake: Wake,
+    fuel: &mut u64,
+) -> Result<Stop, VmError> {
+    let mut stack = begin(m, *fuel);
+    let entered = match m.coro_enter(&mut stack, coro, Driver::Host) {
+        Ok(e) => e,
+        Err(fault) => {
+            *fuel = end(m, stack, false);
+            let (func, pc) = m
+                .heap
+                .coro(coro)
+                .and_then(|c| c.frames.last())
+                .map_or((0, 0), |f| (f.func, f.pc));
+            let kind = match fault {
+                Fault::Raise(k) | Fault::Trap(k) => k,
+                Fault::Throw(_) => ErrorKind::TypeError,
+            };
+            return Err(VmError::Raised {
+                kind,
+                func: bytecode_lang::FuncId(func),
+                pc,
+            });
+        }
+    };
+    let started = match (entered, wake) {
+        (Entered::Suspended(d), Wake::Send(v)) => {
+            m.coro_send(&mut stack, d, v);
+            Ok(())
+        }
+        (Entered::Suspended(_), Wake::Throw(e)) => m.unwind(&mut stack, prog, Fault::Throw(e)),
+        // A created coroutine starts; the sent value is ignored (rule 1).
+        (Entered::Fresh, _) => Ok(()),
+    };
+    let result = started.and_then(|()| run(m, &mut stack, prog));
+    let outcome = m.outcome.take();
+    *fuel = end(m, stack, result.is_err());
+    let _ = result?;
+    // The host-driven coroutine is the bottom of the frame stack, so the
+    // run returns exactly when its delivery has recorded an outcome.
+    Ok(outcome.unwrap_or(Stop::Returned(dynv::NIL)))
+}
+
+/// Closes queued dropped coroutines (rule 13) from the host, outside any
+/// run: each runs on an empty stack until its close ends. Returns how many
+/// were closed.
+pub(crate) fn finalize_all(
+    m: &mut Machine,
+    prog: &Program,
+    fuel: &mut u64,
+) -> Result<usize, VmError> {
+    let mut closed = 0;
+    while !m.finalize.is_empty() {
+        let mut stack = begin(m, *fuel);
+        let r = if m.start_finalizer(&mut stack) {
+            closed += 1;
+            m.unwind(&mut stack, prog, Fault::Throw(dynv::NIL))
+                .and_then(|()| run(m, &mut stack, prog).map(|_| ()))
+        } else {
+            Ok(())
+        };
+        *fuel = end(m, stack, r.is_err());
+        r?;
+    }
+    Ok(closed)
 }
 
 /// The read of a float register as `f32`.
@@ -157,12 +262,7 @@ enum Lookup {
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn run(
-    m: &mut Machine,
-    stack: &mut Vec<u64>,
-    prog: &Program,
-    fuel: &mut u64,
-) -> Result<Option<u64>, VmError> {
+fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u64>, VmError> {
     'frame: loop {
         let Some(&top) = m.frames.last() else {
             return Ok(None);
@@ -178,7 +278,10 @@ fn run(
         let module_fn = prog.module.function(bytecode_lang::FuncId(func));
         let mut pc = top.pc as usize;
 
-        let fault: Fault = 'dispatch: loop {
+        // The fault, and whether it is raised at this frame's `pc` (an
+        // `Unwind` from the coroutine machinery has already positioned the
+        // frames and the pc the unwind starts at).
+        let (fault, here): (Fault, bool) = 'dispatch: loop {
             let inst = code[pc];
             macro_rules! r {
                 ($x:expr) => {
@@ -189,21 +292,30 @@ fn run(
                 ($e:expr) => {
                     match $e {
                         Ok(v) => v,
-                        Err(f) => break 'dispatch f,
+                        Err(f) => break 'dispatch (f, true),
                     }
                 };
             }
             macro_rules! fail {
                 ($f:expr) => {
-                    break 'dispatch $f
+                    break 'dispatch ($f, true)
                 };
             }
+            // Fuel (LSB §5.14). The cold branch also starts a pending
+            // drop-close before this instruction (it re-executes after).
             macro_rules! charge {
                 () => {
-                    if *fuel == 0 {
-                        break 'dispatch Fault::Trap(ErrorKind::OutOfFuel);
+                    if m.fuel == 0 {
+                        match m.charge_slow(stack, Some((fi, pc as u32))) {
+                            Charge::Done => {}
+                            Charge::Spent => {
+                                break 'dispatch (Fault::Trap(ErrorKind::OutOfFuel), true);
+                            }
+                            Charge::Close => break 'dispatch (Fault::Throw(dynv::NIL), false),
+                        }
+                    } else {
+                        m.fuel -= 1;
                     }
-                    *fuel -= 1;
                 };
             }
             macro_rules! gc {
@@ -231,10 +343,11 @@ fn run(
                         closure,
                         fi,
                     };
-                    match cold(m, stack, prog, &cx, pc, inst, fuel) {
+                    match cold(m, stack, prog, &cx, pc, inst) {
                         Step::Next => {}
                         Step::Frame => continue 'frame,
-                        Step::Fault(f) => break 'dispatch f,
+                        Step::Fault(f) => break 'dispatch (f, true),
+                        Step::Unwind(f) => break 'dispatch (f, false),
                     }
                 }};
             }
@@ -486,6 +599,11 @@ fn run(
                             continue 'frame;
                         }
                         Callable::Import(i) => {
+                            if prog.imports.get(i as usize).map(|imp| imp.params.len())
+                                != Some(argc)
+                            {
+                                fail!(Fault::type_error());
+                            }
                             charge!();
                             let res = t!(host_window(m, stack, prog, i, first, argc));
                             let ty = prog.imports.get(i as usize).and_then(|imp| imp.result);
@@ -493,7 +611,10 @@ fn run(
                                 Ok(Next::Exit(v)) => return Ok(v),
                                 Ok(Next::Resume) => continue 'frame,
                                 Err(f) => {
-                                    m.unwind(stack, prog, f, fuel)?;
+                                    if let Some(fr) = m.frames.get_mut(fi) {
+                                        fr.pc = pc as u32;
+                                    }
+                                    m.unwind(stack, prog, f)?;
                                     continue 'frame;
                                 }
                             }
@@ -506,7 +627,13 @@ fn run(
                         Ok(Next::Exit(v)) => return Ok(v),
                         Ok(Next::Resume) => continue 'frame,
                         Err(f) => {
-                            m.unwind(stack, prog, f, fuel)?;
+                            // A coroutine body whose result does not convert
+                            // is back on top: the error is raised at this
+                            // `ret` (a caller's conversion error, at its call).
+                            if let Some(fr) = m.frames.get_mut(fi) {
+                                fr.pc = pc as u32;
+                            }
+                            m.unwind(stack, prog, f)?;
                             continue 'frame;
                         }
                     }
@@ -515,7 +642,7 @@ fn run(
                     Ok(Next::Exit(v)) => return Ok(v),
                     Ok(Next::Resume) => continue 'frame,
                     Err(f) => {
-                        m.unwind(stack, prog, f, fuel)?;
+                        m.unwind(stack, prog, f)?;
                         continue 'frame;
                     }
                 },
@@ -576,27 +703,35 @@ fn run(
             }
             pc += 1;
         };
-        m.frames[fi].pc = pc as u32;
-        m.unwind(stack, prog, fault, fuel)?;
+        if here {
+            m.frames[fi].pc = pc as u32;
+        }
+        m.unwind(stack, prog, fault)?;
     }
 }
 
 /// What the out-of-line handler tells the dispatch loop.
-enum Step {
+pub(crate) enum Step {
     /// Continue with the next instruction.
     Next,
     /// A frame was pushed (or the top frame changed): reload.
     Frame,
-    /// The instruction failed.
+    /// The instruction failed; nothing changed, so it raises at its own pc.
     Fault(Fault),
+    /// The frames changed (a coroutine was entered or suspended) and the
+    /// error is raised in the new top frame, at the pc it records: the
+    /// suspension point for `resume_throw`/`coro_close`, the driving
+    /// instruction for a delivery the driver refuses.
+    Unwind(Fault),
 }
 
 /// The running frame's facts the out-of-line handler needs.
-struct Cx<'a> {
-    info: &'a FuncInfo,
-    base: usize,
-    closure: u64,
-    fi: usize,
+pub(crate) struct Cx<'a> {
+    pub(crate) info: &'a FuncInfo,
+    pub(crate) base: usize,
+    pub(crate) closure: u64,
+    /// The running frame's index in the frame stack.
+    pub(crate) fi: usize,
 }
 
 /// Every instruction not handled inline by the dispatch loop: kept out of
@@ -612,7 +747,6 @@ fn cold(
     cx: &Cx<'_>,
     pc: usize,
     inst: Inst,
-    fuel: &mut u64,
 ) -> Step {
     let Cx {
         info,
@@ -640,10 +774,9 @@ fn cold(
     }
     macro_rules! charge {
         () => {
-            if *fuel == 0 {
-                return Step::Fault(Fault::Trap(ErrorKind::OutOfFuel));
+            if let Some(step) = charge(m, stack, fi, pc) {
+                return step;
             }
-            *fuel -= 1;
         };
     }
     macro_rules! gc {
@@ -1233,6 +1366,11 @@ fn cold(
                     return Step::Frame;
                 }
                 Callable::Import(i) => {
+                    // The callee and its arity are checked before fuel is
+                    // charged, as for a bytecode callee (LSB §5.14).
+                    if prog.imports.get(i as usize).map(|imp| imp.params.len()) != Some(argc) {
+                        fail!(Fault::type_error());
+                    }
                     charge!();
                     if let Some(v) = t!(host_window(m, stack, prog, i, first, argc)) {
                         r!(dst) = v;
@@ -1384,13 +1522,23 @@ fn cold(
                 None => fail!(not_a(&m.heap, v)),
             }
         }
-        Inst::IterNext { has, iter, val } => match t!(coll::iter_next(&mut m.heap, r!(iter))) {
-            Some(v) => {
-                r!(val) = v;
-                r!(has) = 1;
+        Inst::IterNext { has, iter, val } => {
+            let it = r!(iter);
+            // An iterator over a coroutine resumes it (LSB §5.13 rule 7).
+            if let Some(Object::Iter(i)) = m.heap.get(it) {
+                if i.coro {
+                    let src = i.src;
+                    return coro::iter_next(m, stack, prog, cx, pc, (has.0, it, val.0), src);
+                }
             }
-            None => r!(has) = 0,
-        },
+            match t!(coll::iter_next(&mut m.heap, it)) {
+                Some(v) => {
+                    r!(val) = v;
+                    r!(has) = 1;
+                }
+                None => r!(has) = 0,
+            }
+        }
         Inst::IterKey { dst, iter } => r!(dst) = t!(coll::iter_key(&m.heap, r!(iter))),
         Inst::Dup { dst, src } => {
             gc!(64);
@@ -1505,11 +1653,27 @@ fn cold(
         | Inst::Spawn { .. }
         | Inst::CoroClose { .. }
         | Inst::CoroKey { .. }
-        | Inst::CoroResult { .. } => fail!(Fault::Unsupported(inst.opcode())),
+        | Inst::CoroResult { .. } => return coro::exec(m, stack, prog, cx, pc, inst),
         // Handled inline by the dispatch loop.
         _ => {}
     }
     Step::Next
+}
+
+/// One unit of fuel for the out-of-line instructions (LSB §5.14): `None`
+/// to continue, or the step to take (the `OutOfFuel` trap, or a pending
+/// drop-close that starts before this instruction).
+#[inline]
+pub(crate) fn charge(m: &mut Machine, stack: &mut Vec<u64>, fi: usize, pc: usize) -> Option<Step> {
+    if m.fuel != 0 {
+        m.fuel -= 1;
+        return None;
+    }
+    match m.charge_slow(stack, Some((fi, pc as u32))) {
+        Charge::Done => None,
+        Charge::Spent => Some(Step::Fault(Fault::Trap(ErrorKind::OutOfFuel))),
+        Charge::Close => Some(Step::Unwind(Fault::Throw(dynv::NIL))),
+    }
 }
 
 /// Calls import `imp` with the arguments in `first..first + argc` read at the
@@ -1586,7 +1750,9 @@ fn dup(m: &mut Machine, v: u64) -> Result<u64, Fault> {
             elem: c.elem,
             value: c.value,
         }),
-        Some(Object::Iter(_)) => return Err(Fault::type_error()),
+        // Iterators and coroutines are positions in a computation, not
+        // values: a copy with a new identity has no meaning.
+        Some(Object::Iter(_) | Object::Coro(_)) => return Err(Fault::type_error()),
         Some(Object::Str(_) | Object::Func(_) | Object::Int(_) | Object::Error(_)) => return Ok(v),
     };
     m.heap.alloc(copy)

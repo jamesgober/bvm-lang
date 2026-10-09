@@ -3,15 +3,16 @@
 
 use alloc::vec::Vec;
 
-use bytecode_lang::{FuncId, GlobalId, Kind};
+use bytecode_lang::{CoroState, FuncId, GlobalId, Kind};
 
 use crate::conv;
+use crate::dynv;
 use crate::error::VmError;
 use crate::exec;
 use crate::fault::Fault;
 use crate::heap::Object;
 use crate::host;
-use crate::machine::Machine;
+use crate::machine::{Machine, Stop, Wake};
 use crate::program::Program;
 use crate::value::{Obj, Value};
 
@@ -22,17 +23,21 @@ use crate::value::{Obj, Value};
 ///
 /// - **fuel**: units charged at every `safepoint`, call-family instruction
 ///   (calls, tail calls, host calls, hook invocations), taken backward
-///   branch, and handler entry. Exhausting it is the `OutOfFuel` trap
-///   (E0107). Execution between two charges is bounded by the length of one
-///   function, so fuel bounds total work.
+///   branch, handler entry, coroutine instruction, and `iter_next` over a
+///   coroutine (the rule of LSB §5.14). Exhausting it is the `OutOfFuel`
+///   trap (E0107). Execution between two charges is bounded by the length of
+///   one function, so fuel bounds total work.
 /// - **memory**: bytes of heap objects (strings, arrays, maps, structs,
 ///   closures, cells, iterators, error values, boxed ints). Exceeding it is
 ///   the `OutOfMemory` trap (E0106). Accounting is approximate (headers and
 ///   shared copy-on-write storage are estimated), never unbounded.
-/// - **depth**: frames on the call stack, hook frames included. Exceeding it
-///   raises `StackOverflow` (E0105, catchable).
+/// - **depth**: frames on the call stack, hook frames and the frames of
+///   running coroutines included (a suspended coroutine's frames count again
+///   when it is resumed). Exceeding it raises `StackOverflow` (E0105,
+///   catchable).
 /// - **stack**: register slots across all frames (8 bytes each). Exceeding
-///   it also raises `StackOverflow`.
+///   it also raises `StackOverflow`. Suspended coroutines' registers count
+///   against the memory budget instead.
 ///
 /// # Examples
 ///
@@ -373,19 +378,40 @@ impl<'p> Vm<'p> {
         args: &[Value],
         fuel: &mut u64,
     ) -> Result<Value, VmError> {
+        self.prepare(fuel)?;
+        let words = self.entry_words(func, args)?;
         let prog = self.prog;
-        if !self.ready {
-            self.m
-                .init_globals(prog)
-                .map_err(|(g, f)| VmError::GlobalInit {
-                    global: GlobalId(g),
-                    kind: fault_kind(f),
-                })?;
-            if let Some(start) = prog.module.start() {
-                let _ = exec::execute(&mut self.m, prog, start.0, &[], fuel)?;
-            }
-            self.ready = true;
+        let result = prog.func(func.0).and_then(|i| i.result);
+        let out = exec::execute(&mut self.m, prog, func.0, &words, fuel)?;
+        Ok(match (out, result) {
+            (Some(w), Some(ty)) => conv::value_of(&self.m.heap, ty, w),
+            _ => Value::Nil,
+        })
+    }
+
+    /// The first run's set-up: globals from their initialisers, then the
+    /// module's start function.
+    fn prepare(&mut self, fuel: &mut u64) -> Result<(), VmError> {
+        if self.ready {
+            return Ok(());
         }
+        let prog = self.prog;
+        self.m
+            .init_globals(prog)
+            .map_err(|(g, f)| VmError::GlobalInit {
+                global: GlobalId(g),
+                kind: fault_kind(f),
+            })?;
+        if let Some(start) = prog.module.start() {
+            let _ = exec::execute(&mut self.m, prog, start.0, &[], fuel)?;
+        }
+        self.ready = true;
+        Ok(())
+    }
+
+    /// Checks an entry function and converts its arguments.
+    fn entry_words(&mut self, func: FuncId, args: &[Value]) -> Result<Vec<u64>, VmError> {
+        let prog = self.prog;
         let info = prog.func(func.0).ok_or(VmError::NoSuchFunction(func))?;
         if !info.captures.is_empty() {
             return Err(VmError::NeedsClosure(func));
@@ -402,11 +428,244 @@ impl<'p> Vm<'p> {
                 .map_err(|_| VmError::ArgumentType { index })?;
             words.push(w);
         }
-        let out = exec::execute(&mut self.m, prog, func.0, &words, fuel)?;
-        Ok(match (out, info.result) {
-            (Some(w), Some(ty)) => conv::value_of(&self.m.heap, ty, w),
-            _ => Value::Nil,
-        })
+        Ok(words)
+    }
+
+    /// Runs `func` as the main task of the VM's built-in scheduler and
+    /// returns its result (Python's `asyncio.run`, a Mox request).
+    ///
+    /// `func` becomes a coroutine (so it may `await`); the scheduler resumes
+    /// ready tasks one at a time in FIFO order until the main task finishes.
+    /// The rules, all deterministic:
+    ///
+    /// - `spawn` (with the module's `spawn` hook bound to the import
+    ///   registered by [`Host::register_scheduler`]) makes the new coroutine a
+    ///   task at the back of the queue and returns it as the task handle.
+    /// - `await` of a task (or of any coroutine, which then becomes a task)
+    ///   waits until it finishes, then resumes with its return value, or
+    ///   raises its error at the `await` (`resume_throw`). Awaiting a
+    ///   finished coroutine resumes at once, at the back of the queue.
+    /// - `await` of any other value resumes, at the back of the queue, with
+    ///   that same value (a cooperative "let the others run").
+    /// - A task that `yield`s is resumed with `nil` at the back of the queue.
+    /// - A task that fails wakes its waiters with its error; the main task
+    ///   failing ends the run with that error.
+    ///
+    /// Tasks still unfinished when the main task finishes are dropped (and,
+    /// once collected, closed like any dropped coroutine). Tasks spawned by
+    /// a plain [`run`](Vm::run) wait in the queue for the next `run_async`.
+    /// Fuel is one budget for the whole run, every task included.
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Vm::run), plus [`VmError::Deadlock`] when the main task
+    /// waits and no task can run.
+    ///
+    /// # Examples
+    ///
+    /// `main` may `await` (here a plain value, which comes straight back);
+    /// [`Host::register_scheduler`] shows tasks made with `spawn`.
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm, VmError};
+    /// use bytecode_lang::{ErrorKind, Inst, ModuleBuilder, ValType};
+    ///
+    /// let d = ValType::Dyn;
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("main", &[d], &[d]);
+    /// let r = f.reg(d);
+    /// f.emit(Inst::Await { dst: r, src: f.param(0) });
+    /// f.ret(r);
+    /// let main = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// assert_eq!(vm.run_async(main, &[Value::Int(7)]), Ok(Value::Int(7)));
+    /// // A plain run has no coroutine to suspend.
+    /// assert_eq!(
+    ///     vm.run(main, &[Value::Int(7)]),
+    ///     Err(VmError::Raised { kind: ErrorKind::CannotSuspend, func: main, pc: 0 })
+    /// );
+    /// ```
+    ///
+    /// [`Host::register_scheduler`]: crate::Host::register_scheduler
+    pub fn run_async(&mut self, func: FuncId, args: &[Value]) -> Result<Value, VmError> {
+        let limits = self.limits;
+        self.m.heap.limit = limits.memory;
+        self.m.max_depth = limits.depth;
+        self.m.max_stack = limits.stack;
+        let mut fuel = limits.fuel;
+        let result = self.async_inner(func, args, &mut fuel);
+        self.m.sched.clear();
+        self.fuel_used = limits.fuel - fuel;
+        result
+    }
+
+    fn async_inner(
+        &mut self,
+        func: FuncId,
+        args: &[Value],
+        fuel: &mut u64,
+    ) -> Result<Value, VmError> {
+        self.prepare(fuel)?;
+        let words = self.entry_words(func, args)?;
+        let prog = self.prog;
+        let main = self
+            .m
+            .coro_create(prog, func.0, dynv::NIL, &words)
+            .map_err(|f| VmError::Trap {
+                kind: fault_kind(f),
+                func,
+                pc: 0,
+            })?;
+        if let Some(c) = self.m.heap.coro_mut(main) {
+            c.task = true;
+        }
+        self.m.sched.ready.push_back((main, Wake::Send(dynv::NIL)));
+        loop {
+            let Some((task, wake)) = self.m.sched.ready.pop_front() else {
+                // Nothing is ready, so every task left (the main one
+                // included) is waiting for another.
+                return Err(VmError::Deadlock {
+                    waiting: self.m.sched.len(),
+                });
+            };
+            let stop = match self.m.heap.coro(task).map(|c| (c.state, c.result)) {
+                Some((CoroState::Returned, v)) => Stop::Returned(v),
+                Some((CoroState::Failed, e)) => Stop::Failed(e, func.0, 0),
+                // A task some bytecode is running cannot be resumed from
+                // here; it is not one the scheduler still owns.
+                Some((CoroState::Running, _)) | None => continue,
+                Some((CoroState::Created, _)) if matches!(wake, Wake::Throw(_)) => {
+                    let Wake::Throw(e) = wake else { continue };
+                    if let Some(c) = self.m.heap.coro_mut(task) {
+                        c.state = CoroState::Failed;
+                        c.result = e;
+                        c.frames = Vec::new();
+                        c.regs = Vec::new();
+                    }
+                    Stop::Failed(e, func.0, 0)
+                }
+                Some(_) => exec::drive(&mut self.m, prog, task, wake, fuel)?,
+            };
+            let sched = &mut self.m.sched;
+            match stop {
+                Stop::Yielded(_) | Stop::CloseIgnored => {
+                    sched.ready.push_back((task, Wake::Send(dynv::NIL)));
+                }
+                Stop::Awaiting(target) => match self.m.heap.coro_mut(target) {
+                    Some(t) => match t.state {
+                        CoroState::Returned => sched.ready.push_back((task, Wake::Send(t.result))),
+                        CoroState::Failed => sched.ready.push_back((task, Wake::Throw(t.result))),
+                        _ => {
+                            if !t.task && t.state.is_resumable() {
+                                t.task = true;
+                                sched.ready.push_back((target, Wake::Send(dynv::NIL)));
+                            }
+                            sched.waiters.entry(target).or_default().push(task);
+                        }
+                    },
+                    None => sched.ready.push_back((task, Wake::Send(target))),
+                },
+                Stop::Returned(v) => {
+                    if task == main {
+                        return Ok(conv::dyn_value(&self.m.heap, v));
+                    }
+                    for w in sched.waiters.remove(&task).unwrap_or_default() {
+                        sched.ready.push_back((w, Wake::Send(v)));
+                    }
+                }
+                Stop::Failed(e, at_func, at_pc) => {
+                    if task == main {
+                        return Err(self.m.uncaught(e, at_func, at_pc));
+                    }
+                    for w in sched.waiters.remove(&task).unwrap_or_default() {
+                        sched.ready.push_back((w, Wake::Throw(e)));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Closes the dropped suspended coroutines a collection has queued
+    /// (LSB §5.13 rule 13) now, under the VM's limits, instead of at the
+    /// next safepoint of a later run; returns how many were closed. Call it
+    /// after [`collect_garbage`](Vm::collect_garbage) to run the pending
+    /// `finally` blocks of everything dropped (at program exit, say).
+    ///
+    /// # Errors
+    ///
+    /// A trap inside a `finally` block (`OutOfFuel`, `OutOfMemory`,
+    /// `Unreachable`) stops the closing; the remaining coroutines stay queued.
+    /// Errors raised by a `finally` block are discarded, as CPython discards
+    /// an exception raised while a dropped generator closes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.collect_garbage();
+    /// assert_eq!(vm.pending_finalizers(), 0);
+    /// assert_eq!(vm.run_finalizers(), Ok(0));
+    /// ```
+    pub fn run_finalizers(&mut self) -> Result<usize, VmError> {
+        let limits = self.limits;
+        self.m.heap.limit = limits.memory;
+        self.m.max_depth = limits.depth;
+        self.m.max_stack = limits.stack;
+        let mut fuel = limits.fuel;
+        let result = exec::finalize_all(&mut self.m, self.prog, &mut fuel);
+        self.fuel_used = limits.fuel - fuel;
+        result
+    }
+
+    /// Dropped suspended coroutines waiting to be closed (see
+    /// [`run_finalizers`](Vm::run_finalizers)).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// assert_eq!(Vm::new(&p).pending_finalizers(), 0);
+    /// ```
+    #[must_use]
+    pub fn pending_finalizers(&self) -> usize {
+        self.m.finalize.len()
+    }
+
+    /// The state of a coroutine value (`None` for anything else).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{CoroState, Inst, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let mut body = m.function("body", &[], &[]);
+    /// body.ret_void();
+    /// let body = m.add_function(body).unwrap();
+    /// let mut f = m.function("f", &[], &[ValType::Dyn]);
+    /// let c = f.reg(ValType::Dyn);
+    /// f.emit(Inst::CoroNew { dst: c, func: body, argc: 0 });
+    /// f.ret(c);
+    /// let f = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let c = vm.run(f, &[]).unwrap();
+    /// assert_eq!(vm.coro_state(c), Some(CoroState::Created));
+    /// assert_eq!(vm.coro_state(Value::Int(1)), None);
+    /// ```
+    #[must_use]
+    pub fn coro_state(&self, v: Value) -> Option<CoroState> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        self.m.heap.coro(w).map(|c| c.state)
     }
 
     /// Fuel the last run consumed.
@@ -492,7 +751,9 @@ impl<'p> Vm<'p> {
 
     /// Collects now, keeping what globals and constant caches reach. Values
     /// from earlier runs that nothing else references are freed (their
-    /// handles then read as `nil`).
+    /// handles then read as `nil`), except suspended coroutines, which are
+    /// queued to be closed (LSB §5.13 rule 13): at the next run's first fuel
+    /// charge, or now with [`run_finalizers`](Vm::run_finalizers).
     ///
     /// # Examples
     ///
@@ -727,6 +988,6 @@ impl<'p> Vm<'p> {
 fn fault_kind(f: Fault) -> bytecode_lang::ErrorKind {
     match f {
         Fault::Raise(k) | Fault::Trap(k) => k,
-        Fault::Throw(_) | Fault::Unsupported(_) => bytecode_lang::ErrorKind::TypeError,
+        Fault::Throw(_) => bytecode_lang::ErrorKind::TypeError,
     }
 }

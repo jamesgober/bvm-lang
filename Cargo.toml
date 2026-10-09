@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bvm-lang"
-version = "2.0.0-alpha.1"
+version = "2.0.0-alpha.2"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "The LSB bytecode VM: executes bytecode-lang modules with typed and dynamic values, PHP-style ordered maps, exceptions, a tracing GC, fuel, and memory budgets."
+description = "The LSB bytecode VM: executes bytecode-lang modules with typed and dynamic values, PHP-style ordered maps, exceptions, stackful coroutines, a tracing GC, fuel, and memory budgets."
 
 # Keywords (5 max)
 keywords = ["language", "runtime", "vm", "bytecode"]

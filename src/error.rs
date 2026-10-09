@@ -2,7 +2,7 @@
 
 use core::fmt;
 
-use bytecode_lang::{ErrorKind, FuncId, GlobalId, Opcode};
+use bytecode_lang::{ErrorKind, FuncId, GlobalId};
 
 use crate::value::Value;
 
@@ -14,6 +14,7 @@ use crate::value::Value;
 /// [`Thrown`](VmError::Thrown) for a `throw` of any other value. Traps
 /// ([`Trap`](VmError::Trap)) abort at once and carry the instruction that
 /// trapped. Every runtime variant names the function and pc (ISSUES M62).
+/// [`Deadlock`](VmError::Deadlock) is the built-in scheduler's own outcome.
 ///
 /// # Examples
 ///
@@ -66,15 +67,12 @@ pub enum VmError {
         /// The instruction that trapped.
         pc: u32,
     },
-    /// An instruction this release does not execute: the coroutine group
-    /// (`0xF0`..=`0xFC`) arrives in 2.0.0-alpha.2.
-    Unsupported {
-        /// The instruction's opcode.
-        opcode: Opcode,
-        /// The function containing it.
-        func: FuncId,
-        /// Its pc.
-        pc: u32,
+    /// [`Vm::run_async`](crate::Vm::run_async): every remaining task waits
+    /// for a task that cannot finish (the main task awaits something no task
+    /// will complete), so the scheduler has nothing left to run.
+    Deadlock {
+        /// Tasks still waiting, the main task included.
+        waiting: usize,
     },
     /// A global's initialiser could not be materialised into the global's
     /// type (or exhausted memory).
@@ -160,8 +158,7 @@ impl VmError {
         match self {
             VmError::Raised { func, pc, .. }
             | VmError::Thrown { func, pc, .. }
-            | VmError::Trap { func, pc, .. }
-            | VmError::Unsupported { func, pc, .. } => Some((*func, *pc)),
+            | VmError::Trap { func, pc, .. } => Some((*func, *pc)),
             _ => None,
         }
     }
@@ -175,11 +172,9 @@ impl fmt::Display for VmError {
                 write!(f, "uncaught throw of {value} at {func} @{pc}")
             }
             VmError::Trap { kind, func, pc } => write!(f, "trap {kind} at {func} @{pc}"),
-            VmError::Unsupported { opcode, func, pc } => write!(
-                f,
-                "{} is not supported in this release (coroutines arrive in 2.0.0-alpha.2) at {func} @{pc}",
-                opcode.mnemonic()
-            ),
+            VmError::Deadlock { waiting } => {
+                write!(f, "deadlock: {waiting} tasks wait and none can run")
+            }
             VmError::GlobalInit { global, kind } => {
                 write!(f, "cannot initialise {global}: {kind}")
             }

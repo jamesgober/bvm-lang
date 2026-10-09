@@ -4,7 +4,8 @@
 //! defined by [`bytecode-lang`](https://docs.rs/bytecode-lang): the T1
 //! interpreter of the `-lang` family, for static languages (typed registers,
 //! unboxed integers and floats) and dynamic ones (`dyn` registers, PHP-style
-//! ordered maps, hooks) alike.
+//! ordered maps, hooks) alike, with stackful coroutines for generators,
+//! fibers, and async tasks.
 //!
 //! ## The model
 //!
@@ -19,8 +20,10 @@
 //!   [`Value`] arguments and returns its result.
 //! - A [`VmError`] is how a run ends without a result: an uncaught error
 //!   with its OPS/LSB code and the function and pc that raised it, an
-//!   uncaught throw, a trap (`OutOfFuel`, `OutOfMemory`, `Unreachable`), or
-//!   an instruction this release does not execute.
+//!   uncaught throw, or a trap (`OutOfFuel`, `OutOfMemory`, `Unreachable`).
+//! - [`Vm::run_async`] runs a function as the main task of a small
+//!   deterministic scheduler ([`Host::register_scheduler`]) that drives the
+//!   tasks `spawn` creates.
 //!
 //! ## Example
 //!
@@ -67,11 +70,47 @@
 //!   stack limits bound frames. The crate is `#![forbid(unsafe_code)]`.
 //! - **Precise errors.** A failing instruction raises at its own pc without
 //!   writing its destination, so handlers see the registers as they were.
+//! - **Every LSB instruction executes**, the coroutine group included:
+//!   stackful coroutines (a `yield` may sit any number of calls below the
+//!   coroutine's body), keys and return values, throwing in, closing with
+//!   pending `finally` blocks, iteration, and tasks. A suspended coroutine
+//!   that is dropped is closed (LSB §5.13 rule 13): this heap is traced, so
+//!   the collection that finds it unreachable queues it and the VM closes
+//!   it at the next fuel charge point, oldest first.
 //!
-//! ## Not in this release
+//! ## Coroutines
 //!
-//! The coroutine instructions (`0xF0`..=`0xFC`) load but do not execute: they
-//! end the run with [`VmError::Unsupported`]. They arrive in 2.0.0-alpha.2.
+//! A generator yields; its consumer resumes it (or iterates it with
+//! `diter_new`/`iter_next`):
+//!
+//! ```
+//! use bvm_lang::{Host, Program, Value, Vm};
+//! use bytecode_lang::{Inst, ModuleBuilder, ValType};
+//!
+//! let d = ValType::Dyn;
+//! let mut m = ModuleBuilder::new();
+//! // gen() { x = yield 1; return x + 1 }
+//! let mut g = m.function("gen", &[], &[d]);
+//! let (one, x) = (g.reg(d), g.reg(d));
+//! g.emit(Inst::DLoadInt { dst: one, val: 1 });
+//! g.emit(Inst::Yield { dst: x, src: one });
+//! g.emit(Inst::DAdd { dst: x, lhs: x, rhs: one, pol: Default::default() });
+//! g.ret(x);
+//! let generator = m.add_function(g).unwrap();
+//! // main() { c = gen(); a = c.resume(nil); b = c.resume(41); return a + b }
+//! let mut f = m.function("main", &[], &[d]);
+//! let (c, a, b, sent) = (f.reg(d), f.reg(d), f.reg(d), f.reg(d));
+//! f.emit(Inst::CoroNew { dst: c, func: generator, argc: 0 });
+//! f.emit(Inst::Resume { dst: a, coro: c, src: sent });
+//! f.emit(Inst::DLoadInt { dst: sent, val: 41 });
+//! f.emit(Inst::Resume { dst: b, coro: c, src: sent });
+//! f.emit(Inst::DAdd { dst: a, lhs: a, rhs: b, pol: Default::default() });
+//! f.ret(a);
+//! let main = m.add_function(f).unwrap();
+//!
+//! let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+//! assert_eq!(Vm::new(&program).run(main, &[]), Ok(Value::Int(43)));
+//! ```
 //!
 //! ## `no_std`
 //!
@@ -102,6 +141,7 @@ extern crate std;
 
 mod coll;
 mod conv;
+mod coro;
 mod dynops;
 mod dynv;
 mod error;

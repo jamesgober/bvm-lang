@@ -11,6 +11,12 @@
 //! - `string/*`: 100k concatenations and comparisons.
 //! - `gc/*`: 1M short-lived allocations under a 16 MiB budget, with a live
 //!   set of 10k objects kept in a map.
+//! - `coroutine/*`: a generator of 100k values consumed by `foreach`
+//!   (`diter_new` + `iter_next`: one resume and one yield per element), and
+//!   100k short coroutines created and run to completion.
+//! - `async/*`: two tasks taking turns through the built-in scheduler,
+//!   100k `await`s in all (each a suspension, a trip through the host
+//!   scheduler, and a resume).
 //!
 //! Run with `cargo bench`.
 
@@ -18,8 +24,8 @@ use std::hint::black_box;
 
 use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{
-    Const, FuncId, FunctionBuilder, Inst, IntOp, IntTy, ModuleBuilder, Policy, Reg, TypeDef,
-    ValType,
+    Callee, Const, FuncId, FunctionBuilder, Hook, Inst, IntOp, IntTy, ModuleBuilder, Policy, Prim,
+    Reg, TypeDef, ValType,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -582,6 +588,191 @@ fn bench_load(c: &mut Criterion) {
     g.finish();
 }
 
+/// `gen(n) { for i in 0..n { yield i } }` and
+/// `main(n) { s = 0; foreach (gen(n) as v) { s += v } return s }`.
+fn generator_program() -> (Program, FuncId) {
+    let mut m = ModuleBuilder::new();
+    let mut g = m.function("gen", &[I64], &[]);
+    let (v, sent) = (g.reg(D), g.reg(D));
+    counted(&mut g, Reg(0), |g, i| {
+        g.emit(Inst::ToDyn {
+            dst: v,
+            src: i,
+            from: Prim::I64,
+        });
+        g.emit(Inst::Yield { dst: sent, src: v });
+    });
+    g.ret_void();
+    let gen_id = m.add_function(g).expect("builds");
+    let mut f = m.function("main", &[I64], &[D]);
+    let w = f.regs(&[D, I64]);
+    f.mov(Reg(w.0 + 1), Reg(0));
+    f.emit(Inst::CoroNew {
+        dst: w,
+        func: gen_id,
+        argc: 1,
+    });
+    let (it, v, sum, has) = (f.reg(D), f.reg(D), f.reg(D), f.reg(BOOL));
+    f.emit(Inst::DIterNew { dst: it, src: w });
+    f.emit(Inst::DLoadInt { dst: sum, val: 0 });
+    let (top, done) = (f.label(), f.label());
+    f.bind(top);
+    f.emit(Inst::IterNext {
+        has,
+        iter: it,
+        val: v,
+    });
+    f.jmp_if_not(has, done);
+    f.emit(Inst::DAdd {
+        dst: sum,
+        lhs: sum,
+        rhs: v,
+        pol: Policy::new(),
+    });
+    f.emit(Inst::Safepoint {});
+    f.jmp(top);
+    f.bind(done);
+    f.ret(sum);
+    let main = m.add_function(f).expect("builds");
+    (load(m), main)
+}
+
+/// `body(x) { y = yield x; return y }` and
+/// `main(n) { for i in 0..n { c = body(i); resume c; resume c } }`.
+fn create_finish_program() -> (Program, FuncId) {
+    let mut m = ModuleBuilder::new();
+    let mut b = m.function("body", &[D], &[D]);
+    let y = b.reg(D);
+    b.emit(Inst::Yield {
+        dst: y,
+        src: Reg(0),
+    });
+    b.ret(y);
+    let body = m.add_function(b).expect("builds");
+    let mut f = m.function("main", &[I64], &[]);
+    let w = f.regs(&[D, D]);
+    let r = f.reg(D);
+    counted(&mut f, Reg(0), |f, i| {
+        f.emit(Inst::ToDyn {
+            dst: Reg(w.0 + 1),
+            src: i,
+            from: Prim::I64,
+        });
+        f.emit(Inst::CoroNew {
+            dst: w,
+            func: body,
+            argc: 1,
+        });
+        f.emit(Inst::Resume {
+            dst: r,
+            coro: w,
+            src: r,
+        });
+        f.emit(Inst::Resume {
+            dst: r,
+            coro: w,
+            src: r,
+        });
+    });
+    f.ret_void();
+    let main = m.add_function(f).expect("builds");
+    (load(m), main)
+}
+
+fn bench_coroutines(c: &mut Criterion) {
+    let mut g = c.benchmark_group("coroutine");
+    g.sample_size(20);
+    let n = 100_000;
+    g.throughput(Throughput::Elements(n));
+    let (p, main) = generator_program();
+    let mut vm = Vm::new(&p);
+    let expected = Value::Int(i64::try_from(n * (n - 1) / 2).expect("fits"));
+    g.bench_function("generator_iter_100k", |b| {
+        b.iter(|| {
+            let out = vm
+                .run(main, &[Value::Int(black_box(100_000))])
+                .expect("runs");
+            assert_eq!(out, expected);
+            black_box(out)
+        });
+    });
+    let (p, main) = create_finish_program();
+    let mut vm = Vm::new(&p);
+    g.bench_function("create_finish_100k", |b| {
+        b.iter(|| {
+            black_box(
+                vm.run(main, &[Value::Int(black_box(100_000))])
+                    .expect("runs"),
+            )
+        });
+    });
+    g.finish();
+}
+
+/// Two tasks, each `for i in 0..n { await nil }`, spawned and awaited by the
+/// main task, through the built-in scheduler.
+fn ping_pong_program() -> (Program, FuncId) {
+    let mut host = Host::new();
+    host.register_scheduler("ls.async", "spawn");
+    let mut m = ModuleBuilder::new();
+    let sig = m.func_type(&[D], &[D]);
+    let spawn = m.import("ls.async", "spawn", sig);
+    m.hook(Hook::Spawn, Callee::Import(spawn));
+    let mut t = m.function("player", &[I64], &[]);
+    let (nil, got) = (t.reg(D), t.reg(D));
+    counted(&mut t, Reg(0), |t, _| {
+        t.emit(Inst::Await { dst: got, src: nil });
+    });
+    t.ret_void();
+    let player = m.add_function(t).expect("builds");
+    let mut f = m.function("main", &[I64], &[]);
+    let (fv, r) = (f.reg(D), f.reg(D));
+    f.emit(Inst::MakeClosure {
+        dst: fv,
+        func: player,
+    });
+    let mut tasks = Vec::new();
+    for _ in 0..2 {
+        let w = f.regs(&[D, D]);
+        f.emit(Inst::ToDyn {
+            dst: Reg(w.0 + 1),
+            src: Reg(0),
+            from: Prim::I64,
+        });
+        f.emit(Inst::Spawn {
+            dst: w,
+            callee: fv,
+            argc: 1,
+        });
+        tasks.push(w);
+    }
+    for w in tasks {
+        f.emit(Inst::Await { dst: r, src: w });
+    }
+    f.ret_void();
+    let main = m.add_function(f).expect("builds");
+    let p = Program::load(m.finish().expect("module builds"), &host).expect("module loads");
+    (p, main)
+}
+
+fn bench_async(c: &mut Criterion) {
+    let mut g = c.benchmark_group("async");
+    g.sample_size(20);
+    let (p, main) = ping_pong_program();
+    let mut vm = Vm::new(&p);
+    // 2 x 50,000 awaits.
+    g.throughput(Throughput::Elements(100_000));
+    g.bench_function("ping_pong_2x50k", |b| {
+        b.iter(|| {
+            black_box(
+                vm.run_async(main, &[Value::Int(black_box(50_000))])
+                    .expect("runs"),
+            )
+        });
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_dispatch,
@@ -589,6 +780,8 @@ criterion_group!(
     bench_maps,
     bench_strings,
     bench_gc,
-    bench_load
+    bench_load,
+    bench_coroutines,
+    bench_async
 );
 criterion_main!(benches);

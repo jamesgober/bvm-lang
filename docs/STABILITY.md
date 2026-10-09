@@ -16,16 +16,16 @@
 
 `bvm-lang` **2.0** is a new major version: the 1.x instruction set (`Op`, `Chunk`) is gone, replaced by LSB, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang). The 1.x line stays frozen as it was released; it receives no further features.
 
-## 2.0.0-alpha.1 is a pre-release
+## 2.0.0-alpha.2 is a pre-release
 
 Per decision D18 (a crate is frozen only after a real consumer has exercised it), the 2.0 API is **not frozen yet**. It freezes at `2.0.0`, after:
 
-1. the coroutine instructions land (`2.0.0-alpha.2`), and
+1. the coroutine instructions land (done in `2.0.0-alpha.2`), and
 2. a real consumer (Mox, through the LexerSketch app) has run end to end on it.
 
-Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.1"`).
+Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.2"`).
 
-## What alpha.1 already promises
+## What the alphas already promise
 
 These are properties of the implementation that will not be weakened before or after 2.0.0:
 
@@ -33,15 +33,17 @@ These are properties of the implementation that will not be weakened before or a
 - **No panics, no unsafe.** `#![forbid(unsafe_code)]`; no module, however malformed or hostile, can make loading or running panic or read outside the VM. Loading refuses what the interpreter cannot index safely; everything else is a value (`LoadError`, `VmError`).
 - **Bounded work.** With finite `Limits`, every run ends: fuel bounds instructions, the memory budget bounds the heap, depth and stack limits bound frames.
 - **Precise errors.** A failing instruction raises at its own pc without writing its destination; `VmError` carries the OPS/LSB error code, the function, and the pc.
-- **Determinism.** Results do not depend on the platform, the `std` feature, hash seeds, or collection timing: map order is insertion order, float results are IEEE (software and hardware paths are bit-identical), and collection is unobservable except through `heap_*` statistics.
+- **Determinism.** Results do not depend on the platform, the `std` feature, or hash seeds: map order is insertion order, and float results are IEEE (software and hardware paths are bit-identical). Collection timing is observable in exactly one way, which LSB §5.13 rule 13 requires: a dropped suspended coroutine's pending `finally` blocks run when a collection has found it unreachable. For a given module, input, and `Limits` on a fresh `Vm`, collections (and so those closes) happen at the same points on every run; they are not part of what other tiers must reproduce.
+- **Fuel is LSB §5.14's.** Every tier charges the same points; a run under a budget stops at the same function and pc.
 
 ## What may change before 2.0.0
 
 - The public types' shapes: `Value` and `VmError` are `#[non_exhaustive]` (new variants may appear), `Limits` gains fields only through new methods, `LoadErrorKind` is `#[non_exhaustive]`.
 - The host interface (`Host`, `HostCtx`, `HostError`): host-lang will replace or extend it; the seam is deliberately small.
 - Inspection methods on `Vm` may be reorganised once a consumer's needs are known.
-- The coroutine group will start executing in alpha.2 (today: `VmError::Unsupported`).
-- Fuel accounting may change in its constants (which instructions cost how much) but will keep bounding every loop.
+- The built-in scheduler's surface (`Host::register_scheduler`, `Vm::run_async`, `VmError::Deadlock`) is the minimum a test harness and a simple host need; host-lang may replace it with a richer interface.
+- Close-on-drop's host controls (`Vm::run_finalizers`, `Vm::pending_finalizers`) and the drop signal (`nil`) follow LSB §5.13 rule 13 and change only with it (a future format version adds a per-coroutine "close on drop" flag).
+- Fuel follows LSB §5.14 and changes only with it.
 
 ## MSRV
 

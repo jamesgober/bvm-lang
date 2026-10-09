@@ -1,14 +1,12 @@
-//! LSB conformance, control flow and calls (LSB §5.9, §4.2) and the
-//! coroutine group's alpha.1 behaviour (§5.13).
+//! LSB conformance, control flow and calls (LSB §5.9, §4.2). The coroutine
+//! group (§5.13) has its own suite in `coroutines.rs`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)]
 
 mod common;
 
 use bvm_lang::{Host, HostError, Limits, Program, Value, Vm, VmError};
-use bytecode_lang::{
-    ErrorKind, FuncId, Inst, IntOp, IntTy, ModuleBuilder, Opcode, Reg, Target, ValType,
-};
+use bytecode_lang::{ErrorKind, FuncId, Inst, IntOp, IntTy, ModuleBuilder, Reg, Target, ValType};
 use common::{BOOL, D, I64};
 
 fn op() -> IntOp {
@@ -517,87 +515,6 @@ fn unreachable_is_not_catchable() {
             pc: 0
         })
     );
-}
-
-#[test]
-fn coroutine_instructions_are_unsupported_with_their_pc() {
-    let insts = [
-        Inst::CoroNew {
-            dst: Reg(0),
-            func: FuncId(0),
-            argc: 0,
-        },
-        Inst::CoroNewIndirect {
-            dst: Reg(0),
-            callee: Reg(0),
-            argc: 0,
-        },
-        Inst::Yield {
-            dst: Reg(0),
-            src: Reg(0),
-        },
-        Inst::YieldKv {
-            dst: Reg(0),
-            key: Reg(0),
-            src: Reg(0),
-        },
-        Inst::Await {
-            dst: Reg(0),
-            src: Reg(0),
-        },
-        Inst::Resume {
-            dst: Reg(0),
-            coro: Reg(0),
-            src: Reg(0),
-        },
-        Inst::ResumeThrow {
-            dst: Reg(0),
-            coro: Reg(0),
-            src: Reg(0),
-        },
-        Inst::CoroStatus {
-            dst: Reg(0),
-            coro: Reg(0),
-        },
-        Inst::CoroCurrent { dst: Reg(0) },
-        Inst::Spawn {
-            dst: Reg(0),
-            callee: Reg(0),
-            argc: 0,
-        },
-        Inst::CoroClose {
-            dst: Reg(0),
-            coro: Reg(0),
-            src: Reg(0),
-        },
-        Inst::CoroKey {
-            dst: Reg(0),
-            coro: Reg(0),
-        },
-        Inst::CoroResult {
-            dst: Reg(0),
-            coro: Reg(0),
-        },
-    ];
-    for inst in insts {
-        let out = common::eval(&[], &[], &[], |_, f| {
-            let _ = f.reg(D);
-            f.emit(Inst::Nop {});
-            f.emit(inst);
-            f.ret_void();
-        });
-        assert_eq!(
-            out,
-            Err(VmError::Unsupported {
-                opcode: inst.opcode(),
-                func: FuncId(0),
-                pc: 1
-            }),
-            "{inst}"
-        );
-        assert!((0xF0..=0xFC).contains(&(inst.opcode() as u8)));
-    }
-    assert!(matches!(Opcode::from_u8(0xF0), Some(Opcode::CoroNew)));
 }
 
 #[test]

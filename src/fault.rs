@@ -1,22 +1,20 @@
 //! The internal outcome of an instruction that does not complete.
 
-use bytecode_lang::{ErrorKind, Opcode};
+use bytecode_lang::ErrorKind;
 
 /// Why an instruction stopped. A `Raise` or `Throw` unwinds to the nearest
-/// handler (LSB §4.3); a `Trap` or `Unsupported` ends the run at once.
+/// handler (LSB §4.3); a `Trap` ends the run at once.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub(crate) enum Fault {
     /// A catchable runtime error with its OPS/LSB kind. The VM allocates the
     /// `error` value when it starts unwinding.
     Raise(ErrorKind),
-    /// A catchable error carrying an arbitrary `dyn` value (`throw`, or a host
-    /// function's thrown value).
+    /// A catchable error carrying an arbitrary `dyn` value (`throw`,
+    /// `resume_throw`, `coro_close`, or a host function's thrown value).
     Throw(u64),
     /// A non-catchable abort: `OutOfFuel`, `OutOfMemory`, `Unreachable`, or an
     /// OPS kind under policy `trap`.
     Trap(ErrorKind),
-    /// An instruction this release does not execute.
-    Unsupported(Opcode),
 }
 
 impl Fault {

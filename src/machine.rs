@@ -2,7 +2,7 @@
 //! not instruction dispatch: frames, constant materialisation, caches, host
 //! calls, call continuations, unwinding, and garbage collection.
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -15,7 +15,7 @@ use crate::error::VmError;
 use crate::fault::Fault;
 use crate::hash::Seed;
 use crate::heap::{ArrayObj, Callable, ErrorObj, FuncObj, Heap, MapObj, Object};
-use crate::host::{HostCtx, HostError};
+use crate::host::{HostCtx, HostError, HostFn};
 use crate::int;
 use crate::program::{Program, TypeInfo};
 use crate::value::Value;
@@ -42,6 +42,100 @@ pub(crate) enum Cont {
     Iter(u16),
     /// A void hook (`set_index`, `set_prop`).
     Discard,
+    /// The body frame of a coroutine: returning from it (or an error escaping
+    /// it) finishes the innermost running coroutine (LSB §5.13 rule 3), and
+    /// the result goes to whoever drove it ([`Active::driver`]).
+    Coro,
+}
+
+/// Who resumed a running coroutine, and so receives what it produces next.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Driver {
+    /// `resume`, `resume_throw`, or `coro_close`: the payload or result goes
+    /// to this register of the resumer's frame.
+    Resume(u16),
+    /// `iter_next` on an iterator over the coroutine (rule 7).
+    Iter {
+        /// The `has` register.
+        has: u16,
+        /// The value register.
+        val: u16,
+        /// The iterator (its key is set from the coroutine's).
+        iter: u64,
+    },
+    /// The host (the built-in scheduler): the run stops and reports a
+    /// [`Stop`].
+    Host,
+    /// A drop-close started by the VM (rule 13): the outcome is discarded
+    /// and the interrupted frame continues where it was.
+    Finalize,
+}
+
+/// A running coroutine: one link of the resume chain.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Active {
+    /// The coroutine object.
+    pub(crate) coro: u64,
+    /// Index in the frame stack of its body frame.
+    pub(crate) floor: usize,
+    pub(crate) driver: Driver,
+}
+
+/// What a coroutine driven by the host did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Stop {
+    Yielded(u64),
+    Awaiting(u64),
+    Returned(u64),
+    /// An error value escaped its body: the value, and the function and pc
+    /// where it was raised (for an uncaught non-error value).
+    Failed(u64, u32, u32),
+    /// It yielded while being closed (rule 11): it stays suspended.
+    CloseIgnored,
+}
+
+/// How the scheduler resumes a task.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Wake {
+    Send(u64),
+    Throw(u64),
+}
+
+/// The built-in scheduler's state (see [`Vm::run_async`]): tasks ready to
+/// run in FIFO order, and tasks waiting for another task to finish.
+///
+/// [`Vm::run_async`]: crate::Vm::run_async
+#[derive(Debug, Default)]
+pub(crate) struct Sched {
+    pub(crate) ready: VecDeque<(u64, Wake)>,
+    /// Per awaited task, its waiters in the order they started waiting.
+    pub(crate) waiters: BTreeMap<u64, Vec<u64>>,
+}
+
+impl Sched {
+    /// Every word the scheduler holds (GC roots).
+    fn words(&self) -> impl Iterator<Item = u64> + '_ {
+        let ready = self.ready.iter().flat_map(|&(t, w)| {
+            let v = match w {
+                Wake::Send(v) | Wake::Throw(v) => v,
+            };
+            [t, v]
+        });
+        let waiting = self
+            .waiters
+            .iter()
+            .flat_map(|(&t, ws)| core::iter::once(t).chain(ws.iter().copied()));
+        ready.chain(waiting)
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.ready.clear();
+        self.waiters.clear();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.ready.len() + self.waiters.values().map(Vec::len).sum::<usize>()
+    }
 }
 
 /// One activation record. Registers live in the shared stack at
@@ -83,6 +177,39 @@ pub(crate) struct Machine {
     pub(crate) host_args: Vec<Value>,
     pub(crate) max_depth: usize,
     pub(crate) max_stack: usize,
+    /// The resume chain: running coroutines, outermost first.
+    pub(crate) coros: Vec<Active>,
+    /// Dropped suspended coroutines waiting to be closed (rule 13), oldest
+    /// first.
+    pub(crate) finalize: VecDeque<u64>,
+    /// A drop-close is running (they run one at a time, in order).
+    pub(crate) finalizing: bool,
+    /// `finalize` is non-empty and no drop-close is running: the one flag the
+    /// dispatch loop tests at each frame transition.
+    pub(crate) close_ready: bool,
+    /// The fuel left in the current run (LSB §5.14).
+    pub(crate) fuel: u64,
+    /// Fuel set aside while a drop-close is armed ([`Machine::arm_close`]).
+    pub(crate) bank: Option<u64>,
+    /// What the coroutine driven by the host did (set by its delivery).
+    pub(crate) outcome: Option<Stop>,
+    pub(crate) sched: Sched,
+    /// The next coroutine's creation number.
+    pub(crate) coro_seq: u64,
+    /// Pooled list of coroutines a collection found dropped.
+    pub(crate) dropped: Vec<u64>,
+}
+
+/// The outcome of the cold branch of a fuel charge.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Charge {
+    /// Charged; continue.
+    Done,
+    /// The budget is spent: the `OutOfFuel` trap.
+    Spent,
+    /// A dropped coroutine's close was started on top of the frames, before
+    /// the charging instruction: raise its close signal there.
+    Close,
 }
 
 /// What a returning frame leads to.
@@ -112,6 +239,16 @@ impl Machine {
             host_args: Vec::new(),
             max_depth: 0,
             max_stack: 0,
+            coros: Vec::new(),
+            finalize: VecDeque::new(),
+            finalizing: false,
+            close_ready: false,
+            fuel: 0,
+            bank: None,
+            outcome: None,
+            sched: Sched::default(),
+            coro_seq: 0,
+            dropped: Vec::new(),
         }
     }
 
@@ -147,6 +284,10 @@ impl Machine {
     }
 
     /// Pops the top frame after `ret`/`ret_void` and delivers the result.
+    ///
+    /// A coroutine body's result is converted to `dyn` before its frame is
+    /// given up: on a conversion error (a `u64` above `i64::MAX`) the frame is
+    /// back on top and the caller raises the error there, at the `ret`.
     pub(crate) fn finish(
         &mut self,
         stack: &mut Vec<u64>,
@@ -156,14 +297,45 @@ impl Machine {
         let Some(frame) = self.frames.pop() else {
             return Ok(Next::Exit(result));
         };
-        stack.truncate(frame.base);
-        if frame.cont == Cont::Entry {
-            return Ok(Next::Exit(result));
+        match frame.cont {
+            Cont::Entry => {
+                stack.truncate(frame.base);
+                return Ok(Next::Exit(result));
+            }
+            Cont::Coro => return self.finish_coro(stack, frame, result, ty),
+            _ => {}
         }
+        stack.truncate(frame.base);
         self.apply_cont(stack, frame.cont, result, ty)?;
         if let Some(top) = self.frames.last_mut() {
             top.pc += 1;
         }
+        Ok(Next::Resume)
+    }
+
+    /// [`finish`](Machine::finish) of a coroutine's body frame (rule 3).
+    #[cold]
+    #[inline(never)]
+    fn finish_coro(
+        &mut self,
+        stack: &mut Vec<u64>,
+        frame: Frame,
+        result: Option<u64>,
+        ty: Option<ValType>,
+    ) -> Result<Next, Fault> {
+        let value = match (result, ty) {
+            (Some(v), Some(t)) => match conv::to_dyn(&mut self.heap, t, v) {
+                Ok(d) => d,
+                Err(f) => {
+                    // Back on top; the caller records the `ret`'s pc.
+                    self.frames.push(frame);
+                    return Err(f);
+                }
+            },
+            _ => dynv::NIL,
+        };
+        stack.truncate(frame.base);
+        self.coro_returned(stack, value);
         Ok(Next::Resume)
     }
 
@@ -177,7 +349,7 @@ impl Machine {
     ) -> Result<(), Fault> {
         let base = self.frames.last().map_or(0, |f| f.base);
         let (dst, v) = match cont {
-            Cont::Entry | Cont::Discard => return Ok(()),
+            Cont::Entry | Cont::Discard | Cont::Coro => return Ok(()),
             Cont::Write(dst) => match result {
                 Some(v) => (dst, v),
                 None => return Ok(()),
@@ -228,7 +400,6 @@ impl Machine {
         stack: &mut Vec<u64>,
         prog: &Program,
         fault: Fault,
-        fuel: &mut u64,
     ) -> Result<(), VmError> {
         let (func, pc) = self.frames.last().map_or((0, 0), |f| (f.func, f.pc));
         let value = match fault {
@@ -251,13 +422,6 @@ impl Machine {
                     pc,
                 });
             }
-            Fault::Unsupported(opcode) => {
-                return Err(VmError::Unsupported {
-                    opcode,
-                    func: FuncId(func),
-                    pc,
-                });
-            }
         };
         loop {
             let Some(frame) = self.frames.last_mut() else {
@@ -276,17 +440,25 @@ impl Machine {
             };
             if let Some(h) = found {
                 // Entering a handler is a control transfer that may go
-                // backward, so it costs fuel like a back edge.
-                if *fuel == 0 {
-                    return Err(VmError::Trap {
-                        kind: ErrorKind::OutOfFuel,
-                        func: FuncId(frame.func),
-                        pc: at,
-                    });
+                // backward, so it costs fuel like a back edge (a pending
+                // close stays armed for the next charge).
+                let (target, catch, func) = (h.target.0, h.catch, frame.func);
+                if self.fuel == 0 {
+                    if self.charge_slow(stack, None) == Charge::Spent {
+                        return Err(VmError::Trap {
+                            kind: ErrorKind::OutOfFuel,
+                            func: FuncId(func),
+                            pc: at,
+                        });
+                    }
+                } else {
+                    self.fuel -= 1;
                 }
-                *fuel -= 1;
-                frame.pc = h.target.0;
-                let slot = frame.base + h.catch.index();
+                let Some(frame) = self.frames.last_mut() else {
+                    return Ok(());
+                };
+                frame.pc = target;
+                let slot = frame.base + catch.index();
                 if let Some(s) = stack.get_mut(slot) {
                     *s = value;
                 }
@@ -296,14 +468,22 @@ impl Machine {
             let base = frame.base;
             let _ = self.frames.pop();
             stack.truncate(base);
-            if cont == Cont::Entry {
-                return Err(self.uncaught(value, func, pc));
+            match cont {
+                Cont::Entry => return Err(self.uncaught(value, func, pc)),
+                // The error escapes a coroutine's body (rule 3): it fails,
+                // unless it is being closed and the error is the close signal
+                // itself (rule 11), and the search continues at whoever drove
+                // it (the resumer's `resume`/`resume_throw`/`coro_close`/
+                // `iter_next`, still at its pc), or stops for a driver that is
+                // not a frame (the host scheduler, a drop-close).
+                Cont::Coro if self.coro_escaped(stack, value, (func, pc)) => return Ok(()),
+                _ => {}
             }
         }
     }
 
     /// The error for a value no handler caught.
-    fn uncaught(&self, value: u64, func: u32, pc: u32) -> VmError {
+    pub(crate) fn uncaught(&self, value: u64, func: u32, pc: u32) -> VmError {
         match self.heap.get(value) {
             Some(Object::Error(e)) => VmError::Raised {
                 kind: e.kind,
@@ -328,11 +508,21 @@ impl Machine {
         let Some(info) = prog.imports.get(imp as usize) else {
             return Err(Fault::type_error());
         };
-        let Machine {
-            heap, host_args, ..
-        } = self;
-        let res = info.func.call(&mut HostCtx { heap }, host_args);
-        host_args.clear();
+        let res = match &info.func {
+            HostFn::User(f) => {
+                let Machine {
+                    heap, host_args, ..
+                } = self;
+                let res = f(&mut HostCtx { heap }, host_args);
+                host_args.clear();
+                res
+            }
+            HostFn::Scheduler => {
+                let arg = self.host_args.first().copied().unwrap_or(Value::Nil);
+                self.host_args.clear();
+                return self.spawn_task(arg).map(Some);
+            }
+        };
         match res {
             Ok(v) => match info.result {
                 Some(t) => conv::slot_of(&mut self.heap, prog, t, v).map(Some),
@@ -657,6 +847,10 @@ impl Machine {
             names,
             fn_refs,
             imp_refs,
+            coros,
+            finalize,
+            sched,
+            dropped,
             ..
         } = self;
         let frame_roots = frames.iter().flat_map(|f| {
@@ -678,6 +872,30 @@ impl Machine {
             .chain(fn_refs.iter())
             .chain(imp_refs.iter())
             .copied();
-        heap.collect(frame_roots.chain(global_roots).chain(caches), prog);
+        // Running coroutines (and the iterators driving them), coroutines
+        // waiting to be closed, and the scheduler's tasks.
+        let coroutines = coros
+            .iter()
+            .flat_map(|a| {
+                let iter = match a.driver {
+                    Driver::Iter { iter, .. } => iter,
+                    _ => dynv::NIL,
+                };
+                [a.coro, iter]
+            })
+            .chain(finalize.iter().copied())
+            .chain(sched.words());
+        dropped.clear();
+        heap.collect(
+            frame_roots
+                .chain(global_roots)
+                .chain(caches)
+                .chain(coroutines),
+            prog,
+            dropped,
+        );
+        finalize.extend(dropped.iter().copied());
+        self.close_ready = !self.finalizing && !self.finalize.is_empty();
+        self.arm_close();
     }
 }

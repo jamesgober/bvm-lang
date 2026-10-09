@@ -658,3 +658,1196 @@ fn reference_and_vm_agree_on_a_known_loop() {
     // With 5 units the run traps at the 6th charge.
     assert!(agree(&vm_outcome(&p, 0, 5), &reference_outcome(&p, 0, 5)));
 }
+
+// ===========================================================================
+// Whole programs: calls, closures, heap objects, exceptions with `finally`,
+// and coroutines, against the module reference in `common/full.rs`.
+// ===========================================================================
+
+mod whole {
+    use super::*;
+    use bytecode_lang::{
+        Const, ConstId, Field, FieldIdx, FunctionBuilder, GlobalId, Kind, Label, StructDef,
+        TypeDef, TypeRef,
+    };
+    use common::full::{self, End, Shape, V, float_bits};
+
+    // Register file of every generated function (params r0, r1):
+    // r0..r7 dyn (r2, r3 generic; r4 arrays; r5 maps; r6, r7 coroutines),
+    // r8/r9 and r19/r20 loop counter and bound per nesting level (i64),
+    // r10 bool, r11/r12 and r21/r22 `finally` completion kind (i8) and
+    // value (dyn) per level, r13 catch, r14..r16 call window, r17 u8,
+    // r18 u32, r23 callee, r24 i64 scratch, r25 iterator, r26 bool, r27 i64
+    // constant 1.
+    pub(super) fn regs() -> Vec<ValType> {
+        use ValType::{Bool as B, Dyn as Dy, I8, I64 as I, U8, U32};
+        vec![
+            Dy, Dy, Dy, Dy, Dy, Dy, Dy, Dy, I, I, B, I8, Dy, Dy, Dy, Dy, Dy, U8, U32, I, I, I8, Dy,
+            Dy, I, Dy, B, I,
+        ]
+    }
+    const COND: Reg = Reg(10);
+    const CATCH: Reg = Reg(13);
+    const WIN: Reg = Reg(14);
+    const A0: Reg = Reg(15);
+    const A1: Reg = Reg(16);
+    const U8R: Reg = Reg(17);
+    const U32R: Reg = Reg(18);
+    const CALLEE: Reg = Reg(23);
+    const SCRATCH: Reg = Reg(24);
+    const ITER: Reg = Reg(25);
+    const HAS: Reg = Reg(26);
+    const ONE: Reg = Reg(27);
+
+    /// One generated item: an instruction group or a structure marker.
+    #[derive(Clone, Debug)]
+    pub(super) enum Op {
+        Load(u8, i32),
+        LoadStr(u8, u8),
+        Arith(u8, u8, u8, u8, Policy),
+        Mov(u8, u8),
+        GetG(u8, u8),
+        SetG(u8, u8),
+        NewArr(u8, i32),
+        Push(u8, u8),
+        AGet(u8, u8, i32),
+        ASet(u8, i32, u8),
+        ALen(u8, u8),
+        APop(u8, u8),
+        NewMap(u8),
+        MSet(u8, u8, u8),
+        MGet(u8, u8, u8, bool),
+        MHas(u8, u8, u8),
+        MDel(u8, u8),
+        MPush(u8, u8),
+        MLen(u8, u8),
+        NewSt(u8),
+        GetF(u8, u8, u8),
+        SetF(u8, u8, u8),
+        Concat(u8, u8, u8),
+        SLen(u8, u8),
+        Call(u8, u8, u8, u8),
+        Closure(u8, u8, u8, u8, u8, u8),
+        Tail(u8, u8, u8),
+        Throw(u8),
+        ErrCode(u8, u8),
+        Ret(u8),
+        Safepoint,
+        CoroNew(u8, u8, u8, u8),
+        Resume(u8, u8, u8),
+        ResumeThrow(u8, u8, u8),
+        Close(u8, u8, u8),
+        Yield(u8, u8),
+        YieldKv(u8, u8, u8),
+        Await(u8, u8),
+        Status(u8, u8),
+        Key(u8, u8),
+        Result(u8, u8),
+        Current(u8),
+        Spawn(u8, u8),
+        ForGen(u8, u8, u8, u8, bool),
+        OpenIf(u8, u8),
+        OpenLoop(i32, bool),
+        OpenTry,
+        OpenFinally(bool),
+        Else,
+        End,
+    }
+
+    fn make_op(k: u8, x: [u8; 6], i: i32, p: Policy) -> Op {
+        let [a, b, c, d, e, f] = x;
+        match k {
+            0..6 => Op::Load(a, i),
+            6..9 => Op::LoadStr(a, b),
+            9..15 => Op::Arith(a, b, c, d, p),
+            15..20 => Op::Resume(a, b, c),
+            20..23 => Op::Mov(a, b),
+            23..25 => Op::GetG(a, b),
+            25..27 => Op::SetG(a, b),
+            27..29 => Op::NewArr(a, i % 4),
+            29..31 => Op::Push(a, b),
+            31 => Op::AGet(a, b, i % 4),
+            32 => Op::ASet(a, i % 4, b),
+            33 => Op::ALen(a, b),
+            34 => Op::APop(a, b),
+            35..37 => Op::NewMap(a),
+            37..39 => Op::MSet(a, b, c),
+            39 => Op::MGet(a, b, c, false),
+            40 => Op::MGet(a, b, c, true),
+            41 => Op::MHas(a, b, c),
+            42 => Op::MDel(a, b),
+            43 => Op::MPush(a, b),
+            44 => Op::MLen(a, b),
+            45 => Op::NewSt(a),
+            46 => Op::GetF(a, b, c),
+            47 => Op::SetF(a, b, c),
+            48 => Op::Concat(a, b, c),
+            49 => Op::SLen(a, b),
+            50..53 => Op::Call(a, b, c, d),
+            53..55 => Op::Closure(a, b, c, d, e, f),
+            55 => Op::Tail(a, b, c),
+            56..58 => Op::Throw(a),
+            58 => Op::ErrCode(a, b),
+            59 => Op::Ret(a),
+            60 => Op::Safepoint,
+            61..64 => Op::CoroNew(a, b, c, d),
+            64..68 => Op::Resume(a, b, c),
+            68 => Op::ResumeThrow(a, b, c),
+            69..71 => Op::Close(a, b, c),
+            71..75 => Op::Yield(a, b),
+            75 => Op::YieldKv(a, b, c),
+            76 => Op::Await(a, b),
+            77 => Op::Status(a, b),
+            78 => Op::Key(a, b),
+            79 if x[5] % 2 == 0 => Op::YieldKv(a, b, c),
+            79 => Op::Result(a, b),
+            80 => Op::Current(a),
+            81 => Op::Spawn(a, b),
+            82..84 => Op::ForGen(a, b, c, d, e % 2 == 0),
+            84..87 => Op::OpenIf(a, b),
+            87..89 => Op::OpenLoop(i.rem_euclid(4), a % 2 == 0),
+            89..92 => Op::OpenTry,
+            92..95 => Op::OpenFinally(a % 3 == 0),
+            95..97 => Op::Else,
+            _ => Op::End,
+        }
+    }
+
+    /// An op and whether it gets its own catch-all region (most do, so a
+    /// run continues past the errors random code raises).
+    pub(super) fn op() -> impl Strategy<Value = (Op, bool)> {
+        (0u8..100, any::<[u8; 6]>(), -3i32..12, dyn_policy(), 0u8..10)
+            .prop_map(|(k, x, i, p, g)| (make_op(k, x, i, p), g < 6))
+    }
+
+    /// A generic destination: r0..r3, mostly r2/r3.
+    fn dst(v: u8) -> Reg {
+        Reg([2, 3, 2, 3, 0, 1][usize::from(v % 6)])
+    }
+    /// A generic source: any dyn register or the catch register.
+    fn src(v: u8) -> Reg {
+        Reg([0, 1, 2, 3, 4, 5, 6, 7, 13][usize::from(v % 9)])
+    }
+    /// A register of a role (`r`), sometimes another one (error paths).
+    fn role(r: u16, v: u8) -> Reg {
+        if v < 224 { Reg(r) } else { src(v) }
+    }
+    fn coro(v: u8) -> Reg {
+        role(6 + u16::from(v % 2), v)
+    }
+    fn func(v: u8) -> FuncId {
+        FuncId(u32::from(v % 5))
+    }
+
+    enum Open {
+        If {
+            else_l: Label,
+            end_l: Label,
+            in_else: bool,
+        },
+        Loop {
+            top: Label,
+            done: Label,
+            level: u16,
+        },
+        Try {
+            start: Label,
+            end: Label,
+            h: Label,
+            after: Label,
+            in_catch: bool,
+        },
+        Fin {
+            start: Label,
+            end: Label,
+            h: Label,
+            fin: Label,
+            after: Label,
+            level: u16,
+            in_fin: bool,
+            over: bool,
+        },
+    }
+
+    struct Gen<'a> {
+        f: &'a mut FunctionBuilder,
+        arr: TypeRef,
+        map: TypeRef,
+        st: TypeRef,
+        strs: [ConstId; 3],
+        closure_fn: FuncId,
+        open: Vec<Open>,
+    }
+
+    impl Gen<'_> {
+        fn e(&mut self, i: Inst) {
+            let _ = self.f.emit(i);
+        }
+        fn mov(&mut self, d: Reg, s: Reg) {
+            let _ = self.f.mov(d, s);
+        }
+        fn loops(&self) -> u16 {
+            let n = self
+                .open
+                .iter()
+                .filter(|o| matches!(o, Open::Loop { .. }))
+                .count();
+            u16::try_from(n).unwrap_or(0)
+        }
+        fn fins(&self) -> u16 {
+            let n = self
+                .open
+                .iter()
+                .filter(|o| matches!(o, Open::Fin { .. }))
+                .count();
+            u16::try_from(n).unwrap_or(0)
+        }
+        fn in_try(&self) -> bool {
+            self.open
+                .iter()
+                .any(|o| matches!(o, Open::Try { .. } | Open::Fin { .. }))
+        }
+        fn args(&mut self, a: u8, b: u8) {
+            self.mov(A0, src(a));
+            self.mov(A1, src(b));
+        }
+        fn box_dyn(&mut self, d: Reg, s: Reg, from: Prim) {
+            self.e(Inst::ToDyn {
+                dst: d,
+                src: s,
+                from,
+            });
+        }
+
+        /// Emits `op`, inside its own catch-all region when `guard`ed: the
+        /// handler is the next instruction, so an error is swallowed (the
+        /// catch register keeps it) and execution continues.
+        fn guarded(&mut self, op: &Op, guard: bool) {
+            let plain = !matches!(
+                op,
+                Op::Tail(..)
+                    | Op::OpenIf(..)
+                    | Op::OpenLoop(..)
+                    | Op::OpenTry
+                    | Op::OpenFinally(..)
+                    | Op::Else
+                    | Op::End
+            );
+            if !(guard && plain) {
+                self.op(op);
+                return;
+            }
+            let (s, e) = (self.f.label(), self.f.label());
+            self.f.bind(s);
+            self.op(op);
+            self.f.bind(e);
+            self.f.try_region(s, e, e, CATCH);
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn op(&mut self, op: &Op) {
+            match *op {
+                Op::Load(d, v) => self.e(Inst::DLoadInt {
+                    dst: dst(d),
+                    val: v,
+                }),
+                Op::LoadStr(d, w) => {
+                    let k = self.strs[usize::from(w % 3)];
+                    self.e(Inst::DLoadConst { dst: dst(d), k });
+                }
+                Op::Arith(w, d, a, b, pol) => {
+                    let (d, lhs, rhs) = (dst(d), src(a), src(b));
+                    match w % 7 {
+                        0 => self.e(Inst::DAdd {
+                            dst: d,
+                            lhs,
+                            rhs,
+                            pol,
+                        }),
+                        1 => self.e(Inst::DSub {
+                            dst: d,
+                            lhs,
+                            rhs,
+                            pol,
+                        }),
+                        2 => self.e(Inst::DMul {
+                            dst: d,
+                            lhs,
+                            rhs,
+                            pol,
+                        }),
+                        3 => self.e(Inst::DDiv {
+                            dst: d,
+                            lhs,
+                            rhs,
+                            pol,
+                        }),
+                        4 => self.e(Inst::DConcat { dst: d, lhs, rhs }),
+                        5 => {
+                            self.e(Inst::DLt {
+                                dst: COND,
+                                lhs,
+                                rhs,
+                            });
+                            self.box_dyn(d, COND, Prim::Bool);
+                        }
+                        _ => {
+                            self.e(Inst::DEq {
+                                dst: COND,
+                                lhs,
+                                rhs,
+                            });
+                            self.box_dyn(d, COND, Prim::Bool);
+                        }
+                    }
+                }
+                Op::Mov(d, s) => self.mov(Reg([2, 3, 4, 5, 6, 7][usize::from(d % 6)]), src(s)),
+                Op::GetG(d, g) => self.e(Inst::GetGlobal {
+                    dst: dst(d),
+                    global: GlobalId(u32::from(g % 2)),
+                }),
+                Op::SetG(g, s) => self.e(Inst::SetGlobal {
+                    global: GlobalId(u32::from(g % 2)),
+                    src: src(s),
+                }),
+                Op::NewArr(d, len) => {
+                    self.e(Inst::LoadInt {
+                        dst: SCRATCH,
+                        val: len,
+                        ty: IntTy::I64,
+                    });
+                    let ty = self.arr;
+                    self.e(Inst::NewArray {
+                        dst: role(4, d),
+                        len: SCRATCH,
+                        ty,
+                    });
+                }
+                Op::Push(a, v) => self.e(Inst::ArrayPush {
+                    arr: role(4, a),
+                    src: src(v),
+                }),
+                Op::AGet(d, a, i) => {
+                    self.e(Inst::LoadInt {
+                        dst: SCRATCH,
+                        val: i,
+                        ty: IntTy::I64,
+                    });
+                    self.e(Inst::ArrayGet {
+                        dst: dst(d),
+                        arr: role(4, a),
+                        idx: SCRATCH,
+                    });
+                }
+                Op::ASet(a, i, v) => {
+                    self.e(Inst::LoadInt {
+                        dst: SCRATCH,
+                        val: i,
+                        ty: IntTy::I64,
+                    });
+                    self.e(Inst::ArraySet {
+                        arr: role(4, a),
+                        idx: SCRATCH,
+                        src: src(v),
+                    });
+                }
+                Op::ALen(d, a) => {
+                    self.e(Inst::ArrayLen {
+                        dst: SCRATCH,
+                        arr: role(4, a),
+                    });
+                    self.box_dyn(dst(d), SCRATCH, Prim::I64);
+                }
+                Op::APop(d, a) => self.e(Inst::ArrayPop {
+                    dst: dst(d),
+                    arr: role(4, a),
+                }),
+                Op::NewMap(d) => {
+                    let ty = self.map;
+                    self.e(Inst::NewMap {
+                        dst: role(5, d),
+                        ty,
+                    });
+                }
+                Op::MSet(m, k, v) => self.e(Inst::MapSet {
+                    map: role(5, m),
+                    key: src(k),
+                    src: src(v),
+                }),
+                Op::MGet(d, m, k, find) => {
+                    let (dst, map, key) = (dst(d), role(5, m), src(k));
+                    if find {
+                        self.e(Inst::MapFind { dst, map, key });
+                    } else {
+                        self.e(Inst::MapGet { dst, map, key });
+                    }
+                }
+                Op::MHas(d, m, k) => {
+                    self.e(Inst::MapHas {
+                        dst: COND,
+                        map: role(5, m),
+                        key: src(k),
+                    });
+                    self.box_dyn(dst(d), COND, Prim::Bool);
+                }
+                Op::MDel(m, k) => self.e(Inst::MapDel {
+                    map: role(5, m),
+                    key: src(k),
+                }),
+                Op::MPush(m, v) => self.e(Inst::MapPush {
+                    map: role(5, m),
+                    src: src(v),
+                }),
+                Op::MLen(d, m) => {
+                    self.e(Inst::MapLen {
+                        dst: SCRATCH,
+                        map: role(5, m),
+                    });
+                    self.box_dyn(dst(d), SCRATCH, Prim::I64);
+                }
+                Op::NewSt(d) => {
+                    let ty = self.st;
+                    self.e(Inst::NewStruct {
+                        dst: role(3, d),
+                        ty,
+                    });
+                }
+                Op::GetF(d, o, fl) => self.e(Inst::GetField {
+                    dst: dst(d),
+                    obj: role(3, o),
+                    field: FieldIdx(u16::from(fl % 2)),
+                }),
+                Op::SetF(o, fl, v) => self.e(Inst::SetField {
+                    obj: role(3, o),
+                    field: FieldIdx(u16::from(fl % 2)),
+                    src: src(v),
+                }),
+                Op::Concat(d, a, b) => self.e(Inst::StrConcat {
+                    dst: dst(d),
+                    lhs: src(a),
+                    rhs: src(b),
+                }),
+                Op::SLen(d, s) => {
+                    self.e(Inst::StrLen {
+                        dst: SCRATCH,
+                        s: src(s),
+                    });
+                    self.box_dyn(dst(d), SCRATCH, Prim::I64);
+                }
+                Op::Call(d, fv, a, b) => {
+                    self.args(a, b);
+                    self.e(Inst::Call {
+                        dst: WIN,
+                        func: func(fv),
+                        argc: 2,
+                    });
+                    self.mov(dst(d), WIN);
+                }
+                Op::Closure(d, ca, cb, a, b, mode) => {
+                    self.args(ca, cb);
+                    let cf = self.closure_fn;
+                    self.e(Inst::MakeClosure { dst: WIN, func: cf });
+                    self.mov(CALLEE, WIN);
+                    self.args(a, b);
+                    match mode % 3 {
+                        0 => self.e(Inst::CallIndirect {
+                            dst: WIN,
+                            callee: CALLEE,
+                            argc: 2,
+                        }),
+                        1 => self.e(Inst::DCall {
+                            dst: WIN,
+                            callee: CALLEE,
+                            argc: 2,
+                        }),
+                        _ => self.e(Inst::CoroNewIndirect {
+                            dst: WIN,
+                            callee: CALLEE,
+                            argc: 2,
+                        }),
+                    }
+                    let out = if mode % 3 == 2 { coro(d) } else { dst(d) };
+                    self.mov(out, WIN);
+                }
+                Op::Tail(fv, a, b) => {
+                    // No tail call inside a try region (LSB V-CF4).
+                    if !self.in_try() {
+                        self.args(a, b);
+                        self.e(Inst::TailCall {
+                            func: func(fv),
+                            args: A0,
+                            argc: 2,
+                        });
+                    }
+                }
+                Op::Throw(s) => self.e(Inst::Throw { src: src(s) }),
+                Op::ErrCode(d, s) => {
+                    self.e(Inst::ErrCode {
+                        dst: U32R,
+                        src: src(s),
+                    });
+                    self.box_dyn(dst(d), U32R, Prim::U32);
+                }
+                Op::Ret(s) => self.ret(src(s)),
+                Op::Safepoint => self.e(Inst::Safepoint {}),
+                Op::CoroNew(d, fv, a, b) => {
+                    self.args(a, b);
+                    self.e(Inst::CoroNew {
+                        dst: WIN,
+                        func: func(fv),
+                        argc: 2,
+                    });
+                    self.mov(coro(d), WIN);
+                }
+                Op::Resume(d, c, v) => self.e(Inst::Resume {
+                    dst: dst(d),
+                    coro: coro(c),
+                    src: src(v),
+                }),
+                Op::ResumeThrow(d, c, v) => self.e(Inst::ResumeThrow {
+                    dst: dst(d),
+                    coro: coro(c),
+                    src: src(v),
+                }),
+                Op::Close(d, c, v) => self.e(Inst::CoroClose {
+                    dst: dst(d),
+                    coro: coro(c),
+                    src: src(v),
+                }),
+                Op::Yield(d, v) => self.e(Inst::Yield {
+                    dst: dst(d),
+                    src: src(v),
+                }),
+                Op::YieldKv(d, k, v) => self.e(Inst::YieldKv {
+                    dst: dst(d),
+                    key: src(k),
+                    src: src(v),
+                }),
+                Op::Await(d, v) => self.e(Inst::Await {
+                    dst: dst(d),
+                    src: src(v),
+                }),
+                Op::Status(d, c) => {
+                    self.e(Inst::CoroStatus {
+                        dst: U8R,
+                        coro: coro(c),
+                    });
+                    self.box_dyn(dst(d), U8R, Prim::U8);
+                }
+                Op::Key(d, c) => self.e(Inst::CoroKey {
+                    dst: dst(d),
+                    coro: coro(c),
+                }),
+                Op::Result(d, c) => self.e(Inst::CoroResult {
+                    dst: dst(d),
+                    coro: coro(c),
+                }),
+                Op::Current(d) => self.e(Inst::CoroCurrent { dst: coro(d) }),
+                Op::Spawn(d, fv) => {
+                    self.e(Inst::MakeClosure {
+                        dst: CALLEE,
+                        func: func(fv),
+                    });
+                    self.e(Inst::Spawn {
+                        dst: WIN,
+                        callee: CALLEE,
+                        argc: 2,
+                    });
+                    self.mov(dst(d), WIN);
+                }
+                Op::ForGen(acc, fv, a, b, keys) => {
+                    let acc = dst(acc);
+                    self.e(Inst::DLoadInt { dst: acc, val: 0 });
+                    self.args(a, b);
+                    self.e(Inst::CoroNew {
+                        dst: WIN,
+                        func: func(fv),
+                        argc: 2,
+                    });
+                    self.e(Inst::DIterNew {
+                        dst: ITER,
+                        src: WIN,
+                    });
+                    let (top, done) = (self.f.label(), self.f.label());
+                    self.f.bind(top);
+                    self.e(Inst::IterNext {
+                        has: HAS,
+                        iter: ITER,
+                        val: WIN,
+                    });
+                    let _ = self.f.jmp_if_not(HAS, done);
+                    if keys {
+                        self.e(Inst::IterKey {
+                            dst: WIN,
+                            iter: ITER,
+                        });
+                    }
+                    self.e(Inst::DAdd {
+                        dst: acc,
+                        lhs: acc,
+                        rhs: WIN,
+                        pol: Policy::new(),
+                    });
+                    self.e(Inst::Safepoint {});
+                    let _ = self.f.jmp(top);
+                    self.f.bind(done);
+                }
+                Op::OpenIf(a, b) => {
+                    if self.open.len() < 2 {
+                        let (else_l, end_l) = (self.f.label(), self.f.label());
+                        self.e(Inst::DLt {
+                            dst: COND,
+                            lhs: src(a),
+                            rhs: src(b),
+                        });
+                        let _ = self.f.jmp_if_not(COND, else_l);
+                        self.open.push(Open::If {
+                            else_l,
+                            end_l,
+                            in_else: false,
+                        });
+                    }
+                }
+                Op::OpenLoop(n, sp) => {
+                    if self.open.len() < 2 {
+                        let level = self.loops();
+                        let (ctr, bound) = if level == 0 {
+                            (Reg(8), Reg(9))
+                        } else {
+                            (Reg(19), Reg(20))
+                        };
+                        self.e(Inst::LoadInt {
+                            dst: ctr,
+                            val: 0,
+                            ty: IntTy::I64,
+                        });
+                        self.e(Inst::LoadInt {
+                            dst: bound,
+                            val: n,
+                            ty: IntTy::I64,
+                        });
+                        let (top, done) = (self.f.label(), self.f.label());
+                        self.f.bind(top);
+                        self.e(Inst::ILt {
+                            dst: COND,
+                            lhs: ctr,
+                            rhs: bound,
+                            ty: IntTy::I64,
+                        });
+                        let _ = self.f.jmp_if_not(COND, done);
+                        if sp {
+                            self.e(Inst::Safepoint {});
+                        }
+                        self.open.push(Open::Loop { top, done, level });
+                    }
+                }
+                Op::OpenTry => {
+                    if self.open.len() < 2 {
+                        let (start, end, h, after) = (
+                            self.f.label(),
+                            self.f.label(),
+                            self.f.label(),
+                            self.f.label(),
+                        );
+                        self.f.bind(start);
+                        self.e(Inst::Nop {});
+                        self.open.push(Open::Try {
+                            start,
+                            end,
+                            h,
+                            after,
+                            in_catch: false,
+                        });
+                    }
+                }
+                Op::OpenFinally(over) => {
+                    if self.open.len() < 2 {
+                        let level = self.fins();
+                        let (start, end, h, fin, after) = (
+                            self.f.label(),
+                            self.f.label(),
+                            self.f.label(),
+                            self.f.label(),
+                            self.f.label(),
+                        );
+                        self.f.bind(start);
+                        self.e(Inst::Nop {});
+                        self.open.push(Open::Fin {
+                            start,
+                            end,
+                            h,
+                            fin,
+                            after,
+                            level,
+                            in_fin: false,
+                            over,
+                        });
+                    }
+                }
+                Op::Else => self.else_(),
+                Op::End => self.close(),
+            }
+        }
+
+        /// The entry function's final state, observable through global 1:
+        /// `[r0, ..., r7, key(r6), key(r7)]` (the coroutines' states show in
+        /// their shapes).
+        fn epilogue(&mut self) {
+            let arr = self.arr;
+            self.e(Inst::LoadInt {
+                dst: SCRATCH,
+                val: 0,
+                ty: IntTy::I64,
+            });
+            self.e(Inst::NewArray {
+                dst: WIN,
+                len: SCRATCH,
+                ty: arr,
+            });
+            for r in 0..8 {
+                self.e(Inst::ArrayPush {
+                    arr: WIN,
+                    src: Reg(r),
+                });
+            }
+            for c in [6u16, 7] {
+                let (s, e) = (self.f.label(), self.f.label());
+                self.e(Inst::LoadNil { dst: A0 });
+                self.f.bind(s);
+                self.e(Inst::CoroKey {
+                    dst: A0,
+                    coro: Reg(c),
+                });
+                self.f.bind(e);
+                self.f.try_region(s, e, e, CATCH);
+                self.e(Inst::ArrayPush { arr: WIN, src: A0 });
+            }
+            self.e(Inst::SetGlobal {
+                global: GlobalId(1),
+                src: WIN,
+            });
+        }
+
+        fn fin_regs(level: u16) -> (Reg, Reg) {
+            if level == 0 {
+                (Reg(11), Reg(12))
+            } else {
+                (Reg(21), Reg(22))
+            }
+        }
+
+        /// `return s`: through the innermost pending `finally` (canonical
+        /// lowering, LSB §4.3), else directly.
+        fn ret(&mut self, s: Reg) {
+            let pending = self.open.iter().rev().find_map(|o| match o {
+                Open::Fin {
+                    fin,
+                    level,
+                    in_fin: false,
+                    ..
+                } => Some((*fin, *level)),
+                _ => None,
+            });
+            match pending {
+                Some((fin, level)) => {
+                    let (kind, val) = Self::fin_regs(level);
+                    self.mov(val, s);
+                    self.e(Inst::LoadInt {
+                        dst: kind,
+                        val: 1,
+                        ty: IntTy::I8,
+                    });
+                    let _ = self.f.jmp(fin);
+                }
+                None => {
+                    let _ = self.f.ret(s);
+                }
+            }
+        }
+
+        fn else_(&mut self) {
+            let Some(top) = self.open.pop() else { return };
+            let top = match top {
+                Open::If {
+                    else_l,
+                    end_l,
+                    in_else: false,
+                } => {
+                    let _ = self.f.jmp(end_l);
+                    self.f.bind(else_l);
+                    Open::If {
+                        else_l,
+                        end_l,
+                        in_else: true,
+                    }
+                }
+                Open::Try {
+                    start,
+                    end,
+                    h,
+                    after,
+                    in_catch: false,
+                } => {
+                    let _ = self.f.jmp(after);
+                    self.f.bind(end);
+                    self.f.bind(h);
+                    Open::Try {
+                        start,
+                        end,
+                        h,
+                        after,
+                        in_catch: true,
+                    }
+                }
+                Open::Fin {
+                    start,
+                    end,
+                    h,
+                    fin,
+                    after,
+                    level,
+                    in_fin: false,
+                    over,
+                } => {
+                    let (kind, val) = Self::fin_regs(level);
+                    self.e(Inst::LoadInt {
+                        dst: kind,
+                        val: 0,
+                        ty: IntTy::I8,
+                    });
+                    let _ = self.f.jmp(fin);
+                    self.f.bind(end);
+                    self.f.bind(h);
+                    self.mov(val, CATCH);
+                    self.e(Inst::LoadInt {
+                        dst: kind,
+                        val: 2,
+                        ty: IntTy::I8,
+                    });
+                    self.f.bind(fin);
+                    Open::Fin {
+                        start,
+                        end,
+                        h,
+                        fin,
+                        after,
+                        level,
+                        in_fin: true,
+                        over,
+                    }
+                }
+                other => other,
+            };
+            self.open.push(top);
+        }
+
+        fn close(&mut self) {
+            // Finish the first part of a two-part construct first.
+            let needs_else = matches!(
+                self.open.last(),
+                Some(
+                    Open::Try {
+                        in_catch: false,
+                        ..
+                    } | Open::Fin { in_fin: false, .. }
+                )
+            );
+            if needs_else {
+                self.else_();
+            }
+            let Some(top) = self.open.pop() else { return };
+            match top {
+                Open::If {
+                    else_l,
+                    end_l,
+                    in_else,
+                } => {
+                    if !in_else {
+                        self.f.bind(else_l);
+                    }
+                    self.f.bind(end_l);
+                }
+                Open::Loop { top, done, level } => {
+                    let ctr = if level == 0 { Reg(8) } else { Reg(19) };
+                    self.e(Inst::IAdd {
+                        dst: ctr,
+                        lhs: ctr,
+                        rhs: ONE,
+                        op: IntOp::new(IntTy::I64),
+                    });
+                    let _ = self.f.jmp(top);
+                    self.f.bind(done);
+                }
+                Open::Try {
+                    start,
+                    end,
+                    h,
+                    after,
+                    ..
+                } => {
+                    self.f.bind(after);
+                    self.f.try_region(start, end, h, CATCH);
+                }
+                Open::Fin {
+                    start,
+                    end,
+                    h,
+                    after,
+                    level,
+                    over,
+                    ..
+                } => {
+                    let (kind, val) = Self::fin_regs(level);
+                    if over {
+                        // `return` in `finally` overrides the pending
+                        // completion (LSB §4.3 rule 3).
+                        let _ = self.f.ret(Reg(2));
+                    } else {
+                        let (l_ret, l_throw) = (self.f.label(), self.f.label());
+                        let _ = self
+                            .f
+                            .switch(IntTy::I8, kind, &[after, l_ret, l_throw], after);
+                        self.f.bind(l_ret);
+                        let _ = self.f.ret(val);
+                        self.f.bind(l_throw);
+                        self.e(Inst::Throw { src: val });
+                    }
+                    self.f.bind(after);
+                    self.f.try_region(start, end, h, CATCH);
+                }
+            }
+        }
+    }
+
+    /// Builds the module: five functions `(dyn, dyn) -> dyn` (0 is the
+    /// entry) and a closure body with two captures, each from its op list.
+    pub(super) fn build(bodies: &[Vec<(Op, bool)>; 6]) -> Program {
+        let mut m = ModuleBuilder::new();
+        let at = m.add_type(TypeDef::Array(ValType::Dyn));
+        let mt = m.add_type(TypeDef::Map {
+            key: ValType::Dyn,
+            value: ValType::Dyn,
+        });
+        let (sa, sb, sname) = (m.string("a"), m.string("b"), m.string("S"));
+        let st = m.add_type(TypeDef::Struct(StructDef {
+            name: sname,
+            fields: vec![
+                Field {
+                    name: sa,
+                    ty: ValType::Dyn,
+                },
+                Field {
+                    name: sb,
+                    ty: ValType::Dyn,
+                },
+            ],
+            ..Default::default()
+        }));
+        let strs = [
+            m.constant(Const::Bytes(b"a".to_vec())),
+            m.constant(Const::Bytes(b"bc".to_vec())),
+            m.constant(Const::Bytes(Vec::new())),
+        ];
+        let _g0 = m.global("g0", ValType::Dyn, true, None);
+        let _g1 = m.global("g1", ValType::Dyn, true, None);
+        let d = ValType::Dyn;
+        let mut builders: Vec<FunctionBuilder> = (0..6)
+            .map(|i| m.function(&format!("f{i}"), &[d, d], &[d]))
+            .collect();
+        let closure_fn = builders[5].id();
+        for (i, fb) in builders.iter_mut().enumerate() {
+            if i == 5 {
+                let _ = fb.capture(d);
+                let _ = fb.capture(d);
+            }
+            for &t in &regs()[2..] {
+                let _ = fb.reg(t);
+            }
+            let (arr, map, sty) = (fb.type_ref(at), fb.type_ref(mt), fb.type_ref(st));
+            let _ = fb.emit(Inst::LoadInt {
+                dst: ONE,
+                val: 1,
+                ty: IntTy::I64,
+            });
+            if i == 5 {
+                let _ = fb.emit(Inst::GetUpval {
+                    dst: Reg(2),
+                    idx: bytecode_lang::UpvalIdx(0),
+                });
+                let _ = fb.emit(Inst::GetUpval {
+                    dst: Reg(3),
+                    idx: bytecode_lang::UpvalIdx(1),
+                });
+            }
+            // Role registers start as an array, a map, and (in the entry
+            // function) two coroutines, so most operations reach their
+            // interesting cases rather than `NullReference`.
+            let _ = fb.emit(Inst::LoadInt {
+                dst: SCRATCH,
+                val: 0,
+                ty: IntTy::I64,
+            });
+            let _ = fb.emit(Inst::NewArray {
+                dst: Reg(4),
+                len: SCRATCH,
+                ty: arr,
+            });
+            let _ = fb.emit(Inst::NewMap {
+                dst: Reg(5),
+                ty: map,
+            });
+            if i == 0 {
+                for (r, body) in [(6u16, 1u32), (7, 2)] {
+                    let _ = fb.mov(A0, Reg(0));
+                    let _ = fb.mov(A1, Reg(1));
+                    let _ = fb.emit(Inst::CoroNew {
+                        dst: WIN,
+                        func: FuncId(body),
+                        argc: 2,
+                    });
+                    let _ = fb.mov(Reg(r), WIN);
+                }
+            }
+            let mut g = Gen {
+                f: fb,
+                arr,
+                map,
+                st: sty,
+                strs,
+                closure_fn,
+                open: Vec::new(),
+            };
+            for (op, guard) in &bodies[i] {
+                g.guarded(op, *guard);
+            }
+            while !g.open.is_empty() {
+                g.close();
+            }
+            if i == 0 {
+                g.epilogue();
+            }
+            let _ = g.f.ret(Reg(2));
+        }
+        for fb in builders {
+            let _ = m.add_function(fb).expect("generated functions build");
+        }
+        Program::load(m.finish().expect("module builds"), &Host::new())
+            .expect("generated programs load")
+    }
+
+    pub(super) fn vm_shape(vm: &Vm<'_>, v: Value, depth: usize) -> Shape {
+        if depth == 0 {
+            return Shape::Deep;
+        }
+        match v {
+            Value::Nil => Shape::Nil,
+            Value::Bool(b) => Shape::Bool(b),
+            Value::Int(i) => Shape::Int(i),
+            Value::UInt(u) => Shape::Int(u as i64),
+            Value::Float(f) => Shape::Float(float_bits(f)),
+            Value::Obj(_) => match vm.kind(v) {
+                Kind::Str => Shape::Str(vm.str_bytes(v).unwrap_or_default().to_vec()),
+                Kind::Array => Shape::Arr(
+                    vm.elements(v)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|x| vm_shape(vm, x, depth - 1))
+                        .collect(),
+                ),
+                Kind::Map => Shape::Map(
+                    vm.entries(v)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(k, x)| (vm_shape(vm, k, depth - 1), vm_shape(vm, x, depth - 1)))
+                        .collect(),
+                ),
+                Kind::Object => Shape::Struct(
+                    (0..)
+                        .map_while(|i| vm.field(v, i))
+                        .map(|x| vm_shape(vm, x, depth - 1))
+                        .collect(),
+                ),
+                Kind::Function => Shape::Func,
+                Kind::Error => Shape::Err(vm.error_code(v).unwrap_or(0)),
+                Kind::Iter => Shape::Iter,
+                Kind::Coroutine => {
+                    Shape::Coro(vm.coro_state(v).map_or(255, bytecode_lang::CoroState::code))
+                }
+                Kind::Nil => Shape::Nil,
+                other => panic!("unexpected kind {other:?}"),
+            },
+            other => panic!("unexpected value {other:?}"),
+        }
+    }
+
+    pub(super) type WRun = (End, u64, Vec<Shape>);
+
+    /// The VM's outcome, or `None` when it collected (when dropped
+    /// coroutines are closed is the VM's own timing; the reference never
+    /// collects).
+    pub(super) fn vm_run(p: &Program, args: (i32, i32), fuel: u64, depth: usize) -> Option<WRun> {
+        let mut vm = Vm::new(p);
+        let limits = Limits::new().with_fuel(fuel).with_depth(depth);
+        let argv = [Value::Int(args.0.into()), Value::Int(args.1.into())];
+        let out = vm.run_with(FuncId(0), &argv, limits);
+        if vm.collections() > 0 {
+            return None;
+        }
+        let end = match out {
+            Ok(v) => End::Ret(vm_shape(&vm, v, full::SHAPE_DEPTH)),
+            Err(VmError::Raised { kind, func, pc }) => End::Raised(kind, func.0, pc),
+            Err(VmError::Thrown { value, func, pc }) => {
+                End::Thrown(vm_shape(&vm, value, full::SHAPE_DEPTH), func.0, pc)
+            }
+            Err(VmError::Trap { kind, func, pc }) => End::Trapped(kind, func.0, pc),
+            Err(e) => panic!("unexpected {e}"),
+        };
+        let globals = (0..2)
+            .map(|i| {
+                let g = vm.global(GlobalId(i)).unwrap_or(Value::Nil);
+                vm_shape(&vm, g, full::SHAPE_DEPTH)
+            })
+            .collect();
+        Some((end, vm.fuel_used(), globals))
+    }
+
+    pub(super) fn ref_run(p: &Program, args: (i32, i32), fuel: u64, depth: usize) -> WRun {
+        full::run(
+            p.module(),
+            FuncId(0),
+            &[V::Int(args.0.into()), V::Int(args.1.into())],
+            fuel,
+            depth,
+        )
+    }
+}
+
+fn bodies() -> impl Strategy<Value = [Vec<(whole::Op, bool)>; 6]> {
+    let one = || proptest::collection::vec(whole::op(), 0..24);
+    (one(), one(), one(), one(), one(), one()).prop_map(|(a, b, c, d, e, f)| [a, b, c, d, e, f])
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(3_000))]
+
+    /// Random multi-function programs with calls (direct, indirect, dynamic,
+    /// tail), closures, arrays, maps, structs, strings, try/catch,
+    /// try/finally (including `return` in `finally` overriding a pending
+    /// completion), and coroutines (generators, `resume`/`resume_throw`/
+    /// `coro_close`, keys, iteration): the VM and the reference agree on the
+    /// outcome (value, error kind and location, trap), the fuel used, and the
+    /// globals, under random fuel and call-depth limits.
+    #[test]
+    fn prop_whole_programs_match_the_reference(
+        b in bodies(),
+        args in (-3i32..5, -3i32..5),
+        fuel in 0u64..3_000,
+        depth in 2usize..40,
+    ) {
+        let p = whole::build(&b);
+        if let Some(vm) = whole::vm_run(&p, args, fuel, depth) {
+            let r = whole::ref_run(&p, args, fuel, depth);
+            prop_assert_eq!(vm, r);
+        }
+    }
+}

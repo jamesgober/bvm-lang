@@ -1,7 +1,7 @@
 # bvm-lang &mdash; API Reference
 
 > Complete reference for every public item in `bvm-lang`, with examples.
-> **Status: 2.0.0-alpha.1, a pre-release.** The surface may still change before
+> **Status: 2.0.0-alpha.2, a pre-release.** The surface may still change before
 > `2.0.0` (see [Stability](#stability) and [`STABILITY.md`](./STABILITY.md)).
 > Instruction semantics are those of LSB (`_lexersketch/specs/LSB.md`) and OPS
 > (`_lexersketch/specs/OPS.md`); this file documents the Rust API around them.
@@ -20,6 +20,8 @@
   - [Fuel and the other budgets](#fuel-and-the-other-budgets)
   - [Hooks](#hooks)
   - [Maps as PHP arrays](#maps-as-php-arrays)
+  - [Coroutines](#coroutines)
+  - [Tasks and the built-in scheduler](#tasks-and-the-built-in-scheduler)
   - [Memory and collection](#memory-and-collection)
   - [Instruction coverage](#instruction-coverage)
 - [`Program`](#program)
@@ -34,6 +36,8 @@
   - [`Vm::run`](#vmrun)
   - [`Vm::run_with`](#vmrun_with)
   - [`Vm::run_export`](#vmrun_export)
+  - [`Vm::run_async`](#vmrun_async)
+  - [`Vm::run_finalizers`](#vmrun_finalizers)
   - [Inspecting values](#inspecting-values)
   - [Heap and fuel statistics](#heap-and-fuel-statistics)
 - [`Limits`](#limits)
@@ -62,7 +66,7 @@
 
 ```toml
 [dependencies]
-bvm-lang = "=2.0.0-alpha.1"
+bvm-lang = "=2.0.0-alpha.2"
 bytecode-lang = "0.2"
 ```
 
@@ -167,18 +171,26 @@ value).
 
 ### Fuel and the other budgets
 
-One unit of fuel is charged at every `safepoint`, every call-family
-instruction (`call`, `call_indirect`, `call_import`, `tail_call`,
-`tail_call_indirect`, `dcall`, and every hook invocation), every taken branch
-to a target at or before the branching instruction (`jmp`, `jmp_if`,
-`jmp_if_not`, `switch`), and every handler entry. Between two charges a run
-executes at most one function's length of instructions, so fuel bounds total
-work even for modules a verifier would reject for lacking safepoints.
+Fuel follows LSB §5.14, the rule every tier shares so that a run under a
+budget stops at the same function and pc on each. One unit is charged at
+every `safepoint`, every call-family instruction (`call`, `call_indirect`,
+`call_import`, `tail_call`, `tail_call_indirect`, `dcall`, and every hook
+invocation), every taken branch to a target at or before the branching
+instruction (`jmp`, `jmp_if`, `jmp_if_not`, `switch`), every handler entry,
+every coroutine instruction (`spawn` once more for its hook), and every
+`iter_next` over a coroutine. `call`, `tail_call`, `call_import`, `safepoint`,
+and the coroutine instructions charge before anything else;
+`call_indirect`, `tail_call_indirect`, and `dcall` charge once the callee is
+known to be callable with that many arguments (a `nil` callee, a
+non-function, or an arity mismatch raises uncharged). Between two charges a
+run executes at most one function's length of instructions, so fuel bounds
+total work even for modules a verifier would reject for lacking safepoints.
 
 [`Limits`](#limits) also bounds heap bytes (the `OutOfMemory` trap; large
-buffers are checked before they are requested), call depth (hook frames
-included), and register-stack slots (both raise the catchable
-`StackOverflow`, E0105, at the call).
+buffers are checked before they are requested; suspended coroutines' stacks
+count), call depth (hook frames and running coroutines' frames included),
+and register-stack slots (both raise the catchable `StackOverflow`, E0105,
+at the call or `resume`).
 
 ### Hooks
 
@@ -209,12 +221,73 @@ for `dyn` keys the kind is part of the key (`1` and `1.0` differ).
 While a map's keys are exactly `0, 1, 2, ...` with nothing deleted it is
 *packed*: no hash index exists and lookups are a bounds check.
 
+### Coroutines
+
+The coroutine group (LSB §5.13) is stackful and asymmetric. `coro_new`
+(or `coro_new_indirect` with a closure) makes a coroutine; `resume` runs it
+until it `yield`s, `await`s, returns, or fails, and that is what `resume`
+writes (or raises). A `yield` may be any number of calls (hook calls
+included) below the coroutine's body: every frame above the body is
+suspended with it. Values crossing a suspension are `dyn`.
+
+- **Keys** (`yield_kv`, `coro_key`, `iter_key`): `yield` uses the automatic
+  key, one more than the largest integer key yielded so far (0 first,
+  `ArithOverflow` past `i64::MAX`), exactly as LSB rule 10 and `map_push`
+  state it: after only `yield -5 => x`, the next automatic key is `-4`.
+- **Throwing in** (`resume_throw`) raises at the suspension point, so a `try`
+  around the `yield` catches it; on a `created` coroutine nothing runs, it
+  fails, and the error is raised at the `resume_throw`.
+- **Closing** (`coro_close c, signal`) raises `signal` at the suspension point
+  so pending `finally` blocks run. The signal escaping (the same value) or a
+  return is success (`returned`); another error fails it and is raised at
+  the closer; a `yield` while closing leaves it suspended there and raises
+  `CloseIgnored` (E0113) at the closer; an `await` while closing suspends
+  normally and the closer drives it with `resume`.
+- **Iteration**: `iter_new` and `diter_new` accept a coroutine; `iter_next`
+  resumes it with `nil` (has = true and the value on `yielded`, false once
+  `returned`, `TypeError` on `awaiting`, the error on failure).
+- **Errors**: resuming a `running` (itself or a resumer), `returned`, or
+  `failed` coroutine is `InvalidCoroState` (E0110), as is `coro_result`
+  before it returned; `yield`/`await` with no running coroutine is
+  `CannotSuspend` (E0111); `spawn` without a `spawn` hook is `NoScheduler`
+  (E0112). A coroutine body must be a bytecode function: a closure of an
+  import given to `coro_new_indirect` or `spawn` is a `TypeError` (a host
+  function runs to completion and cannot be suspended). `dup` of a coroutine
+  is a `TypeError`.
+- **Host frames.** LSB raises `CannotSuspend` when a host frame lies between
+  a `yield` and its coroutine. Host functions here never call back into
+  bytecode, so there is never such a frame; `CannotSuspend` is raised exactly
+  when no coroutine is running.
+- **Traps** end the whole run; coroutines that were running then are
+  `failed` (their frames are gone).
+
+Switching is a copy: a suspending coroutine's frames and registers move into
+the coroutine object, and resuming copies them back on top of the resumer
+(LSB §10 question 7). Once a coroutine's buffers have grown to its deepest
+stack, switching allocates nothing. A suspended stack's bytes count against
+the memory budget; its frames count against the depth limit again when it
+is resumed.
+
+### Tasks and the built-in scheduler
+
+`spawn` hands a new coroutine to the module's `spawn` hook (LSB hook 27).
+Bind that hook to a module function (a scheduler written in bytecode), to
+your own import, or to the VM's built-in scheduler with
+[`Host::register_scheduler`](#hostregister_scheduler), which
+[`Vm::run_async`](#vmrun_async) drives. The built-in scheduler is
+single-threaded and deterministic: tasks run one at a time in FIFO order,
+`await` of a task waits for its result (or its error), `await` of any other
+value resumes at the back of the queue with that value, and the run ends when
+the main task does.
+
 ### Memory and collection
 
 Objects live in the VM's heap until unreachable. Collection is a mark and
 sweep over the exact roots (reference-typed registers of every frame,
-running closures, globals, and the constant and name caches). It runs only
-at safepoints (`safepoint`, calls, and allocating instructions, LSB §5.9) and
+running closures, running coroutines, globals, the scheduler's tasks, and
+the constant and name caches); a suspended coroutine is traced through its
+frames' reference-typed registers. It runs only at safepoints (`safepoint`,
+calls, coroutine instructions, and allocating instructions, LSB §5.9) and
 only once as many bytes have been allocated as survived the previous
 collection, so its total cost stays proportional to allocation. A
 [`Value::Obj`](#obj) returned by a run stays valid until the next run on the
@@ -222,9 +295,26 @@ same VM; a handle to a collected object reads as `nil` (slots are
 generation-checked and retired before a generation could wrap, so a stale
 handle never aliases a new object).
 
+**Close on drop** (LSB §5.13 rule 13). A suspended coroutine (`yielded` or
+`awaiting`) that becomes unreachable is closed, its pending `finally` blocks
+running as `coro_close` would run them, with the drop signal `nil`. This heap
+is traced, not reference-counted, so the moment the last reference goes away
+is not observable when it happens; instead the collection that finds the
+coroutine unreachable keeps it (and what it reaches) alive and queues it.
+Queued coroutines are closed one at a time, oldest (by creation) first, at
+the next fuel charge point of a run that comes before its instruction does
+anything (the instruction then runs as if just reached), or when the host
+calls [`Vm::run_finalizers`](#vmrun_finalizers). The close's outcome is
+discarded: its return value, an error escaping it (as CPython discards an
+exception raised while a dropped generator closes), and a refusal (a
+`yield`). Each coroutine is closed on drop at most once; one that refuses or
+awaits is freed when next found unreachable. Created, returned, and failed
+coroutines run no code and are freed. Collection timing is this VM's own, so
+when a close runs is not something other tiers reproduce.
+
 ### Instruction coverage
 
-| LSB group | Opcodes | 2.0.0-alpha.1 |
+| LSB group | Opcodes | 2.0.0-alpha.2 |
 |---|---|---|
 | Moves, constants, globals (§5.1) | `0x00`-`0x0A` | implemented |
 | Integer arithmetic and comparison (§5.2) | `0x10`-`0x26` | implemented, every policy |
@@ -237,8 +327,8 @@ handle never aliases a new object).
 | Closures and cells (§5.10) | `0xB0`-`0xB4` | implemented |
 | Typed heap objects (§5.10) | `0xC0`-`0xD4` | implemented |
 | Strings (§5.11) | `0xE0`-`0xE6` | implemented |
-| Coroutines (§5.13) | `0xF0`-`0xFC` | **unsupported**: loads, ends the run with `VmError::Unsupported` (alpha.2) |
-| Hooks (§5.8) | codes 0-27 | all but `spawn` (27, coroutines) |
+| Coroutines (§5.13) | `0xF0`-`0xFC` | implemented: rules 1-14, keys, close, iteration, close on drop |
+| Hooks (§5.8) | codes 0-27 | implemented, `spawn` (27) included |
 
 ## `Program`
 
@@ -441,7 +531,7 @@ Calls `func` with `args` under the VM's limits. A void function returns
 
 **Errors.** [`VmError`](#vmerror): `NoSuchFunction`, `NeedsClosure` (the
 function has captures), `ArgumentCount`, `ArgumentType`, `GlobalInit`, or the
-run's own outcome (`Raised`, `Thrown`, `Trap`, `Unsupported`).
+run's own outcome (`Raised`, `Thrown`, `Trap`).
 
 ```rust
 use bvm_lang::{Host, Program, Value, Vm, VmError};
@@ -495,6 +585,105 @@ pub fn run_export(&mut self, name: &str, args: &[Value]) -> Result<Value, VmErro
 Runs the function exported under `name`; `VmError::NoSuchExport` if none.
 See [Quick start](#quick-start).
 
+### `Vm::run_async`
+
+```rust,ignore
+pub fn run_async(&mut self, func: FuncId, args: &[Value]) -> Result<Value, VmError>
+```
+
+Runs `func` as the main task of the built-in scheduler (Python's
+`asyncio.run`) and returns its result. `func` becomes a coroutine, so it may
+`await`; tasks run one at a time, FIFO, until the main task finishes:
+
+- `spawn` (its hook bound to the [`Host::register_scheduler`](#hostregister_scheduler)
+  import) queues the new coroutine as a task and returns it as the handle;
+- `await` of a task, or of any coroutine (which becomes a task), waits until
+  it finishes and resumes with its return value, or raises its error at the
+  `await`; a finished one resumes at once, at the back of the queue;
+- `await` of any other value resumes, at the back of the queue, with that
+  value; a task that `yield`s resumes with `nil`;
+- the main task failing ends the run with its error.
+
+Tasks unfinished when the main task finishes are dropped (and closed when
+collected, like any dropped coroutine); tasks spawned by a plain
+[`run`](#vmrun) wait for the next `run_async`. One fuel budget covers the
+whole run.
+
+**Errors.** As [`run`](#vmrun), plus `VmError::Deadlock { waiting }` when no
+task can run and the main task has not finished.
+
+```rust
+use bvm_lang::{Host, Program, Vm, VmError};
+use bytecode_lang::{Inst, ModuleBuilder, ValType};
+
+let d = ValType::Dyn;
+let mut m = ModuleBuilder::new();
+// main() { me = current coroutine; return await me }: waits for itself.
+let mut f = m.function("main", &[], &[d]);
+let (me, r) = (f.reg(d), f.reg(d));
+f.emit(Inst::CoroCurrent { dst: me });
+f.emit(Inst::Await { dst: r, src: me });
+f.ret(r);
+let main = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+assert_eq!(Vm::new(&p).run_async(main, &[]), Err(VmError::Deadlock { waiting: 1 }));
+```
+
+### `Vm::run_finalizers`
+
+```rust,ignore
+pub fn run_finalizers(&mut self) -> Result<usize, VmError>
+pub fn pending_finalizers(&self) -> usize
+```
+
+Closes now, under the VM's limits, the dropped suspended coroutines that
+collections have queued (see [Memory and collection](#memory-and-collection)),
+and returns how many it closed; `pending_finalizers` counts the queue. Call
+[`collect_garbage`](#heap-and-fuel-statistics) first to queue everything
+dropped (at program exit, say).
+
+**Errors.** A trap inside a closing `finally` (`OutOfFuel`, `OutOfMemory`,
+`Unreachable`) stops it; the rest stay queued. Errors the `finally` blocks
+raise are discarded.
+
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::{Inst, ModuleBuilder, ValType};
+
+let d = ValType::Dyn;
+let mut m = ModuleBuilder::new();
+let count = m.global("count", d, true, None);
+// gen() { try { yield nil } finally { count = 1 } }
+let mut g = m.function("gen", &[], &[]);
+let (s, e, one) = (g.reg(d), g.reg(d), g.reg(d));
+let (start, end, h) = (g.label(), g.label(), g.label());
+g.bind(start);
+g.emit(Inst::Yield { dst: s, src: s });
+g.bind(end);
+g.ret_void();
+g.bind(h);
+g.emit(Inst::DLoadInt { dst: one, val: 1 });
+g.emit(Inst::SetGlobal { global: count, src: one });
+g.emit(Inst::Throw { src: e });
+g.try_region(start, end, h, e);
+let gen_id = m.add_function(g).unwrap();
+// drop() { c = gen(); resume c } -- the suspended coroutine is dropped.
+let mut f = m.function("drop", &[], &[]);
+let (c, r) = (f.reg(d), f.reg(d));
+f.emit(Inst::CoroNew { dst: c, func: gen_id, argc: 0 });
+f.emit(Inst::Resume { dst: r, coro: c, src: r });
+f.ret_void();
+let drop_id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+
+let mut vm = Vm::new(&p);
+vm.run(drop_id, &[]).unwrap();
+vm.collect_garbage();
+assert_eq!(vm.pending_finalizers(), 1);
+assert_eq!(vm.run_finalizers(), Ok(1));
+assert_eq!(vm.global(count), Some(bvm_lang::Value::Int(1))); // its finally ran
+```
+
 ### Inspecting values
 
 ```rust,ignore
@@ -504,14 +693,16 @@ pub fn elements(&self, v: Value) -> Option<Vec<Value>>
 pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>>
 pub fn field(&self, v: Value, index: usize) -> Option<Value>
 pub fn error_code(&self, v: Value) -> Option<u32>
+pub fn coro_state(&self, v: Value) -> Option<CoroState>
 pub fn global(&self, id: GlobalId) -> Option<Value>
 pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, VmError>
 ```
 
 Read what runs return: a value's dynamic kind, a string's bytes, an array's
 elements, a map's entries in insertion order, a struct's field, a runtime
-error value's code, a global's current value; `new_str` allocates a string to
-pass to a run (the `OutOfMemory` trap if the budget is spent).
+error value's code, a coroutine's state, a global's current value; `new_str`
+allocates a string to pass to a run (the `OutOfMemory` trap if the budget is
+spent).
 
 ```rust
 use bvm_lang::{Host, Program, Value, Vm};
@@ -545,9 +736,11 @@ pub fn collections(&self) -> u64
 pub fn collect_garbage(&mut self)
 ```
 
-Fuel the last run consumed; bytes charged to the memory budget; live objects
-(exact after a collection); collections so far; and an explicit collection
-keeping only what globals and caches reach.
+Fuel the last run (or `run_async`, or `run_finalizers`) consumed; bytes
+charged to the memory budget; live objects (exact after a collection);
+collections so far; and an explicit collection keeping only what globals and
+caches reach (suspended coroutines it finds dropped are queued to be closed,
+not freed).
 
 ```rust
 use bvm_lang::{Host, Program, Vm};
@@ -654,7 +847,8 @@ Host functions by import module and name. A host function receives its
 arguments converted from the import's declared parameter types; its result is
 converted to the declared result type (`TypeError` at the call if it does not
 fit; ignored for a void import). It runs to completion without re-entering the
-VM, so no collection happens during it.
+VM, so no collection happens during it, and no host frame can ever sit
+between a coroutine and its `yield`.
 
 ```rust
 use bvm_lang::{Host, HostError, Program, Value, Vm};
@@ -676,6 +870,48 @@ f.ret(w);
 let id = m.add_function(f).unwrap();
 let p = Program::load(m.finish().unwrap(), &host).unwrap();
 assert_eq!(Vm::new(&p).run(id, &[Value::Int(99)]), Ok(Value::Int(9)));
+```
+
+### `Host::register_scheduler`
+
+```rust,ignore
+pub fn register_scheduler(&mut self, module: &str, name: &str) -> &mut Host
+```
+
+Registers the VM's built-in scheduler as the import `module`.`name`, which
+must have the signature `(dyn) -> dyn` (`LoadErrorKind::BadSignature`
+otherwise). Bind it as the `spawn` hook; [`Vm::run_async`](#vmrun_async)
+drives the tasks it receives.
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm};
+use bytecode_lang::{Callee, Hook, Inst, ModuleBuilder, Policy, Reg, ValType};
+
+let d = ValType::Dyn;
+let mut host = Host::new();
+host.register_scheduler("ls.async", "spawn");
+let mut m = ModuleBuilder::new();
+let sig = m.func_type(&[d], &[d]);
+let spawn = m.import("ls.async", "spawn", sig);
+m.hook(Hook::Spawn, Callee::Import(spawn));
+// async fn double(x) { x + x }
+let mut t = m.function("double", &[d], &[d]);
+let r = t.reg(d);
+t.emit(Inst::DAdd { dst: r, lhs: t.param(0), rhs: t.param(0), pol: Policy::new() });
+t.ret(r);
+let double = m.add_function(t).unwrap();
+// async fn main() { await spawn double(21) }
+let mut f = m.function("main", &[], &[d]);
+let (fv, out) = (f.reg(d), f.reg(d));
+let w = f.regs(&[d, d]);
+f.emit(Inst::MakeClosure { dst: fv, func: double });
+f.emit(Inst::DLoadInt { dst: Reg(w.0 + 1), val: 21 });
+f.emit(Inst::Spawn { dst: w, callee: fv, argc: 1 });
+f.emit(Inst::Await { dst: out, src: w });
+f.ret(out);
+let main = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &host).unwrap();
+assert_eq!(Vm::new(&p).run_async(main, &[]), Ok(Value::Int(42)));
 ```
 
 ## `HostCtx`
@@ -730,7 +966,7 @@ pub enum VmError {
     Raised { kind: ErrorKind, func: FuncId, pc: u32 },
     Thrown { value: Value, func: FuncId, pc: u32 },
     Trap { kind: ErrorKind, func: FuncId, pc: u32 },
-    Unsupported { opcode: Opcode, func: FuncId, pc: u32 },
+    Deadlock { waiting: usize },
     GlobalInit { global: GlobalId, kind: ErrorKind },
     NoSuchFunction(FuncId),
     NoSuchExport,
@@ -747,10 +983,11 @@ impl VmError {
 
 How a run ended without a result. `Raised` is an uncaught runtime error (its
 location is where it was raised, even if a handler caught and rethrew it);
-`Thrown` an uncaught non-error value; `Trap` a trap; `Unsupported` a coroutine
-instruction (alpha.2); `GlobalInit` a global initialiser that does not fit
-its global; the rest are entry problems. `kind`, `code`, and `location` read
-the common parts.
+`Thrown` an uncaught non-error value (its location is where the unwind that
+ended the run began); `Trap` a trap; `Deadlock` a [`run_async`](#vmrun_async)
+whose tasks all wait; `GlobalInit` a global initialiser that does not fit its
+global; the rest are entry problems. `kind`, `code`, and `location` read the
+common parts.
 
 ```rust
 use bvm_lang::{Host, Program, Value, Vm, VmError};
@@ -849,6 +1086,6 @@ assert_eq!(bvm_lang::MAX_CONST_DEPTH, 64);
 
 ## Stability
 
-2.0.0-alpha.1 is a pre-release: names and signatures may change before 2.0.0,
+2.0.0-alpha.2 is a pre-release: names and signatures may change before 2.0.0,
 each change recorded in the CHANGELOG. Instruction semantics follow LSB and
 OPS and change only with them. See [`STABILITY.md`](./STABILITY.md).

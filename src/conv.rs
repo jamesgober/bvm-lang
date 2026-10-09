@@ -192,6 +192,7 @@ pub(crate) fn cast_ok(heap: &Heap, prog: &Program, v: u64, t: u32) -> bool {
         (Some(TypeInfo::Iter(k, val)), Object::Iter(it)) => {
             iter_types(heap, it.src, it.dynamic) == Some((*k, *val))
         }
+        (Some(TypeInfo::Coroutine), Object::Coro(_)) => true,
         _ => false,
     }
 }

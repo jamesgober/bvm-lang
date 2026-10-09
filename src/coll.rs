@@ -404,14 +404,20 @@ pub(crate) fn new_array(heap: &mut Heap, elem: ValType, len: i64) -> Result<u64,
 // Iterators
 // ---------------------------------------------------------------------------
 
-/// A new iterator over an array or map (`dynamic` for `diter_new`).
-/// `None` when `src` is neither.
+/// A new iterator over an array, a map, or a coroutine (`dynamic` for
+/// `diter_new`). `None` when `src` is none of them.
+///
+/// An iterator over a coroutine always produces `dyn` keys and values (LSB
+/// §5.13 rule 7: `iter_new` gives a `ref iter dyn -> dyn`), and its
+/// `iter_next` is executed by the coroutine machinery, which resumes it.
 pub(crate) fn new_iter(heap: &mut Heap, src: u64, dynamic: bool) -> Option<Result<u64, Fault>> {
-    let key_ty = match heap.get(src)? {
-        Object::Array(_) => ValType::I64,
-        Object::Map(m) => m.key,
+    let (key_ty, coro) = match heap.get(src)? {
+        Object::Array(_) => (ValType::I64, false),
+        Object::Map(m) => (m.key, false),
+        Object::Coro(_) => (ValType::Dyn, true),
         _ => return None,
     };
+    let dynamic = dynamic || coro;
     Some(heap.alloc(Object::Iter(alloc::boxed::Box::new(IterObj {
         src,
         dynamic,
@@ -420,6 +426,7 @@ pub(crate) fn new_iter(heap: &mut Heap, src: u64, dynamic: bool) -> Option<Resul
         cursor: Cursor::default(),
         key: None,
         key_ty: if dynamic { ValType::Dyn } else { key_ty },
+        coro,
     }))))
 }
 

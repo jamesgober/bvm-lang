@@ -21,6 +21,33 @@
 
 ---
 
+## [2.0.0-alpha.2] - 2026-10-09
+
+**Coroutines.** The VM now executes every LSB instruction: the coroutine group (`0xF0`..=`0xFC`) for generators, fibers, and async tasks, with close on drop and a small deterministic scheduler for tests and simple hosts. Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
+
+### Breaking
+
+- **`VmError::Unsupported` is removed.** No instruction is unsupported any more. Code matching it can drop the arm.
+- **`VmError::Deadlock { waiting }` is new** (the enum is `#[non_exhaustive]`): `Vm::run_async` ends with it when every remaining task waits.
+- **`coro_new` is checked at load like `call`**: wrong argument count is `LoadErrorKind::ArityMismatch`, a body with captures is `LoadErrorKind::CalleeHasCaptures` (alpha.1 loaded such modules and stopped at the instruction).
+- **Fuel follows LSB §5.14 exactly.** Every coroutine instruction (and `iter_next` over a coroutine) costs one unit. `call_indirect` and `tail_call_indirect` to an import now check the argument count before charging, as they already did for bytecode callees (alpha.1 charged first), so a mismatched call to a host function costs no fuel.
+
+### Added
+
+- Execution of `coro_new`, `coro_new_indirect`, `yield`, `yield_kv`, `await`, `resume`, `resume_throw`, `coro_status`, `coro_current`, `spawn`, `coro_close`, `coro_key`, and `coro_result` (LSB §5.13 rules 1-14): stackful suspension through nested calls and hook frames; automatic and explicit keys; return values; throwing into a coroutine; closing with pending `finally` blocks, `CloseIgnored`, and `await` during a close; iteration over coroutines with `iter_new`/`diter_new`; `InvalidCoroState`, `CannotSuspend`, `NoScheduler`; coroutine frames counted against the depth limit and suspended stacks against the memory budget.
+- **Close on drop** (LSB §5.13 rule 13, decided in §10 question 9): a suspended coroutine that becomes unreachable is closed. The heap is traced, so the collection that finds it queues it (alive, with what it reaches), and the VM closes queued coroutines one at a time, oldest first, at the next fuel charge point of a run, with the drop signal `nil`; outcomes are discarded. `Vm::run_finalizers` and `Vm::pending_finalizers` let a host close them explicitly.
+- `Host::register_scheduler` and `Vm::run_async`: a single-threaded, deterministic scheduler bound as the `spawn` hook (FIFO tasks; `await` of a task waits for its result or error; `await` of other values passes back the value).
+- `Vm::coro_state`.
+- Tests: `tests/coroutines.rs` (conformance per instruction and rule), `tests/scheduler.rs`, `tests/coroutine_gc.rs` (tracing, close on drop, budgets); a whole-module reference interpreter (`tests/common/full.rs`, a frame stack per coroutine) and a differential property over random six-function modules with calls, closures, arrays, maps, structs, strings, try/catch, try/finally with `return` in `finally` overriding, and coroutines, mutation-checked.
+- Benchmarks `coroutine/generator_iter_100k`, `coroutine/create_finish_100k`, `async/ping_pong_2x50k`. Example `coroutines`.
+
+### Changed
+
+- LSB §5.13 rule 13 is rewritten for the close-on-drop decision and LSB gains §5.14, the fuel rule every tier shares (both in `_lexersketch/specs/LSB.md`).
+- A pending close is started from the fuel counter's cold branch, so the dispatch loop has no test of its own for it; the fuel counter now lives in the VM instance during a run.
+
+---
+
 ## [2.0.0-alpha.1] - 2026-10-08
 
 **The VM now executes LSB**, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang) 0.2: typed and dynamic code, calls, closures, structs, arrays, PHP-style ordered maps, strings, exceptions, a tracing garbage collector, and explicit budgets for untrusted code. A pre-release: the coroutine instructions arrive in alpha.2 and the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
@@ -136,7 +163,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.1...HEAD
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.2...HEAD
+[2.0.0-alpha.2]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.1...v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/jamesgober/bvm-lang/compare/v1.0.0...v2.0.0-alpha.1
 [1.0.0]: https://github.com/jamesgober/bvm-lang/compare/v0.2.5...v1.0.0
 [0.2.5]: https://github.com/jamesgober/bvm-lang/compare/v0.2.0...v0.2.5

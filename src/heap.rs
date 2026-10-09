@@ -16,15 +16,24 @@
 //! memory budget bounds, and it runs only when enough has been allocated since
 //! the previous collection (at least as much as survived it), so the total
 //! collection work stays proportional to the total allocation.
+//!
+//! **Close on drop** (LSB §5.13 rule 13). A suspended coroutine that the mark
+//! phase did not reach is not freed: it is *resurrected* (marked, with
+//! everything it reaches) and handed back to the VM, which closes it (runs its
+//! pending `finally` blocks) at the next safepoint. The heap keeps the slot
+//! indices of its coroutines so this costs O(coroutines), not a heap scan.
+//! Each coroutine is resurrected at most once (`finalized`); a later
+//! collection that finds it unreachable again frees it.
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bytecode_lang::{ErrorKind, Kind, ValType};
+use bytecode_lang::{CoroState, ErrorKind, Kind, ValType};
 
 use crate::dynv;
 use crate::fault::Fault;
+use crate::machine::Frame;
 use crate::map::{Cursor, MapStore};
 use crate::program::Program;
 
@@ -42,6 +51,8 @@ pub(crate) enum Object {
     Cell(CellObj),
     Iter(Box<IterObj>),
     Error(ErrorObj),
+    /// A coroutine (LSB §5.13).
+    Coro(Box<CoroObj>),
 }
 
 /// An array. The element storage is shared copy-on-write between an array
@@ -111,7 +122,60 @@ pub(crate) struct IterObj {
     pub(crate) key: Option<u64>,
     /// Representation of `key` (for tracing).
     pub(crate) key_ty: ValType,
+    /// The source is a coroutine: `iter_next` resumes it (LSB §5.13 rule 7).
+    pub(crate) coro: bool,
 }
+
+/// A coroutine: a suspendable stack of frames (LSB §5.13, "What a coroutine
+/// owns").
+///
+/// While it runs, its frames live on the VM's active stack like any others
+/// and `frames`/`regs` are empty; when it suspends they are copied here (the
+/// copy-on-suspend answer to LSB §10 question 7: a switch costs one copy of
+/// the suspended registers, and the dispatch loop keeps one flat stack, so a
+/// register read stays one indexed load). A created coroutine holds its
+/// body's first frame with the arguments in place, so starting one is an
+/// ordinary resume.
+#[derive(Debug)]
+pub(crate) struct CoroObj {
+    pub(crate) state: CoroState,
+    /// Being closed (rule 11): a `yield` is refused with `CloseIgnored`, and
+    /// the close signal escaping the body counts as success.
+    pub(crate) closing: bool,
+    /// Already queued for a drop-close once: never queued again.
+    pub(crate) finalized: bool,
+    /// Owned by the VM's built-in scheduler.
+    pub(crate) task: bool,
+    /// Creation order: the order dropped coroutines are closed in.
+    pub(crate) seq: u64,
+    /// Suspended frames, bottom (the body) first; bases index `regs`.
+    pub(crate) frames: Vec<Frame>,
+    /// Their registers.
+    pub(crate) regs: Vec<u64>,
+    /// The register of the suspending instruction that receives the value
+    /// sent by the next `resume`.
+    pub(crate) resume_dst: u16,
+    /// The current suspension's value (yielded value or awaitable).
+    pub(crate) payload: u64,
+    /// The key of the value most recently yielded (nil before the first).
+    pub(crate) key: u64,
+    /// The largest integer key yielded so far (rule 10).
+    pub(crate) max_key: Option<i64>,
+    /// The return value (`returned`) or the error that escaped (`failed`).
+    pub(crate) result: u64,
+    /// The close signal while `closing`.
+    pub(crate) signal: u64,
+}
+
+impl CoroObj {
+    /// Bytes held beyond the object itself: the suspended stack.
+    fn stack_bytes(&self) -> usize {
+        self.regs.capacity() * 8 + self.frames.capacity() * FRAME_BYTES
+    }
+}
+
+/// Bytes charged per suspended frame record.
+pub(crate) const FRAME_BYTES: usize = core::mem::size_of::<Frame>();
 
 /// A runtime error value (kind `error`): its code and where it was raised.
 #[derive(Clone, Copy, Debug)]
@@ -134,6 +198,7 @@ impl Object {
             Object::Cell(_) => Kind::Cell,
             Object::Iter(_) => Kind::Iter,
             Object::Error(_) => Kind::Error,
+            Object::Coro(_) => Kind::Coroutine,
         }
     }
 
@@ -149,6 +214,7 @@ impl Object {
                 Object::Struct(s) => s.fields.len() * 8,
                 Object::Func(f) => f.captures.len() * 8,
                 Object::Iter(_) => core::mem::size_of::<IterObj>(),
+                Object::Coro(c) => core::mem::size_of::<CoroObj>() + c.stack_bytes(),
             }
     }
 }
@@ -177,6 +243,8 @@ pub(crate) struct GcStats {
 pub(crate) struct Heap {
     slots: Vec<Slot>,
     free: Vec<u32>,
+    /// Slots holding coroutines (for the close-on-drop pass).
+    coros: Vec<u32>,
     marks: Vec<u64>,
     work: Vec<u32>,
     /// Estimated bytes held by objects (exact recount at every collection).
@@ -194,6 +262,7 @@ impl Heap {
         Heap {
             slots: Vec::new(),
             free: Vec::new(),
+            coros: Vec::new(),
             marks: Vec::new(),
             work: Vec::new(),
             used: 0,
@@ -298,9 +367,13 @@ impl Heap {
     /// trap when the budget is spent.
     pub(crate) fn alloc(&mut self, obj: Object) -> Result<u64, Fault> {
         self.charge(obj.bytes())?;
+        let coro = matches!(obj, Object::Coro(_));
         if let Some(index) = self.free.pop() {
             if let Some(slot) = self.slots.get_mut(index as usize) {
                 slot.obj = Some(obj);
+                if coro {
+                    self.coros.push(index);
+                }
                 return Ok(dynv::from_ref(index, slot.generation));
             }
         }
@@ -311,7 +384,28 @@ impl Heap {
             generation: 0,
             obj: Some(obj),
         });
+        if coro {
+            self.coros.push(index);
+        }
         Ok(dynv::from_ref(index, 0))
+    }
+
+    /// The coroutine a word names.
+    #[inline]
+    pub(crate) fn coro(&self, v: u64) -> Option<&CoroObj> {
+        match self.get(v)? {
+            Object::Coro(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the coroutine a word names.
+    #[inline]
+    pub(crate) fn coro_mut(&mut self, v: u64) -> Option<&mut CoroObj> {
+        match self.get_mut(v)? {
+            Object::Coro(c) => Some(c),
+            _ => None,
+        }
     }
 
     /// Allocates a string.
@@ -322,8 +416,16 @@ impl Heap {
         self.alloc(Object::Str(bytes.into()))
     }
 
-    /// Marks everything reachable from `roots` and frees the rest.
-    pub(crate) fn collect(&mut self, roots: impl IntoIterator<Item = u64>, prog: &Program) {
+    /// Marks everything reachable from `roots` and frees the rest, except
+    /// suspended coroutines found unreachable for the first time: those are
+    /// resurrected and appended to `dropped`, oldest first, for the VM to
+    /// close (see the module docs).
+    pub(crate) fn collect(
+        &mut self,
+        roots: impl IntoIterator<Item = u64>,
+        prog: &Program,
+        dropped: &mut Vec<u64>,
+    ) {
         let words = self.slots.len().div_ceil(64);
         self.marks.clear();
         self.marks.resize(words, 0);
@@ -332,6 +434,51 @@ impl Heap {
         for root in roots {
             self.mark(root, &mut work);
         }
+        self.trace(&mut work, prog);
+        // Close on drop: suspended coroutines the roots do not reach are kept,
+        // with everything they reach, and handed to the VM in creation order,
+        // so the order they are closed in is defined.
+        let mut found: Vec<(u64, u64)> = Vec::new();
+        for &i in &self.coros {
+            if self.is_marked(i as usize) {
+                continue;
+            }
+            if let Some(Slot {
+                generation,
+                obj: Some(Object::Coro(c)),
+            }) = self.slots.get(i as usize)
+            {
+                let suspended = matches!(c.state, CoroState::Yielded | CoroState::Awaiting);
+                if suspended && !c.finalized {
+                    found.push((c.seq, dynv::from_ref(i, *generation)));
+                }
+            }
+        }
+        if !found.is_empty() {
+            found.sort_unstable();
+            for &(_, word) in &found {
+                if let Some(c) = self.coro_mut(word) {
+                    c.finalized = true;
+                }
+                self.mark(word, &mut work);
+                dropped.push(word);
+            }
+            self.trace(&mut work, prog);
+        }
+        self.work = work;
+        self.sweep();
+    }
+
+    /// Whether slot `i` is marked.
+    #[inline]
+    fn is_marked(&self, i: usize) -> bool {
+        self.marks
+            .get(i >> 6)
+            .is_some_and(|w| (w >> (i & 63)) & 1 == 1)
+    }
+
+    /// Drains the work list: marks every child of every queued object.
+    fn trace(&mut self, work: &mut Vec<u32>, prog: &Program) {
         while let Some(index) = work.pop() {
             // Children are gathered first (shared borrow), then marked.
             let mut children: [u64; 2] = [0; 2];
@@ -352,14 +499,16 @@ impl Heap {
                 Some(_) => extra = Some((index as usize, 0)),
             }
             for child in children {
-                self.mark(child, &mut work);
+                self.mark(child, work);
             }
             if let Some((i, _)) = extra {
-                self.trace_container(i, prog, &mut work);
+                self.trace_container(i, prog, work);
             }
         }
-        self.work = work;
-        // Sweep.
+    }
+
+    /// Frees every unmarked object and recounts the bytes held.
+    fn sweep(&mut self) {
         let mut used = 0usize;
         let mut freed = 0u64;
         for (i, slot) in self.slots.iter_mut().enumerate() {
@@ -388,6 +537,14 @@ impl Heap {
         self.threshold = used.max(MIN_GC_BYTES);
         self.stats.collections += 1;
         self.stats.freed += freed;
+        // Forget freed coroutine slots before any can be reused.
+        let slots = &self.slots;
+        self.coros.retain(|&i| {
+            matches!(
+                slots.get(i as usize).and_then(|s| s.obj.as_ref()),
+                Some(Object::Coro(_))
+            )
+        });
     }
 
     /// Marks the live object `v` names, queueing it for tracing.
@@ -451,6 +608,23 @@ impl Heap {
                 if let Callable::Func(id) = f.target {
                     for (ty, &v) in prog.capture_types(id).iter().zip(f.captures.iter()) {
                         if ty.is_reference() {
+                            self.mark(v, work);
+                        }
+                    }
+                }
+            }
+            Object::Coro(c) => {
+                for v in [c.payload, c.key, c.result, c.signal] {
+                    self.mark(v, work);
+                }
+                // Suspended frames: exactly the registers whose declared types
+                // are references, as for active frames (LSB §1.4), and each
+                // frame's running closure.
+                for f in &c.frames {
+                    self.mark(f.closure, work);
+                    let refs = prog.func(f.func).map_or(&[][..], |i| &i.ref_regs[..]);
+                    for &r in refs {
+                        if let Some(&v) = c.regs.get(f.base + usize::from(r)) {
                             self.mark(v, work);
                         }
                     }

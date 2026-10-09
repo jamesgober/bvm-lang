@@ -68,4 +68,5 @@ pub const BOOL: ValType = ValType::Bool;
 pub const F64: ValType = ValType::F64;
 pub const STR: ValType = ValType::Str;
 
+pub mod full;
 pub mod reference;
