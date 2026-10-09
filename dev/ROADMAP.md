@@ -173,7 +173,90 @@ Delivered:
   `yield -5 => x`; PHP's generators give `0` (they start the counter at -1).
   The VM follows LSB; whether LSB should change is an owner's call.
 - `call/fib25` measured 3-10% slower than alpha.1 in alternating runs on a
-  loaded machine; typed dispatch is at parity. Not isolated.
+  loaded machine; typed dispatch is at parity. Not isolated. (Isolated and
+  fixed in alpha.3: the return path.)
+
+## v2.0.0-alpha.3 - LSB format 2 (DONE, prepared 2026-10-09)
+Executes the format bytecode-lang 0.3 publishes, every item of the "Next for
+bvm-lang" list in bytecode-lang's v0.3.0 release notes.
+
+Delivered:
+- **Loading format 2**: format 1 refused (`UnsupportedVersion(1)`); the new
+  modifier layouts (`Policy`, `IntOp`, `FloatConv`); parameter lists of
+  functions and imports checked (valid, fitting the signature, names in the
+  string table, by-reference parameters `dyn` or `ref` to a `cell dyn`:
+  `LoadErrorKind::BadParamList`), call shapes checked
+  (`LoadErrorKind::BadCallShape`) and `dcall_shape` windows inside the frame,
+  `raise` limited to catchable kinds, hooks 28-30 checked.
+- **The 18 new instructions and the three renamed ones** execute.
+- **Transparent reference slots** (LSB §5.17) in every dynamic slot read and
+  write: `dget_index`, `dset_index`, `get_prop`, `set_prop`, `get_field`,
+  `set_field`, `array_get`/`set`/`push`/`pop`, `map_get`/`find`/`set`/`push`,
+  `iter_next`, `dsep_*`, spreads, and the host and inspection APIs. A
+  reference word carries a flag bit, so the check is one compare on the word
+  (plus the slot's type when it fires).
+- **Copy-on-write separation** (LSB §5.16) with the `cow`/`aliased` bits of
+  the spec's tracing-collector implementation, deterministic (no reference
+  counts, no collection timing).
+- **Parameter-list binding** in `dcall`, `dcall_shape`, `coro_new_indirect`,
+  and `spawn` (an allocation-free positional binder property-tested against
+  `ParamList::bind`, which binds calls with names), fuel charged after
+  binding, the `call_shape` hook, `ArgumentError`.
+- **Import parameter lists** and host functions as first-class values, with
+  `HostCtx` access to references and containers.
+- **OPS v2**: `ipow`/`fpow`/`dpow`/`dabs`, `shift = saturate`,
+  `NegativeExponent`; the shared `ls_pow` routine, specified with a vector
+  table in `_lexersketch/specs/ops-vectors/pow.md` (written in this
+  milestone: pseudocode, constants, 122 vectors, verification).
+- **`raise` and error payloads** (`err_payload`, `VmError::Raised { payload }`,
+  `Vm::error_payload`).
+- **Rule 10 PHP generator keys.**
+- **Tests**: PHP-semantics conformance (`tests/php_semantics.rs`), format 2
+  conformance (`tests/format2.rs`), the `ls_pow` vectors
+  (`tests/pow_vectors.rs`); both differential references extended to every
+  item above (the whole-module reference with its own binder written from
+  §5.15 and its own model of the two bits), a PHP-focused whole-program
+  property; mutation-checked (see the release notes).
+- **The alpha.2 `call/fib25` regression isolated and fixed**: the return
+  path matched every continuation before writing a typed call's result;
+  testing that one first makes `fib(25)` ~7% faster than alpha.1 (min-of-50
+  harness, alternated processes). A `map_set` slowdown found the same way
+  (a separate lookup for the reference-slot check) was folded back into the
+  one lookup.
+- **Benches**: dynamic calls through the binder (positional and named),
+  the nested-append loop with separation against the `dup`-per-write
+  lowering it replaces, `foreach` by reference.
+
+### Dependency wiring
+- **bytecode-lang `0.3`** (crates.io): format 2, `ParamList::bind`. The
+  binder is the shared statement of the rules; the VM calls it for named
+  calls and is differential-tested against it for positional ones.
+- **gc-lang, value-lang, host-lang**: unchanged (reasons under alpha.1 and
+  alpha.2).
+
+### Moved to 2.0.0-alpha.4 (recorded per the anti-deferral rule)
+- **The reference-counting memory profile** (DECISIONS D22): refcounts plus a
+  cycle collector, selected by `[runtime] memory = "rc"`, with PHP's
+  deterministic destructor and close-on-drop timing and its reference
+  unbinding on copy (refcount-1 references revert to values). Reason: D22
+  sequences it as alpha.4; alpha.3 is format 2 on the tracing heap. The seam
+  is in place: every copy-on-write and separation decision goes through
+  `contents_shared` (array and map objects) and `Heap::is_aliased`, which a counted heap answers
+  with "the count is above one".
+
+### Known limitations (recorded, not deferred work of this milestone)
+- LSB keeps a reference slot until `dunref_*` unbinds it; PHP drops a
+  refcount-1 reference when the array is copied. The tracing profile cannot
+  observe the count (LSB §5.17 "the one divergence"); alpha.4's RC profile
+  can.
+- `ls_pow` is correctly rounded except within about 2^-85 of a rounding
+  boundary (one such case is in the vector table); deterministic either way.
+
+## v2.0.0-alpha.4 - Reference-counting memory profile (D22)
+- [ ] Refcounts plus a cycle collector behind the `contents_shared`/
+      `is_aliased` seam, selected per program (`memory = "rc"`).
+- [ ] PHP's reference unbinding on copy, destructor and close-on-drop
+      timing at the last reference, as LSB specifies per profile.
 
 ## v2.0.0 - Stable (per D18: after coroutines and a real consumer)
 - [ ] A real consumer runs end to end on it (Mox through the LexerSketch app).

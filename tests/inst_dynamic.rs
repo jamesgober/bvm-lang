@@ -55,6 +55,7 @@ fn promote() -> Policy {
 fn raised(kind: ErrorKind, pc: u32) -> Result<Value, VmError> {
     Err(VmError::Raised {
         kind,
+        payload: Value::Nil,
         func: FuncId(0),
         pc,
     })
@@ -287,7 +288,7 @@ fn hooks_receive_operands_and_their_result_is_written() {
         with_hook(
             Hook::BitNot,
             1,
-            |d, l, _| Inst::DNot {
+            |d, l, _| Inst::DBitNot {
                 dst: d,
                 src: l,
                 pol: Policy::new()
@@ -317,7 +318,7 @@ fn op_dneg_and_dnot() {
         src: s,
         pol: Policy::new().with_overflow(Overflow::Promote),
     };
-    let not = |d, s| Inst::DNot {
+    let not = |d, s| Inst::DBitNot {
         dst: d,
         src: s,
         pol: Policy::new(),
@@ -515,7 +516,7 @@ fn truthy(v: Value, negate: bool) -> Result<Value, VmError> {
     common::eval(&[D], &[BOOL], &[v], |_, f| {
         let r = f.reg(BOOL);
         if negate {
-            f.emit(Inst::DLNot {
+            f.emit(Inst::DNot {
                 dst: r,
                 src: Reg(0),
             });
@@ -1056,6 +1057,7 @@ fn op_cast_passes_nil_and_rejects_scalars() {
         vm.run(id, &[Value::Int(1)]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 0
         })
@@ -1084,6 +1086,7 @@ fn op_cast_rejects_an_unrelated_struct() {
         Vm::new(&p).run(id, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 1
         })
@@ -1197,6 +1200,7 @@ fn set_prop_converts_to_the_field_type() {
         Vm::new(&p).run(id, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 2
         })
@@ -1500,6 +1504,7 @@ fn op_dcall_converts_arguments_and_result() {
         vm.run(main_id, &[Value::Float(2.0), Value::Int(3)]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: main_id,
             pc: 3
         })
@@ -1623,6 +1628,7 @@ fn hook_errors_propagate_and_host_errors_are_catchable() {
         Vm::new(&p).run(id, &[Value::Nil, Value::Nil]),
         Err(VmError::Raised {
             kind: ErrorKind::KeyNotFound,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 0
         })
@@ -1753,6 +1759,7 @@ fn iter_hook_results_are_wrapped_or_rejected() {
                 out,
                 Err(VmError::Raised {
                     kind: ErrorKind::TypeError,
+                    payload: bvm_lang::Value::Nil,
                     func: id,
                     pc: 0
                 })

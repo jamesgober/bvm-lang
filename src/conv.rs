@@ -188,6 +188,8 @@ pub(crate) fn cast_ok(heap: &Heap, prog: &Program, v: u64, t: u32) -> bool {
         (Some(TypeInfo::Array(e)), Object::Array(a)) => a.elem == *e,
         (Some(TypeInfo::Map(k, val)), Object::Map(m)) => m.key == *k && m.value == *val,
         (Some(TypeInfo::Cell(e)), Object::Cell(c)) => c.elem == *e,
+        // A reference is a cell of `dyn` (LSB §5.17).
+        (Some(TypeInfo::Cell(ValType::Dyn)), Object::Ref(_)) => true,
         (Some(TypeInfo::Func), Object::Func(f)) => callable_sig(prog, f.target) == Some(t),
         (Some(TypeInfo::Iter(k, val)), Object::Iter(it)) => {
             iter_types(heap, it.src, it.dynamic) == Some((*k, *val))

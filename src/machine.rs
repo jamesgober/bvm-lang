@@ -6,8 +6,9 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use bytecode_lang::{Const, ConstId, ErrorKind, FuncId, ValType};
+use bytecode_lang::{Bound, Const, ConstId, ErrorKind, FuncId, ValType};
 
+use crate::bind::Flat;
 use crate::coll;
 use crate::conv;
 use crate::dynv;
@@ -174,6 +175,9 @@ pub(crate) struct Machine {
     pub(crate) imp_refs: Vec<u64>,
     /// Pooled argument buffers.
     pub(crate) scratch: Vec<u64>,
+    /// Pooled flattened items and binding of a dynamic call (LSB §5.15).
+    pub(crate) flat: Flat,
+    pub(crate) bound: Vec<Bound>,
     pub(crate) host_args: Vec<Value>,
     pub(crate) max_depth: usize,
     pub(crate) max_stack: usize,
@@ -236,6 +240,8 @@ impl Machine {
             fn_refs: alloc::vec![0; m.functions().len()],
             imp_refs: alloc::vec![0; m.imports().len()],
             scratch: Vec::new(),
+            flat: Flat::default(),
+            bound: Vec::new(),
             host_args: Vec::new(),
             max_depth: 0,
             max_stack: 0,
@@ -297,6 +303,22 @@ impl Machine {
         let Some(frame) = self.frames.pop() else {
             return Ok(Next::Exit(result));
         };
+        // The common case first, before any other continuation is looked
+        // at: a typed call's result written to the caller's register.
+        // Testing it first (rather than matching every continuation, the
+        // coroutine body's included) measured ~15% faster on `call/fib25`
+        // and removed the alpha.2 call-path regression.
+        if let Cont::Write(dst) = frame.cont {
+            stack.truncate(frame.base);
+            if let Some(top) = self.frames.last_mut() {
+                if let (Some(v), Some(slot)) = (result, stack.get_mut(top.base + usize::from(dst)))
+                {
+                    *slot = v;
+                }
+                top.pc += 1;
+            }
+            return Ok(Next::Resume);
+        }
         match frame.cont {
             Cont::Entry => {
                 stack.truncate(frame.base);
@@ -403,17 +425,28 @@ impl Machine {
     ) -> Result<(), VmError> {
         let (func, pc) = self.frames.last().map_or((0, 0), |f| (f.func, f.pc));
         let value = match fault {
-            Fault::Raise(kind) => match self.heap.alloc(Object::Error(ErrorObj { kind, func, pc }))
-            {
-                Ok(v) => v,
-                Err(_) => {
-                    return Err(VmError::Trap {
-                        kind: ErrorKind::OutOfMemory,
-                        func: FuncId(func),
-                        pc,
-                    });
+            Fault::Raise(kind) | Fault::RaiseWith(kind, _) => {
+                let payload = match fault {
+                    Fault::RaiseWith(_, p) => p,
+                    _ => dynv::NIL,
+                };
+                let obj = Object::Error(ErrorObj {
+                    kind,
+                    func,
+                    pc,
+                    payload,
+                });
+                match self.heap.alloc(obj) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return Err(VmError::Trap {
+                            kind: ErrorKind::OutOfMemory,
+                            func: FuncId(func),
+                            pc,
+                        });
+                    }
                 }
-            },
+            }
             Fault::Throw(v) => v,
             Fault::Trap(kind) => {
                 return Err(VmError::Trap {
@@ -487,6 +520,7 @@ impl Machine {
         match self.heap.get(value) {
             Some(Object::Error(e)) => VmError::Raised {
                 kind: e.kind,
+                payload: conv::dyn_value(&self.heap, e.payload),
                 func: FuncId(e.func),
                 pc: e.pc,
             },
@@ -511,9 +545,12 @@ impl Machine {
         let res = match &info.func {
             HostFn::User(f) => {
                 let Machine {
-                    heap, host_args, ..
+                    heap,
+                    host_args,
+                    seed,
+                    ..
                 } = self;
-                let res = f(&mut HostCtx { heap }, host_args);
+                let res = f(&mut HostCtx { heap, seed: *seed }, host_args);
                 host_args.clear();
                 res
             }
@@ -737,6 +774,8 @@ impl Machine {
                 self.heap.alloc(Object::Array(ArrayObj {
                     elem,
                     frozen: true,
+                    cow: false,
+                    aliased: true,
                     items: Arc::new(values),
                 }))?
             }
@@ -754,6 +793,7 @@ impl Machine {
                 }
                 if let Some(Object::Map(m)) = self.heap.get_mut(map) {
                     m.frozen = true;
+                    m.aliased = true;
                 }
                 map
             }
@@ -793,12 +833,18 @@ impl Machine {
             Some(Object::Array(a)) => Object::Array(ArrayObj {
                 elem: a.elem,
                 frozen: false,
+                // A constant's contents are shared with its template, and
+                // every container below the top is aliased (LSB §5.16).
+                cow: true,
+                aliased: false,
                 items: Arc::clone(&a.items),
             }),
             Some(Object::Map(m)) => Object::Map(MapObj {
                 key: m.key,
                 value: m.value,
                 frozen: false,
+                cow: true,
+                aliased: false,
                 store: Arc::clone(&m.store),
             }),
             _ => return Err(Fault::type_error()),

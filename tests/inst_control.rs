@@ -178,6 +178,7 @@ fn call_depth_limit_raises_catchable_stack_overflow() {
             err,
             VmError::Raised {
                 kind: ErrorKind::StackOverflow,
+                payload: bvm_lang::Value::Nil,
                 ..
             }
         ),
@@ -348,6 +349,7 @@ fn call_indirect_on_nil_is_null_reference() {
         Vm::new(&p).run(id, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::NullReference,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 0
         })
@@ -417,6 +419,7 @@ fn host_result_of_the_wrong_type_is_a_type_error_at_the_call() {
         Vm::new(&p).run(id, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: id,
             pc: 0
         })
@@ -562,6 +565,7 @@ fn errors_escaping_a_callee_are_raised_at_the_call() {
         vm.run(cid, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::DivByZero,
+            payload: bvm_lang::Value::Nil,
             func: cid,
             pc: 0
         })

@@ -1,7 +1,8 @@
 # bvm-lang &mdash; API Reference
 
 > Complete reference for every public item in `bvm-lang`, with examples.
-> **Status: 2.0.0-alpha.2, a pre-release.** The surface may still change before
+> **Status: 2.0.0-alpha.3, a pre-release** executing LSB format 2
+> (bytecode-lang 0.3). The surface may still change before
 > `2.0.0` (see [Stability](#stability) and [`STABILITY.md`](./STABILITY.md)).
 > Instruction semantics are those of LSB (`_lexersketch/specs/LSB.md`) and OPS
 > (`_lexersketch/specs/OPS.md`); this file documents the Rust API around them.
@@ -20,6 +21,10 @@
   - [Fuel and the other budgets](#fuel-and-the-other-budgets)
   - [Hooks](#hooks)
   - [Maps as PHP arrays](#maps-as-php-arrays)
+  - [Dynamic calls and parameter lists](#dynamic-calls-and-parameter-lists)
+  - [Copy-on-write and separation](#copy-on-write-and-separation)
+  - [References](#references)
+  - [`pow` and the shared `ls_pow`](#pow-and-the-shared-ls_pow)
   - [Coroutines](#coroutines)
   - [Tasks and the built-in scheduler](#tasks-and-the-built-in-scheduler)
   - [Memory and collection](#memory-and-collection)
@@ -104,7 +109,7 @@ scalar value. `str`, `ref t`, and `dyn` registers share one encoding (LSB
 | `nil`, `bool`, `char` | immediates |
 | `int` | inline when in [-2^48, 2^48), otherwise a boxed heap object; always 64-bit to the program |
 | `float` | the `f64` bits offset by 2^49; NaN canonicalised (OPS §4) |
-| heap objects | a 32-bit slot index and a 16-bit generation |
+| heap objects | a 32-bit slot index, a 15-bit generation, and a flag set exactly for a PHP reference (kind `reference`, LSB §5.17), so a slot access tells a reference slot from a value with one compare on the word |
 
 At the API boundary a register becomes a [`Value`](#value): signed integers
 and `dyn` ints as `Value::Int`, unsigned integers as `Value::UInt`, `f64` and
@@ -144,7 +149,17 @@ out-of-range index:
   constants refer only to earlier ones and nest at most
   [`MAX_CONST_DEPTH`](#constants) deep;
 - hook callees and the start function have the signatures LSB requires;
-  every import has a registered host function.
+  every import has a registered host function;
+- every parameter list (of a function or an import) is valid and fits its
+  signature (LSB §5.15: kinds in order, names present and unique and in the
+  string table, no default on a rest parameter, rest parameters `dyn`,
+  by-reference parameters `dyn` or `ref` to a `cell dyn`, the `i64` presence
+  mask last when a parameter has a default); every call shape is valid
+  (at most 255 entries, nothing positional after a named entry, no repeated
+  name, names in the string table) and every `dcall_shape` window fits the
+  frame; `raise` names a catchable error kind;
+- the module is LSB format 2: [`Program::decode`](#programdecode) refuses
+  format 1 bytes (`UnsupportedVersion(1)`), which must be regenerated.
 
 It does **not** check the verifier's type rules. A module that, say, adds two
 `str` registers with `iadd` loads and runs; it computes a meaningless word,
@@ -160,9 +175,16 @@ the first covering the pc receives the error value (a `dyn` of kind `error`,
 or the thrown value) and execution continues at its target. Otherwise the
 frame is popped and the search continues at the caller's call instruction.
 An error leaving the entry frame ends the run with
-[`VmError::Raised`](#vmerror) (runtime errors: kind, function, and pc of the
-raising instruction) or [`VmError::Thrown`](#vmerror) (any other thrown
-value).
+[`VmError::Raised`](#vmerror) (runtime errors: kind, payload, function, and
+pc of the raising instruction) or [`VmError::Thrown`](#vmerror) (any other
+thrown value).
+
+`raise kind, src` raises any catchable error kind with `src` as its
+**payload** (LSB §5.9, §6): how a code generator raises `NoMatch` (E0200)
+with the unmatched value, or `ArgumentError` from a prologue. `err_payload`
+reads it back (`nil` for an error an instruction raised by itself, and for a
+value that is not an error), as do [`Vm::error_payload`](#inspecting-values)
+and `VmError::Raised { payload, .. }`.
 
 **Traps** abort without visiting handlers: `OutOfFuel` (E0107),
 `OutOfMemory` (E0106), `Unreachable` (E0109), and any OPS error under policy
@@ -174,15 +196,19 @@ value).
 Fuel follows LSB §5.14, the rule every tier shares so that a run under a
 budget stops at the same function and pc on each. One unit is charged at
 every `safepoint`, every call-family instruction (`call`, `call_indirect`,
-`call_import`, `tail_call`, `tail_call_indirect`, `dcall`, and every hook
-invocation), every taken branch to a target at or before the branching
+`call_import`, `tail_call`, `tail_call_indirect`, `dcall`, `dcall_shape`, and
+every hook invocation), every taken branch to a target at or before the branching
 instruction (`jmp`, `jmp_if`, `jmp_if_not`, `switch`), every handler entry,
 every coroutine instruction (`spawn` once more for its hook), and every
 `iter_next` over a coroutine. `call`, `tail_call`, `call_import`, `safepoint`,
 and the coroutine instructions charge before anything else;
-`call_indirect`, `tail_call_indirect`, and `dcall` charge once the callee is
-known to be callable with that many arguments (a `nil` callee, a
-non-function, or an arity mismatch raises uncharged). Between two charges a
+`call_indirect` and `tail_call_indirect` charge once the callee is known to
+be callable with that many arguments (a `nil` callee, a non-function, or an
+arity mismatch raises uncharged); `dcall` and `dcall_shape` charge once the
+callee is known to be callable and its arguments bind to its parameter list
+(LSB §5.15 step 4: a flattening or binding error raises uncharged, a
+conversion error after binding is charged; on a non-callable the hook's
+invocation is the charge). Between two charges a
 run executes at most one function's length of instructions, so fuel bounds
 total work even for modules a verifier would reject for lacking safepoints.
 
@@ -198,7 +224,11 @@ The dynamic instructions take a built-in fast path (numbers, strings,
 collections, structs) and otherwise call the module's hook for that
 operation (LSB §5.8), bound to a module function or an import. A function
 hook runs as a call (a frame, fuel, depth); an import hook runs the host
-function. Results are converted as LSB states: `eq`, `lt`, `le`, `truthy`, and
+function. Format 2 adds `pow` (28, the `dpow` slow path), `abs` (29, `dabs`),
+and `call_shape` (30): a `dcall_shape` of a non-callable calls it with the
+callee, the positional arguments as a `dyn` array, and the named ones as a
+`dyn` map (a repeated name is `ArgumentError`), or, with it unbound and no
+argument named, the `call` hook with the positional arguments. Results are converted as LSB states: `eq`, `lt`, `le`, `truthy`, and
 `has_prop` must return a `dyn` bool (`TypeError` otherwise; `dne` negates),
 `len` a `dyn` int, `iter` an array, map, or iterator. With no hook bound, each
 instruction has its LSB fallback: `TypeError` for arithmetic, identity for
@@ -221,6 +251,104 @@ for `dyn` keys the kind is part of the key (`1` and `1.0` differ).
 While a map's keys are exactly `0, 1, 2, ...` with nothing deleted it is
 *packed*: no hash index exists and lookups are a bounds check.
 
+### Dynamic calls and parameter lists
+
+A function or an import may carry a parameter list (LSB §5.15,
+`bytecode_lang::ParamList`): one entry per signature parameter with a kind
+(positional-only, normal, named-only, rest, rest map, named rest), a name, a
+by-reference flag, and a default flag, plus `ignore_extra` (PHP user
+functions). A `dcall_shape` site names a call shape (positional, named,
+spread, named spread per window register); `dcall` is the all-positional
+case. The VM binds exactly as `ParamList::bind` states it:
+
+1. a spread array gives one positional item per element, a spread map one
+   per entry (positional for an `int` key, named for a `str` key, otherwise
+   `ArgumentError`), a named spread its `str`-keyed entries; spreading
+   anything else is `TypeError`; spread elements read reference slots as
+   their values;
+2. positional items fill the positional parameters in order, extras go to
+   the `rest`/`rest_map` parameter, are dropped under `ignore_extra`, or are
+   an `ArgumentError`; named items fill the parameter of that name, else the
+   named rest, else the rest map, else `ArgumentError`; a positional item
+   after a named one, a parameter given twice, and a missing parameter
+   without a default are `ArgumentError` (E0114);
+3. one unit of fuel is charged;
+4. a by-reference parameter receives a reference (the argument itself when
+   it is one, else a new reference holding it); a by-value parameter given a
+   reference receives its value, separated as by `dup` when it is an array
+   or map; arguments convert to their parameter types by `from_dyn` rules
+   (`TypeError`); a `rest` parameter receives a new `dyn` array, `rest_map`
+   and `rest_named` a new `dyn` map; the presence mask (bit `i` set when
+   parameter `i` received an argument) is the last argument when any
+   parameter has a default, so the callee computes the others' defaults.
+
+A callee without a list takes exactly its parameters, positionally. All-
+positional calls take a binder that allocates nothing (property-tested
+against `ParamList::bind`); calls with named items use `ParamList::bind`.
+`coro_new_indirect` and `spawn` with a `dyn` callee bind the same way.
+`dparam_ref`/`dparam_ref_named` answer, before an argument is evaluated,
+whether the callee takes it by reference (false for non-callables, callees
+without a list, negative positions, and arguments nothing takes); they never
+raise and are not charged.
+
+`load_import` makes any import a function value. A host function called
+through a parameter list receives the bound arguments in signature order:
+references for by-reference parameters (read and write them with
+[`HostCtx::ref_get`/`ref_set`](#hostctx)), the rest collections, and the
+presence mask.
+
+### Copy-on-write and separation
+
+Arrays and maps share their contents between a container and its `dup`s
+(and the loads of an aggregate constant), copied on the first write. Each
+carries LSB §5.16's two bits: `cow` ("my contents may be shared": set on both
+sides by `dup`, cleared by the first write) and `aliased` ("another
+container's contents may hold me": set on every array and map in contents a
+write to a `cow` container copies, and in the fields of a struct or cell
+`dup` copies). `dsep_index`/`dsep_prop` write the outer container, then
+replace the element by an O(1) `dup` exactly when it is aliased, so a nested
+write `$a[$k][] = $v` is visible through nothing else, and the steady loop
+`$g[$i % 64][] = $i` copies no contents after its first pass. The decisions
+follow the bits, never reference counts or collection timing, so they are
+deterministic; which object `dsep_*` returns when nothing was shared is not
+specified by LSB, and value-semantics code never asks.
+
+### References
+
+A reference (kind `reference`, LSB §5.17) is a box holding one `dyn` value,
+read and written with `cell_get`/`cell_set` and made by `new_ref`. `dref_index`/
+`dref_prop` turn a slot (an array element, a map value, a `dyn` struct field)
+into one, separating the slot's value first (`&$a['k']`, `foreach ($a as
+&$v)`; an absent map key is appended holding `nil`), `dbind_index`/
+`dbind_prop` bind a slot to an existing reference (`$a['k'] = &$x`), and
+`dunref_index`/`dunref_prop` turn a reference slot back into a value slot
+(separated as by `dup`) where a code generator proves the last other holder
+is gone. A reference slot is transparent: every instruction reading the slot
+as a value (`dget_index`, `get_prop`, `get_field`, `array_get`, `map_get`,
+`map_find`, `array_pop`, `iter_next`, `dsep_*`, spreads, and
+[`Vm::elements`/`entries`/`field`](#inspecting-values)) reads the
+reference's value, and every value write (`dset_index`, `set_prop`,
+`set_field`, `array_set`, `map_set`) writes through it; a reference given as
+a value to store stores its value. A copy of a container shares its
+reference slots (PHP's behaviour while the reference is held elsewhere);
+`dup` of a reference itself is a `TypeError`. References, like cells, are
+traced, so reference cycles are collected.
+
+### `pow` and the shared `ls_pow`
+
+`ipow` is OPS v2's exact integer power under the overflow policy (`wrap`
+keeps the low bits; a negative exponent is `NegativeExponent`, E0006, under
+every policy, `trap` included). `dpow` takes it on two ints, with `promote`
+giving the `f64` nearest the exact power and, for a negative exponent, the
+float rule (PHP's `2 ** -1` is `0.5`). Float powers (`fpow`, `dpow` with a
+float) use `ls_pow`, the family's shared routine specified operation by
+operation in `_lexersketch/specs/ops-vectors/pow.md` so every tier produces
+the same bits; this VM's implementation passes the spec's vector table.
+`dabs` is `abs` with `abs(i64::MIN)` per the overflow policy (`promote`:
+`2^63` as an `f64`). The shift policy `saturate` is PHP's `<<`/`>>`: an
+amount at least the width gives `0` (or `-1` for `>>` of a negative value),
+and a negative amount is `ShiftOutOfRange`.
+
 ### Coroutines
 
 The coroutine group (LSB §5.13) is stackful and asymmetric. `coro_new`
@@ -231,9 +359,11 @@ included) below the coroutine's body: every frame above the body is
 suspended with it. Values crossing a suspension are `dyn`.
 
 - **Keys** (`yield_kv`, `coro_key`, `iter_key`): `yield` uses the automatic
-  key, one more than the largest integer key yielded so far (0 first,
-  `ArithOverflow` past `i64::MAX`), exactly as LSB rule 10 and `map_push`
-  state it: after only `yield -5 => x`, the next automatic key is `-4`.
+  key of PHP's generators (LSB rule 10, format 2): a counter starting at -1,
+  raised by every larger explicit integer key, and `yield` takes one more
+  (`ArithOverflow` past `i64::MAX`). After only `yield -5 => x` the next
+  automatic key is `0`; maps differ on purpose (`map_push` after only `-5`
+  gives `-4`, as PHP 8.3 arrays do).
 - **Throwing in** (`resume_throw`) raises at the suspension point, so a `try`
   around the `yield` catches it; on a `created` coroutine nothing runs, it
   fails, and the error is raised at the `resume_throw`.
@@ -314,21 +444,23 @@ when a close runs is not something other tiers reproduce.
 
 ### Instruction coverage
 
-| LSB group | Opcodes | 2.0.0-alpha.2 |
+All 200 instructions of LSB format 2 execute.
+
+| LSB group | Opcodes | 2.0.0-alpha.3 |
 |---|---|---|
-| Moves, constants, globals (§5.1) | `0x00`-`0x0A` | implemented |
-| Integer arithmetic and comparison (§5.2) | `0x10`-`0x26` | implemented, every policy |
-| Float arithmetic and comparison (§5.3) | `0x30`-`0x47` | implemented |
+| Moves, constants, globals (§5.1) | `0x00`-`0x0A` | implemented; `load_import` of any import, parameter list included |
+| Integer arithmetic and comparison (§5.2) | `0x10`-`0x27` | implemented, every policy, `shift = saturate`, `ipow` |
+| Float arithmetic and comparison (§5.3) | `0x30`-`0x48` | implemented, `fpow` by `ls_pow` |
 | Booleans, chars, identity (§5.4) | `0x50`-`0x5A` | implemented |
-| Conversions (§5.5) | `0x60`-`0x6E` | implemented |
-| Dynamic arithmetic and comparison (§5.6) | `0x70`-`0x85`, `0x94` | implemented, `promote` included |
-| Dynamic values, properties, calls (§5.7) | `0x86`-`0x93` | implemented |
-| Control flow, calls, exceptions (§5.9) | `0xA0`-`0xAE` | implemented |
-| Closures and cells (§5.10) | `0xB0`-`0xB4` | implemented |
+| Conversions (§5.5) | `0x60`-`0x6E` | implemented (`f32_to_int`/`f64_to_int` take `FloatConv`) |
+| Dynamic arithmetic and comparison (§5.6) | `0x70`-`0x85`, `0x94`-`0x96` | implemented, `promote` included, `dpow`, `dabs`, `dnot`/`dbit_not` |
+| Dynamic values, properties, calls (§5.7) | `0x86`-`0x93`, `0x97`-`0x9B` | implemented: separation, `dcall_shape`, parameter-list binding, `dparam_ref*` |
+| Control flow, calls, exceptions (§5.9) | `0xA0`-`0xAF`, `0x9C` | implemented, `raise` and `err_payload` |
+| Closures, cells, references (§5.10, §5.17) | `0xB0`-`0xBB` | implemented, transparent reference slots |
 | Typed heap objects (§5.10) | `0xC0`-`0xD4` | implemented |
 | Strings (§5.11) | `0xE0`-`0xE6` | implemented |
-| Coroutines (§5.13) | `0xF0`-`0xFC` | implemented: rules 1-14, keys, close, iteration, close on drop |
-| Hooks (§5.8) | codes 0-27 | implemented, `spawn` (27) included |
+| Coroutines (§5.13) | `0xF0`-`0xFC` | implemented: rules 1-14, PHP generator keys, close, iteration, close on drop |
+| Hooks (§5.8) | codes 0-30 | implemented, `pow`, `abs`, `call_shape` included |
 
 ## `Program`
 
@@ -561,7 +693,7 @@ budget each run; the memory budget applies to the whole heap (including what
 earlier runs left).
 
 ```rust
-use bvm_lang::{Host, Limits, Program, Vm, VmError};
+use bvm_lang::{Host, Limits, Program, Value, Vm, VmError};
 use bytecode_lang::{ErrorKind, Inst, ModuleBuilder};
 
 let mut m = ModuleBuilder::new();
@@ -573,7 +705,7 @@ f.ret_void();
 let id = m.add_function(f).unwrap();
 let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
 let err = Vm::new(&p).run_with(id, &[], Limits::new().with_depth(100)).unwrap_err();
-assert_eq!(err, VmError::Raised { kind: ErrorKind::StackOverflow, func: id, pc: 0 });
+assert_eq!(err, VmError::Raised { kind: ErrorKind::StackOverflow, payload: Value::Nil, func: id, pc: 0 });
 ```
 
 ### `Vm::run_export`
@@ -693,16 +825,19 @@ pub fn elements(&self, v: Value) -> Option<Vec<Value>>
 pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>>
 pub fn field(&self, v: Value, index: usize) -> Option<Value>
 pub fn error_code(&self, v: Value) -> Option<u32>
+pub fn error_payload(&self, v: Value) -> Option<Value>
+pub fn ref_value(&self, v: Value) -> Option<Value>
 pub fn coro_state(&self, v: Value) -> Option<CoroState>
 pub fn global(&self, id: GlobalId) -> Option<Value>
 pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, VmError>
 ```
 
 Read what runs return: a value's dynamic kind, a string's bytes, an array's
-elements, a map's entries in insertion order, a struct's field, a runtime
-error value's code, a coroutine's state, a global's current value; `new_str`
-allocates a string to pass to a run (the `OutOfMemory` trap if the budget is
-spent).
+elements, a map's entries in insertion order, a struct's field (each of
+those three reading a reference slot as its value), a runtime error value's
+code and payload, a reference's value, a coroutine's state, a global's
+current value; `new_str` allocates a string to pass to a run (the
+`OutOfMemory` trap if the budget is spent).
 
 ```rust
 use bvm_lang::{Host, Program, Value, Vm};
@@ -923,11 +1058,23 @@ impl HostCtx<'_> {
     pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, HostError>;
     pub fn kind(&self, v: Value) -> Kind;
     pub fn error_code(&self, v: Value) -> Option<u32>;
+    pub fn ref_get(&self, v: Value) -> Option<Value>;
+    pub fn ref_set(&mut self, r: Value, value: Value) -> Result<(), HostError>;
+    pub fn elements(&self, v: Value) -> Option<Vec<Value>>;
+    pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>>;
+    pub fn new_array(&mut self, items: &[Value]) -> Result<Value, HostError>;
+    pub fn new_map(&mut self, entries: &[(Value, Value)]) -> Result<Value, HostError>;
 }
 ```
 
-What a host function can do with the VM while it runs. `new_str` fails with
-`HostError::Raise(ErrorKind::OutOfMemory)` (a trap) when the budget is spent.
+What a host function can do with the VM while it runs. `new_str`,
+`new_array`, `new_map`, and `ref_set` fail with
+`HostError::Raise(ErrorKind::OutOfMemory)` (a trap) when the budget is
+spent. `ref_get`/`ref_set` read and write a reference (what a by-reference
+parameter of an import's parameter list receives; `ref_set` of a
+non-reference is `TypeError`); `elements`/`entries` read an array or a map
+(reference slots as their values; a rest parameter arrives as one);
+`new_array`/`new_map` build `dyn` containers to return.
 
 ```rust
 use bvm_lang::{Host, Value};
@@ -936,6 +1083,17 @@ let mut host = Host::new();
 host.register("str", "upper", |ctx, args| {
     let s = args.first().and_then(|v| ctx.str_bytes(*v)).unwrap_or(b"").to_ascii_uppercase();
     ctx.new_str(&s)
+});
+// PHP: function sum(&$total, ...$values), through an import parameter list:
+// adds the rest array into the referenced total and returns the count.
+host.register("php", "sum_into", |ctx, args| {
+    let values = ctx.elements(args[1]).unwrap_or_default();
+    let mut total = ctx.ref_get(args[0]).and_then(Value::as_int).unwrap_or(0);
+    for v in &values {
+        total += v.as_int().unwrap_or(0);
+    }
+    ctx.ref_set(args[0], Value::Int(total))?;
+    Ok(Value::Int(values.len() as i64))
 });
 ```
 
@@ -963,7 +1121,7 @@ assert_eq!(HostError::Throw(Value::Nil).to_string(), "host threw nil");
 ```rust,ignore
 #[non_exhaustive]
 pub enum VmError {
-    Raised { kind: ErrorKind, func: FuncId, pc: u32 },
+    Raised { kind: ErrorKind, payload: Value, func: FuncId, pc: u32 },
     Thrown { value: Value, func: FuncId, pc: u32 },
     Trap { kind: ErrorKind, func: FuncId, pc: u32 },
     Deadlock { waiting: usize },
@@ -982,7 +1140,9 @@ impl VmError {
 ```
 
 How a run ended without a result. `Raised` is an uncaught runtime error (its
-location is where it was raised, even if a handler caught and rethrew it);
+payload is `raise`'s operand, `nil` for an error an instruction raised by
+itself; its location is where it was raised, even if a handler caught and
+rethrew it);
 `Thrown` an uncaught non-error value (its location is where the unwind that
 ended the run began); `Trap` a trap; `Deadlock` a [`run_async`](#vmrun_async)
 whose tasks all wait; `GlobalInit` a global initialiser that does not fit its
@@ -1033,6 +1193,7 @@ pub enum LoadErrorKind {
     BadModifier, InvalidHandler, CatchNotDyn, TailCallInTry,
     BadParent, InheritanceTooDeep, BadConstant,
     BadHook(Hook), BadStart,
+    BadParamList, BadCallShape,
 }
 ```
 
@@ -1086,6 +1247,6 @@ assert_eq!(bvm_lang::MAX_CONST_DEPTH, 64);
 
 ## Stability
 
-2.0.0-alpha.2 is a pre-release: names and signatures may change before 2.0.0,
+2.0.0-alpha.3 is a pre-release: names and signatures may change before 2.0.0,
 each change recorded in the CHANGELOG. Instruction semantics follow LSB and
 OPS and change only with them. See [`STABILITY.md`](./STABILITY.md).

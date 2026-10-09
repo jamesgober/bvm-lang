@@ -21,6 +21,41 @@
 
 ---
 
+## [2.0.0-alpha.3] - 2026-10-09
+
+**LSB format 2.** The VM now executes the format [`bytecode-lang`](https://crates.io/crates/bytecode-lang) 0.3 defines: dynamic calls that bind to parameter lists (named arguments, variadics, defaults, by-reference parameters decided at run time), host functions as values, PHP references with transparent reference slots, copy-on-write separation for nested writes, OPS v2's `pow`, `abs`, and saturating shifts with the family's shared `ls_pow` routine, `raise` with error payloads, and PHP's generator keys. Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
+
+### Breaking
+
+- **Format 2 only.** `bytecode-lang` `0.3` replaces `0.2`; `Program::decode` refuses format 1 bytes (`LoadErrorKind::Decode` with `UnsupportedVersion(1)`): regenerate them. The renamed instructions are `Inst::IBitNot` (was `INot`), `Inst::DBitNot` (was the bitwise `DNot`), and `Inst::DNot` (the logical not, was `DLNot`); `Inst::F32ToInt`/`F64ToInt` take `conv: FloatConv` instead of `op: IntOp`.
+- **`VmError::Raised` gains `payload: Value`**: the operand of the `raise` that raised the error (a `NoMatch` carries the unmatched value), `Value::Nil` for an error an instruction raised by itself. Constructing or matching it field by field needs the new field (`..` in patterns). `Display` shows a non-nil payload: `uncaught E0200 NoMatch (42) at f0 @1`.
+- **Dynamic-call arity is `ArgumentError` (E0114)**, no longer `TypeError`: `dcall`, and `coro_new_indirect`/`spawn` with a `dyn` callee, bind their arguments to the callee's parameter list (LSB §5.15), and a callee without one takes exactly its parameters.
+- **Generator keys follow PHP** (LSB §5.13 rule 10): the automatic key counter starts at -1 and only explicit larger integer keys raise it, so after only `yield -5 => x` the next automatic key is `0` (alpha.2 gave `-4`, the `map_push` rule maps keep).
+- **`dup` of a reference is a `TypeError`**; `cell_get`/`cell_set` accept references (kind 14) as well as cells.
+- **Heap references carry 15 generation bits** (one bit marks a PHP reference), so a slot is retired after 32,767 reuses rather than 65,535. Unobservable except as slightly more slots in long-running heaps.
+- `LoadErrorKind` gains `BadParamList` and `BadCallShape` (the enum is `#[non_exhaustive]`).
+
+### Added
+
+- Execution of the 18 new instructions: `ipow`, `fpow`, `dpow`, `dabs`, `dsep_index`, `dsep_prop`, `dcall_shape`, `dparam_ref`, `dparam_ref_named`, `err_payload`, `raise`, `new_ref`, `dref_index`, `dref_prop`, `dbind_index`, `dbind_prop`, `dunref_index`, `dunref_prop`; hooks `pow` (28), `abs` (29), and `call_shape` (30).
+- **Parameter-list binding** (LSB §5.15) for `dcall`, `dcall_shape`, `coro_new_indirect`, and `spawn`: spreads and named spreads flattened, positional/named/rest/rest-map/named-rest binding, `ignore_extra`, the presence mask, by-reference parameters receiving references (a temporary for a non-reference), by-value parameters receiving a reference's value separated, `ArgumentError`, one unit of fuel charged after binding (flattening and binding errors are uncharged). All-positional calls use an allocation-free binder property-tested against `ParamList::bind`; calls with names use `ParamList::bind`. `dcall_shape` on a non-callable calls the `call_shape` hook (or `call` when nothing is named).
+- **Import parameter lists and host functions as values**: `load_import` of any import is a function value every dynamic call form accepts; a host function called through a parameter list receives references, rest collections, and the presence mask. `HostCtx::ref_get`, `HostCtx::ref_set`, `HostCtx::elements`, `HostCtx::entries`, `HostCtx::new_array`, and `HostCtx::new_map` let host functions use them.
+- **References** (LSB §5.17): kind `reference`; reference slots in arrays, maps, and `dyn` struct fields are transparent to every slot read and write (typed and dynamic, `iter_next`, spreads, and `Vm::elements`/`entries`/`field`); copies share reference slots; references are traced, so cycles through them are collected. `Vm::ref_value`.
+- **Copy-on-write separation** (LSB §5.16): arrays and maps carry the `cow` and `aliased` bits of the spec's conforming implementation for tracing collectors; `dsep_*` separate exactly the aliased elements, so `$g[$i % 64][] = $i` copies no contents after its first pass. The decisions follow the bits, not reference counts or collection timing, and are therefore deterministic. They are asked only through `contents_shared` (on the array and map objects) and `Heap::is_aliased`, the seam the reference-counting memory profile (D22, alpha.4) replaces.
+- **OPS v2 arithmetic**: `pow` at every integer type under every overflow policy (exact by repeated squaring; `wrap` keeps the low bits; `promote` rounds the exact power, a negative exponent takes the float rule; otherwise `NegativeExponent`, E0006, never a trap), float `pow` by the shared `ls_pow` routine (specified in `_lexersketch/specs/ops-vectors/pow.md`, with a 122-row vector table this VM passes bit for bit), `dabs` with `promote`, and `shift = saturate` on `ishl`/`ishr`/`dshl`/`dshr`.
+- **`raise` and error payloads**: `raise kind, src` raises any catchable kind with a payload; `err_payload` reads it; `Vm::error_payload`; payloads are traced.
+- Tests: `tests/php_semantics.rs` (PHP programs lowered as a PHP code generator lowers them, with PHP 8.3's results), `tests/format2.rs` (loading, hooks, fuel point, `dparam_ref`, coroutine binding, payloads, reference and separation corners), `tests/pow_vectors.rs` (the spec's vectors through `fpow` and `dpow`); the scalar differential reference gains `pow`, `abs`, and saturating shifts (with its own transcription of `ls_pow` from the spec), and the whole-module reference gains every format 2 feature (independent binder, reference slots, the two copy-on-write bits) with a new PHP-focused property; mutation-checked (32 deliberate bugs; every one that changes behaviour fails the suite).
+- Benchmarks `call/dcall_plain_100k`, `call/dcall_bind_100k`, `call/dcall_shape_named_100k`, `php/nested_append_100k`, `php/nested_append_dup_100k`, `php/foreach_by_ref_100k`. Example `php_calls`.
+
+### Changed
+
+- **`call/fib25` is ~7% faster than alpha.1 and ~12% faster than alpha.2**: the alpha.2 call-path regression is isolated to the return path (every continuation was matched, the coroutine body's included, before a typed call's result was written) and fixed by testing that continuation first.
+- `Vm::elements`, `Vm::entries`, and `Vm::field` read reference slots as their values.
+- Copy-on-write decisions now follow the `cow` bit instead of `Arc` reference counts; the counts only decide whether a physical copy is still needed.
+- Format 2 adds `0x27`, `0x48`, `0x95`-`0x9C`, `0xAF`, `0xB5`-`0xBB` to the loader's checks, plus parameter lists, call shapes, and `raise` kinds.
+
+---
+
 ## [2.0.0-alpha.2] - 2026-10-09
 
 **Coroutines.** The VM now executes every LSB instruction: the coroutine group (`0xF0`..=`0xFC`) for generators, fibers, and async tasks, with close on drop and a small deterministic scheduler for tests and simple hosts. Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
@@ -163,7 +198,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.2...HEAD
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.3...HEAD
+[2.0.0-alpha.3]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.2...v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.1...v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/jamesgober/bvm-lang/compare/v1.0.0...v2.0.0-alpha.1
 [1.0.0]: https://github.com/jamesgober/bvm-lang/compare/v0.2.5...v1.0.0

@@ -42,12 +42,13 @@ use alloc::vec::Vec;
 
 use bytecode_lang::{CoroState, ErrorKind, Hook, Inst, ValType};
 
+use crate::bind;
 use crate::coll::not_a;
 use crate::conv;
 use crate::dynv;
 use crate::exec::{Cx, Step};
 use crate::fault::Fault;
-use crate::heap::{CoroObj, FRAME_BYTES, Object};
+use crate::heap::{Callable, CoroObj, FRAME_BYTES, Object};
 use crate::machine::{Active, Charge, Cont, Driver, Frame, Machine, Stop, Wake};
 use crate::program::Program;
 use crate::value::{Obj, Value};
@@ -115,7 +116,7 @@ impl Machine {
             resume_dst: 0,
             payload: dynv::NIL,
             key: dynv::NIL,
-            max_key: None,
+            max_key: -1,
             result: dynv::NIL,
             signal: dynv::NIL,
         })))
@@ -206,7 +207,7 @@ impl Machine {
         state: CoroState,
         dst: u16,
         payload: u64,
-        key: Option<(u64, Option<i64>)>,
+        key: Option<(u64, i64)>,
     ) -> Result<(Driver, Event), Fault> {
         let Some(&act) = self.coros.last() else {
             return Err(Fault::raise(ErrorKind::CannotSuspend));
@@ -517,17 +518,14 @@ fn finish(co: &mut CoroObj, state: CoroState, result: u64) {
     co.regs = Vec::new();
 }
 
-/// The key of a `yield` (rule 10): the automatic key, one more than the
-/// largest integer key so far (0 for the first), with `ArithOverflow` past
-/// `i64::MAX`.
-fn auto_key(m: &mut Machine, max: Option<i64>) -> Result<(u64, Option<i64>), Fault> {
-    let next = match max {
-        None => 0,
-        Some(k) => k
-            .checked_add(1)
-            .ok_or(Fault::Raise(ErrorKind::ArithOverflow))?,
-    };
-    Ok((conv::encode_int(&mut m.heap, next)?, Some(next)))
+/// The key of a `yield` (rule 10, PHP's generators): one more than the
+/// counter `largest` (which starts at -1 and only grows), with
+/// `ArithOverflow` past `i64::MAX`. Returns the key and the new counter.
+fn auto_key(m: &mut Machine, largest: i64) -> Result<(u64, i64), Fault> {
+    let next = largest
+        .checked_add(1)
+        .ok_or(Fault::Raise(ErrorKind::ArithOverflow))?;
+    Ok((conv::encode_int(&mut m.heap, next)?, next))
 }
 
 /// Executes one coroutine instruction (`0xF0`..=`0xFC`). Every one charges
@@ -642,17 +640,18 @@ pub(crate) fn exec(
                 Inst::Await { .. } => (CoroState::Awaiting, None),
                 Inst::YieldKv { key, .. } => {
                     let k = r!(key);
-                    let max = m.heap.coro(coro).and_then(|c| c.max_key);
+                    let max = m.heap.coro(coro).map_or(-1, |c| c.max_key);
                     // An integer key larger than any before moves the
-                    // automatic-key counter (rule 10).
+                    // automatic-key counter (rule 10); a smaller one,
+                    // negative ones included, leaves it.
                     let max = match conv::dyn_int(&m.heap, k) {
-                        Some(i) => Some(max.map_or(i, |x| x.max(i))),
+                        Some(i) => max.max(i),
                         None => max,
                     };
                     (CoroState::Yielded, Some((k, max)))
                 }
                 _ => {
-                    let max = m.heap.coro(coro).and_then(|c| c.max_key);
+                    let max = m.heap.coro(coro).map_or(-1, |c| c.max_key);
                     (CoroState::Yielded, Some(t!(auto_key(m, max))))
                 }
             };
@@ -796,11 +795,14 @@ pub(crate) fn iter_next(
 }
 
 /// `coro_new_indirect` (and `spawn`'s coroutine): a closure or function
-/// reference with the window's arguments, converted from `dyn` as `dcall`
-/// does when the callee register is `dyn`, passed as they are (as
-/// `call_indirect`) otherwise. `nil` is `NullReference`; any other
-/// non-function, an import (a host function cannot be suspended), or an
-/// arity mismatch is `TypeError`.
+/// reference with the window's arguments. With a `dyn` callee register the
+/// window binds to the body's parameter list exactly as `dcall` binds it
+/// (LSB §5.15: `ArgumentError` when it does not, by-reference parameters
+/// receive references, rest parameters their collections, the presence mask
+/// last); otherwise the arguments pass as they are (as `call_indirect`,
+/// exact arity). `nil` is `NullReference`; any other non-function, an import
+/// (a host function cannot be suspended), or a typed arity mismatch is
+/// `TypeError`.
 fn indirect(
     m: &mut Machine,
     stack: &[u64],
@@ -814,8 +816,8 @@ fn indirect(
     let cv = stack[base + callee];
     let func = match m.heap.get(cv) {
         Some(Object::Func(f)) => match f.target {
-            crate::heap::Callable::Func(f) => f,
-            crate::heap::Callable::Import(_) => return Err(Fault::type_error()),
+            Callable::Func(f) => f,
+            Callable::Import(_) => return Err(Fault::type_error()),
         },
         _ => return Err(not_a(&m.heap, cv)),
     };
@@ -823,32 +825,33 @@ fn indirect(
         return Err(Fault::type_error());
     };
     let argc = usize::from(argc);
-    if body.nparams != argc {
+    let dynamic = info.regs.get(callee) == Some(&ValType::Dyn);
+    if !dynamic && body.nparams != argc {
         return Err(Fault::type_error());
     }
-    let nregs = body.nregs;
-    if m.heap.wants_gc(nregs * 8) {
+    // Collect first: nothing below collects, so the references and rest
+    // collections the binding allocates live until the coroutine holds them.
+    if m.heap.wants_gc(body.nregs * 8) {
         m.collect(stack, prog);
     }
     let first = base + dst + 1;
-    let dynamic = info.regs.get(callee) == Some(&ValType::Dyn);
+    let window = &stack[first..first + argc];
     let mut args = core::mem::take(&mut m.scratch);
-    args.clear();
-    for (i, &ty) in body.regs[..argc].iter().enumerate() {
-        let w = stack[first + i];
-        if dynamic {
-            match conv::from_dyn(&m.heap, prog, ty, w) {
-                Ok(v) => args.push(v),
-                Err(e) => {
-                    m.scratch = args;
-                    return Err(e);
-                }
-            }
-        } else {
-            args.push(w);
-        }
-    }
-    let made = m.coro_create(prog, func, cv, &args);
+    let made = if dynamic {
+        let target = Callable::Func(func);
+        let list = bind::params_of(prog, target);
+        let sig = &body.regs[..body.nparams];
+        let mut bound = core::mem::take(&mut m.bound);
+        let built = bind::bind(prog, list, sig.len(), None, argc, &mut bound).and_then(|mask| {
+            bind::build_args(m, prog, list, sig, window, None, &bound, mask, &mut args)
+        });
+        m.bound = bound;
+        built.and_then(|()| m.coro_create(prog, func, cv, &args))
+    } else {
+        args.clear();
+        args.extend_from_slice(window);
+        m.coro_create(prog, func, cv, &args)
+    };
     m.scratch = args;
     made
 }

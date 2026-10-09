@@ -3,7 +3,7 @@
 
 use alloc::vec::Vec;
 
-use bytecode_lang::{CoroState, FuncId, GlobalId, Kind};
+use bytecode_lang::{CoroState, FuncId, GlobalId, Kind, ValType};
 
 use crate::conv;
 use crate::dynv;
@@ -483,7 +483,7 @@ impl<'p> Vm<'p> {
     /// // A plain run has no coroutine to suspend.
     /// assert_eq!(
     ///     vm.run(main, &[Value::Int(7)]),
-    ///     Err(VmError::Raised { kind: ErrorKind::CannotSuspend, func: main, pc: 0 })
+    ///     Err(VmError::Raised { kind: ErrorKind::CannotSuspend, payload: Value::Nil, func: main, pc: 0 })
     /// );
     /// ```
     ///
@@ -844,7 +844,8 @@ impl<'p> Vm<'p> {
             })
     }
 
-    /// The elements of an array value, as values.
+    /// The elements of an array value, as values (a reference slot as its
+    /// reference's value, LSB §5.17).
     ///
     /// # Examples
     ///
@@ -873,14 +874,15 @@ impl<'p> Vm<'p> {
             Object::Array(a) => Some(
                 a.items
                     .iter()
-                    .map(|&x| conv::value_of(&self.m.heap, a.elem, x))
+                    .map(|&x| conv::value_of(&self.m.heap, a.elem, self.slot(a.elem, x)))
                     .collect(),
             ),
             _ => None,
         }
     }
 
-    /// The entries of a map value, in insertion order.
+    /// The entries of a map value, in insertion order (reference slots as
+    /// their values).
     ///
     /// # Examples
     ///
@@ -914,7 +916,7 @@ impl<'p> Vm<'p> {
                     .map(|e| {
                         (
                             conv::value_of(&self.m.heap, m.key, e.key),
-                            conv::value_of(&self.m.heap, m.value, e.value),
+                            conv::value_of(&self.m.heap, m.value, self.slot(m.value, e.value)),
                         )
                     })
                     .collect(),
@@ -923,7 +925,7 @@ impl<'p> Vm<'p> {
         }
     }
 
-    /// Field `index` of a struct value.
+    /// Field `index` of a struct value (a reference slot as its value).
     ///
     /// # Examples
     ///
@@ -957,7 +959,8 @@ impl<'p> Vm<'p> {
         match self.m.heap.get(w)? {
             Object::Struct(s) => {
                 let ty = *self.prog.struct_info(s.ty)?.fields.get(index)?;
-                Some(conv::value_of(&self.m.heap, ty, *s.fields.get(index)?))
+                let w = self.slot(ty, *s.fields.get(index)?);
+                Some(conv::value_of(&self.m.heap, ty, w))
             }
             _ => None,
         }
@@ -982,12 +985,91 @@ impl<'p> Vm<'p> {
             _ => None,
         }
     }
+
+    /// The payload of a runtime error value (LSB §6): the operand of the
+    /// `raise` that raised it, `nil` for an error an instruction raised by
+    /// itself; `None` for anything but an error value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{ErrorKind, Inst, ModuleBuilder, ValType};
+    ///
+    /// // match (7) {} with no arm: raise NoMatch (E0200) with the scrutinee,
+    /// // catch it, and return the error value.
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("f", &[], &[ValType::Dyn]);
+    /// let (x, e) = (f.reg(ValType::Dyn), f.reg(ValType::Dyn));
+    /// f.emit(Inst::DLoadInt { dst: x, val: 7 });
+    /// let (start, end) = (f.label(), f.label());
+    /// f.bind(start);
+    /// f.emit(Inst::Raise { src: x, kind: ErrorKind::NoMatch });
+    /// f.bind(end);
+    /// f.ret(e);
+    /// f.try_region(start, end, end, e);
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let err = vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.error_code(err), Some(200));
+    /// assert_eq!(vm.error_payload(err), Some(Value::Int(7)));
+    /// ```
+    #[must_use]
+    pub fn error_payload(&self, v: Value) -> Option<Value> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        match self.m.heap.get(w)? {
+            Object::Error(e) => Some(conv::dyn_value(&self.m.heap, e.payload)),
+            _ => None,
+        }
+    }
+
+    /// The value a PHP reference (LSB §5.17, kind `reference`) holds, or
+    /// `None` when `v` is not a reference.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Inst, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("f", &[], &[ValType::Dyn]);
+    /// let (x, r) = (f.reg(ValType::Dyn), f.reg(ValType::Dyn));
+    /// f.emit(Inst::DLoadInt { dst: x, val: 5 });
+    /// f.emit(Inst::NewRef { dst: r, src: x });
+    /// f.ret(r);
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let r = vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.kind(r), bytecode_lang::Kind::Reference);
+    /// assert_eq!(vm.ref_value(r), Some(Value::Int(5)));
+    /// ```
+    #[must_use]
+    pub fn ref_value(&self, v: Value) -> Option<Value> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        self.m
+            .heap
+            .box_value(w)
+            .map(|x| conv::dyn_value(&self.m.heap, x))
+    }
+
+    /// A slot word as a value: a reference slot (a `dyn` slot holding a
+    /// reference) reads as the reference's value.
+    fn slot(&self, ty: ValType, w: u64) -> u64 {
+        if ty == ValType::Dyn {
+            self.m.heap.deref(w)
+        } else {
+            w
+        }
+    }
 }
 
 /// The error kind of a fault outside a run.
 fn fault_kind(f: Fault) -> bytecode_lang::ErrorKind {
     match f {
-        Fault::Raise(k) | Fault::Trap(k) => k,
+        Fault::Raise(k) | Fault::RaiseWith(k, _) | Fault::Trap(k) => k,
         Fault::Throw(_) => bytecode_lang::ErrorKind::TypeError,
     }
 }

@@ -41,8 +41,8 @@ pub const MAX_INHERITANCE_DEPTH: usize = 256;
 /// decoding budget). Materialisation recurses over it.
 pub const MAX_CONST_DEPTH: u32 = 64;
 
-/// Number of hook codes LSB defines.
-pub(crate) const HOOKS: usize = 28;
+/// Number of hook codes LSB defines (format 2: 0..=30).
+pub(crate) const HOOKS: usize = 31;
 
 /// Per-function facts the interpreter uses.
 #[derive(Debug)]
@@ -289,6 +289,16 @@ pub enum LoadErrorKind {
     BadHook(Hook),
     /// The start function does not have the signature `() -> ()`.
     BadStart,
+    /// A function's or import's parameter list (LSB §5.15) is invalid: kinds
+    /// out of order, a missing or repeated name, a rest parameter with a
+    /// default, too many entries, a name out of the string table, or a
+    /// signature that does not fit it (rest parameters `dyn`, by-reference
+    /// parameters `dyn` or `ref` to a `cell dyn`, the presence mask `i64`).
+    BadParamList,
+    /// A call shape (LSB §5.15) is invalid: more than 255 entries, a
+    /// positional entry or spread after a named one, a repeated name, or a
+    /// name out of the string table.
+    BadCallShape,
 }
 
 impl fmt::Display for LoadErrorKind {
@@ -333,6 +343,8 @@ impl fmt::Display for LoadErrorKind {
             LoadErrorKind::BadConstant => f.write_str("invalid aggregate constant"),
             LoadErrorKind::BadHook(h) => write!(f, "hook {h} has the wrong signature"),
             LoadErrorKind::BadStart => f.write_str("start function is not () -> ()"),
+            LoadErrorKind::BadParamList => f.write_str("invalid parameter list"),
+            LoadErrorKind::BadCallShape => f.write_str("invalid call shape"),
         }
     }
 }
@@ -441,8 +453,15 @@ impl fmt::Display for Location<'_> {
 /// The arity and result of each hook (LSB §5.8).
 const fn hook_shape(h: Hook) -> (usize, bool) {
     match h {
-        Hook::Neg | Hook::BitNot | Hook::Truthy | Hook::Iter | Hook::Len | Hook::Spawn => (1, true),
+        Hook::Neg
+        | Hook::BitNot
+        | Hook::Truthy
+        | Hook::Iter
+        | Hook::Len
+        | Hook::Spawn
+        | Hook::Abs => (1, true),
         Hook::SetIndex | Hook::SetProp => (3, false),
+        Hook::CallShape => (3, true),
         _ => (2, true),
     }
 }
@@ -700,6 +719,49 @@ impl<'m> Loader<'m> {
         }
     }
 
+    /// Checks a parameter list against the signature parameters it describes
+    /// (canonical types).
+    fn param_list(
+        &self,
+        list: &bytecode_lang::ParamList,
+        sig: &[ValType],
+    ) -> Result<(), LoadErrorKind> {
+        if list.validate().is_err() || list.fits(sig).is_err() {
+            return Err(LoadErrorKind::BadParamList);
+        }
+        for (p, &ty) in list.params.iter().zip(sig) {
+            if p.name.is_some_and(|n| n.index() >= self.m.string_count()) {
+                return Err(LoadErrorKind::BadParamList);
+            }
+            // A by-reference parameter receives a reference: `dyn`, or a
+            // `ref` to a `cell dyn` (a reference is one, §5.17).
+            if p.by_ref {
+                if let ValType::Ref(t) = ty {
+                    let cell_dyn = matches!(self.m.type_def(t), Some(TypeDef::Cell(ValType::Dyn)));
+                    if !cell_dyn {
+                        return Err(LoadErrorKind::BadParamList);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks a call shape.
+    fn call_shape(&self, shape: &bytecode_lang::CallShape) -> Result<(), LoadErrorKind> {
+        if shape.validate().is_err() {
+            return Err(LoadErrorKind::BadCallShape);
+        }
+        for arg in &shape.args {
+            if let bytecode_lang::ArgKind::Named(n) = arg {
+                if n.index() >= self.m.string_count() {
+                    return Err(LoadErrorKind::BadCallShape);
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn run(mut self, host: &Host) -> Result<Parts, LoadError> {
         let m = self.m;
         let canon_str = canonical_strings(m);
@@ -890,6 +952,9 @@ impl<'m> Loader<'m> {
             if matches!(func, HostFn::Scheduler) && !scheduler_shape {
                 return Err(LoadError::new(LoadErrorKind::BadSignature));
             }
+            if let Some(list) = &imp.params {
+                self.param_list(list, &params).map_err(LoadError::new)?;
+            }
             out.push(ImportInfo {
                 params,
                 result,
@@ -925,6 +990,12 @@ impl<'m> Loader<'m> {
             .filter(|(_, t)| t.is_reference())
             .map(|(i, _)| u16::try_from(i).unwrap_or(u16::MAX))
             .collect();
+        if let Some(list) = f.params() {
+            self.param_list(list, &params).map_err(err)?;
+        }
+        for shape in f.shapes() {
+            self.call_shape(shape).map_err(err)?;
+        }
         let captures = self.valtypes(f.captures()).map_err(err)?;
         let names = f
             .names()
@@ -1027,7 +1098,7 @@ impl<'m> Loader<'m> {
             covered += cover.get(pc).copied().unwrap_or(0);
             let at = |k| LoadError::at(k, id, Some(count(pc)));
             self.check_fields(inst, info, f, len).map_err(at)?;
-            self.check_inst(inst, info, funcs, imports, covered > 0)
+            self.check_inst(inst, info, (funcs, imports), f.shapes(), covered > 0)
                 .map_err(at)?;
         }
         Ok(())
@@ -1058,6 +1129,7 @@ impl<'m> Loader<'m> {
                 FieldKind::Name => ("name", info.names.len()),
                 FieldKind::TypeRef => ("type ref", info.type_refs.len()),
                 FieldKind::Upval => ("capture", info.captures.len()),
+                FieldKind::Shape => ("call shape", f.shapes().len()),
                 _ => continue,
             };
             if raw as usize >= limit {
@@ -1074,8 +1146,8 @@ impl<'m> Loader<'m> {
         &self,
         inst: &Inst,
         info: &FuncInfo,
-        funcs: &[FuncInfo],
-        imports: &[ImportInfo],
+        (funcs, imports): (&[FuncInfo], &[ImportInfo]),
+        shapes: &[bytecode_lang::CallShape],
         in_try: bool,
     ) -> Result<(), LoadErrorKind> {
         let nregs = info.nregs;
@@ -1130,8 +1202,9 @@ impl<'m> Loader<'m> {
             | Inst::IMin { .. }
             | Inst::IMax { .. }
             | Inst::INeg { .. }
-            | Inst::INot { .. }
+            | Inst::IBitNot { .. }
             | Inst::IAbs { .. }
+            | Inst::IPow { .. }
             | Inst::IntCast { .. }
             | Inst::F32ToInt { .. }
             | Inst::F64ToInt { .. } => no_promote(inst.overflow())?,
@@ -1148,13 +1221,24 @@ impl<'m> Loader<'m> {
             | Inst::DShl { dst, pol, .. }
             | Inst::DShr { dst, pol, .. }
             | Inst::DNeg { dst, pol, .. }
-            | Inst::DNot { dst, pol, .. }
+            | Inst::DBitNot { dst, pol, .. }
+            | Inst::DPow { dst, pol, .. }
+            | Inst::DAbs { dst, pol, .. }
                 if pol.overflow() == Overflow::Promote
                     && info.regs.get(dst.index()) != Some(&ValType::Dyn) =>
             {
                 return Err(LoadErrorKind::PromoteNotDynamic);
             }
             Inst::FromDyn { to: Prim::Ref, .. } => return Err(LoadErrorKind::BadModifier),
+            // Only catchable kinds are error values (LSB §5.9); the decoder
+            // refuses the others, a builder-made module is checked here.
+            Inst::Raise { kind, .. } if !kind.is_catchable() => {
+                return Err(LoadErrorKind::BadModifier);
+            }
+            Inst::DCallShape { dst, shape, .. } => {
+                let n = shapes.get(shape.index()).map_or(0, |s| s.args.len());
+                window(dst.index() + 1, n)?;
+            }
             Inst::FloatToBits { ty, .. } | Inst::BitsToFloat { ty, .. }
                 if !matches!(ty.bits(), 32 | 64) =>
             {

@@ -12,8 +12,9 @@
 //! 0                              nil
 //! [1, 2^48)                      immediates: tag in bits 32..48
 //!                                  1 = bool (payload 0/1), 2 = char (scalar)
-//! [2^48, 2^49)                   heap reference: generation in bits 32..48,
-//!                                  slot index in bits 0..32
+//! [2^48, 2^49)                   heap reference: slot index in bits 0..32,
+//!                                  generation in bits 32..47, and bit 47 set
+//!                                  exactly for a PHP reference (kind 14)
 //! [2^49, 0xFFFE_0000_0000_0000)  float: f64 bits + 2^49 (NaN canonicalised)
 //! [0xFFFE_0000_0000_0000, 2^64)  int in [-2^48, 2^48), sign-extended 49 bits
 //! ```
@@ -34,6 +35,8 @@ const TAG_BOOL: u64 = 1 << TAG_SHIFT;
 const TAG_CHAR: u64 = 2 << TAG_SHIFT;
 /// First word of the reference range.
 pub(crate) const REF_BASE: u64 = 1 << 48;
+/// Bit 47 of a reference word: the object is a PHP reference box.
+pub(crate) const BOX_FLAG: u64 = 1 << 47;
 /// First word of the float range, and the offset added to float bits.
 const FLOAT_OFFSET: u64 = 1 << 49;
 /// First word of the inline-int range.
@@ -130,7 +133,15 @@ pub(crate) const fn is_ref(v: u64) -> bool {
     v >= REF_BASE && v < FLOAT_OFFSET
 }
 
-/// The slot index and generation of a reference word.
+/// Whether the word is a reference to a PHP reference box (live or not):
+/// one shift and compare, used on every dynamic slot access.
+#[inline(always)]
+pub(crate) const fn is_box(v: u64) -> bool {
+    v >> 47 == 0b11
+}
+
+/// The slot index and tag (generation, plus the box flag in bit 15) of a
+/// reference word.
 #[inline]
 pub(crate) const fn ref_parts(v: u64) -> (u32, u16) {
     (v as u32, (v >> 32) as u16)
@@ -219,6 +230,25 @@ mod tests {
         assert!(from_char(0x10FFFF) < REF_BASE);
         assert_eq!(decode(from_bool(true)), Raw::Bool(true));
         assert_eq!(decode(from_char(0x41)), Raw::Char(0x41));
+    }
+
+    #[test]
+    fn test_box_flag_marks_only_flagged_references() {
+        assert!(is_box(from_ref(7, 0x8000 | 3)));
+        assert!(is_box(from_ref(u32::MAX, u16::MAX)));
+        assert!(!is_box(from_ref(7, 0x7FFF)));
+        for v in [
+            NIL,
+            from_bool(true),
+            from_char(0x10FFFF),
+            from_f64(0.0),
+            from_f64(f64::NEG_INFINITY),
+            inline_int(-1).unwrap_or(0),
+            inline_int(INLINE_MAX).unwrap_or(0),
+            BOX_FLAG,
+        ] {
+            assert!(!is_box(v), "{v:#x}");
+        }
     }
 
     #[test]

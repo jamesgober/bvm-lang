@@ -213,6 +213,7 @@ fn finally_runs_once_on_every_exit_and_delivers_the_pending_completion() {
             out,
             Err(VmError::Raised {
                 kind: ErrorKind::DivByZero,
+                payload: bvm_lang::Value::Nil,
                 pc: 1,
                 ..
             })

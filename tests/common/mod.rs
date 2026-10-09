@@ -69,4 +69,5 @@ pub const F64: ValType = ValType::F64;
 pub const STR: ValType = ValType::Str;
 
 pub mod full;
+pub mod lspow;
 pub mod reference;

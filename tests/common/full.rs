@@ -11,21 +11,35 @@
 //!
 //! Subset: moves and constants (`dyn`, strings, typed ints), globals, the
 //! dynamic arithmetic and comparison instructions (numbers via the scalar
-//! reference), `dconcat`, `to_dyn` from integers and `bool`, typed `i64`
-//! loop arithmetic, branches and `switch`, `safepoint`, calls (direct,
-//! indirect, `dcall`, tail), closures and captures, `throw`/`err_code`,
-//! handlers, arrays, maps, structs, strings, and every coroutine
+//! reference, `dpow`/`dabs`/shifts included), `dconcat`, `to_dyn` from
+//! integers and `bool`, typed `i64` loop arithmetic, branches and `switch`,
+//! `safepoint`, calls (direct, indirect, tail, and dynamic calls with
+//! parameter-list binding: `dcall`, `dcall_shape` with named arguments and
+//! spreads, `dparam_ref`/`dparam_ref_named`), closures and captures,
+//! `throw`/`raise`/`err_code`/`err_payload`, handlers, arrays, maps, structs
+//! (typed and dynamic access: `dget_index`/`dset_index`, `get_prop`/
+//! `set_prop`), strings, `dup`, separation (`dsep_*`), PHP references
+//! (`new_ref`, `cell_get`/`cell_set`, `dref_*`, `dbind_*`, `dunref_*`, and
+//! transparent reference slots in every slot access), and every coroutine
 //! instruction, with iteration over coroutines. No hooks are bound.
+//!
+//! **Copy-on-write.** Containers here copy their contents eagerly, so the
+//! reference needs only LSB §5.16's two bits to decide what the VM decides:
+//! `cow` (set on both sides by `dup`, cleared by the first write, which
+//! marks the arrays and maps in the contents `aliased`) and `aliased` (which
+//! elements `dsep_*` and `dref_*` replace by a `dup`). The bits live in side
+//! sets keyed by object index.
 
 #![allow(dead_code, clippy::unwrap_used, clippy::too_many_lines)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytecode_lang::{
-    Const, ConstId, CoroState, ErrorKind, FuncId, Inst, IntTy, Module, Prim, ValType,
+    ArgKind, CallShape, Const, ConstId, CoroState, ErrorKind, FuncId, Inst, IntTy, Module,
+    ParamKind, ParamList, Prim, ValType,
 };
 
-use super::reference::{Dv, dyn_bin, dyn_cmp, int_bin, wrap};
+use super::reference::{Dv, dyn_abs, dyn_bin, dyn_cmp, int_bin, wrap};
 
 /// A value.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -60,7 +74,8 @@ struct Co {
     stack: Vec<Frame>,
     resume_dst: u16,
     key: V,
-    max_key: Option<i64>,
+    /// PHP's generator key counter (rule 10): starts at -1.
+    max_key: i64,
     result: V,
 }
 
@@ -78,7 +93,10 @@ enum O {
         kind: ErrorKind,
         func: u32,
         pc: u32,
+        payload: V,
     },
+    /// A PHP reference (LSB §5.17).
+    Ref(V),
     Iter {
         coro: usize,
         done: bool,
@@ -132,9 +150,12 @@ pub enum Shape {
     Map(Vec<(Shape, Shape)>),
     Struct(Vec<Shape>),
     Func,
-    Err(u32),
+    /// An error value: its code and payload.
+    Err(u32, Box<Shape>),
     Iter,
     Coro(u8),
+    /// A reference, by its value.
+    Ref(Box<Shape>),
     /// Nesting deeper than the comparison looks.
     Deep,
 }
@@ -152,7 +173,7 @@ pub fn float_bits(f: f64) -> u64 {
 #[derive(Clone, Debug, PartialEq)]
 pub enum End {
     Ret(Shape),
-    Raised(ErrorKind, u32, u32),
+    Raised(ErrorKind, u32, u32, Shape),
     Thrown(Shape, u32, u32),
     Trapped(ErrorKind, u32, u32),
 }
@@ -186,6 +207,36 @@ struct M<'a> {
     fuel: u64,
     depth: usize,
     strs: HashMap<u32, usize>,
+    /// LSB §5.16 `cow` and `aliased`, by object index.
+    cow: HashSet<usize>,
+    aliased: HashSet<usize>,
+}
+
+/// A slot of a container (LSB §5.17).
+#[derive(Clone, Copy, Debug)]
+enum At {
+    Arr(usize, usize),
+    Map(usize, usize),
+    Field(usize, usize),
+}
+
+impl At {
+    fn obj(self) -> usize {
+        match self {
+            At::Arr(o, _) | At::Map(o, _) | At::Field(o, _) => o,
+        }
+    }
+}
+
+/// A flattened argument item of a dynamic call: its value and name.
+type Item = (V, Option<Vec<u8>>);
+
+/// What a parameter binds to (LSB §5.15).
+#[derive(Clone, Debug)]
+enum Slot {
+    Arg(usize),
+    Default,
+    Rest(Vec<usize>),
 }
 
 fn default_of(t: ValType) -> V {
@@ -307,6 +358,12 @@ impl<'a> M<'a> {
         Ok(())
     }
 
+    /// The text of a name operand of `func`.
+    fn name(&self, func: usize, n: bytecode_lang::NameRef) -> Vec<u8> {
+        let id = self.func(func).names()[n.index()];
+        self.m.string(id).unwrap_or("").as_bytes().to_vec()
+    }
+
     fn str_bytes(&self, v: V) -> Option<&[u8]> {
         match self.obj(v) {
             Some(O::Str(b)) => Some(b),
@@ -420,24 +477,846 @@ impl<'a> M<'a> {
             V::Float(f) => Shape::Float(float_bits(f)),
             V::Obj(i) => match &self.heap[i] {
                 O::Str(b) => Shape::Str(b.clone()),
-                O::Arr(items) => {
-                    Shape::Arr(items.iter().map(|&x| self.shape(x, depth - 1)).collect())
-                }
+                // Slots are transparent (LSB §5.17): a reference slot shows
+                // its value, as the VM's inspection API reads it.
+                O::Arr(items) => Shape::Arr(
+                    items
+                        .iter()
+                        .map(|&x| self.shape(self.deref(x), depth - 1))
+                        .collect(),
+                ),
                 O::Map(m) => Shape::Map(
                     m.entries
                         .iter()
-                        .map(|&(k, v)| (self.shape(k, depth - 1), self.shape(v, depth - 1)))
+                        .map(|&(k, v)| {
+                            (
+                                self.shape(k, depth - 1),
+                                self.shape(self.deref(v), depth - 1),
+                            )
+                        })
                         .collect(),
                 ),
-                O::Struct(f) => {
-                    Shape::Struct(f.iter().map(|&x| self.shape(x, depth - 1)).collect())
-                }
+                O::Struct(f) => Shape::Struct(
+                    f.iter()
+                        .map(|&x| self.shape(self.deref(x), depth - 1))
+                        .collect(),
+                ),
                 O::Func { .. } => Shape::Func,
-                O::Err { kind, .. } => Shape::Err(kind.code()),
+                O::Err { kind, payload, .. } => {
+                    Shape::Err(kind.code(), Box::new(self.shape(*payload, depth - 1)))
+                }
                 O::Iter { .. } => Shape::Iter,
                 O::Coro(c) => Shape::Coro(c.state.code()),
+                O::Ref(x) => Shape::Ref(Box::new(self.shape(*x, depth - 1))),
             },
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Slots, copy-on-write, references (LSB §5.16, §5.17)
+    // ------------------------------------------------------------------
+
+    /// A slot word read as a value: a reference gives its value.
+    fn deref(&self, v: V) -> V {
+        match self.obj(v) {
+            Some(O::Ref(x)) => *x,
+            _ => v,
+        }
+    }
+
+    fn is_ref(&self, v: V) -> bool {
+        matches!(self.obj(v), Some(O::Ref(_)))
+    }
+
+    fn is_container(&self, v: V) -> bool {
+        matches!(self.obj(v), Some(O::Arr(_) | O::Map(_)))
+    }
+
+    /// A write to container `o`: a `cow` container marks the arrays and maps
+    /// among its contents aliased and clears the bit.
+    fn write(&mut self, o: usize) {
+        if !self.cow.remove(&o) {
+            return;
+        }
+        let inner: Vec<V> = match &self.heap[o] {
+            O::Arr(items) => items.clone(),
+            O::Map(mm) => mm.entries.iter().flat_map(|&(k, v)| [k, v]).collect(),
+            _ => Vec::new(),
+        };
+        for v in inner {
+            if let V::Obj(i) = v {
+                if self.is_container(v) {
+                    let _ = self.aliased.insert(i);
+                }
+            }
+        }
+    }
+
+    /// `dup`.
+    fn dup(&mut self, v: V) -> Result<V, ErrorKind> {
+        let V::Obj(i) = v else {
+            return if v == V::Nil {
+                Err(ErrorKind::NullReference)
+            } else {
+                Ok(v)
+            };
+        };
+        let o = self.heap[i].clone();
+        let copy = match o {
+            O::Arr(_) | O::Map(_) => o,
+            O::Struct(f) => {
+                for &x in &f {
+                    if let V::Obj(j) = x {
+                        if self.is_container(x) {
+                            let _ = self.aliased.insert(j);
+                        }
+                    }
+                }
+                O::Struct(f)
+            }
+            O::Iter { .. } | O::Coro(_) | O::Ref(_) => return Err(ErrorKind::TypeError),
+            O::Str(_) | O::Func { .. } | O::Err { .. } => return Ok(v),
+        };
+        let shares = matches!(copy, O::Arr(_) | O::Map(_));
+        let c = self.alloc(copy);
+        if shares {
+            let _ = self.cow.insert(i);
+            if let V::Obj(ci) = c {
+                let _ = self.cow.insert(ci);
+            }
+        }
+        Ok(c)
+    }
+
+    /// An array or map given by a reference: separated as by `dup`.
+    fn separated(&mut self, v: V) -> V {
+        if self.is_container(v) {
+            self.dup(v).unwrap_or(v)
+        } else {
+            v
+        }
+    }
+
+    fn is_aliased(&self, v: V) -> bool {
+        match v {
+            V::Obj(i) => self.is_container(v) && self.aliased.contains(&i),
+            _ => false,
+        }
+    }
+
+    fn slot_get(&self, s: At) -> V {
+        match (s, s.obj()) {
+            (At::Arr(_, i), o) => match &self.heap[o] {
+                O::Arr(items) => items[i],
+                _ => V::Nil,
+            },
+            (At::Map(_, p), o) => match &self.heap[o] {
+                O::Map(mm) => mm.entries[p].1,
+                _ => V::Nil,
+            },
+            (At::Field(_, f), o) => match &self.heap[o] {
+                O::Struct(fs) => fs[f],
+                _ => V::Nil,
+            },
+        }
+    }
+
+    fn slot_put(&mut self, s: At, v: V) {
+        match s {
+            At::Arr(o, i) => {
+                if let O::Arr(items) = &mut self.heap[o] {
+                    items[i] = v;
+                }
+            }
+            At::Map(o, p) => {
+                if let O::Map(mm) = &mut self.heap[o] {
+                    mm.entries[p].1 = v;
+                }
+            }
+            At::Field(o, f) => {
+                if let O::Struct(fs) = &mut self.heap[o] {
+                    fs[f] = v;
+                }
+            }
+        }
+    }
+
+    /// A value write into a slot: a reference value stores its value; a
+    /// reference slot is written through (the container is not written);
+    /// otherwise the container is written (struct fields have no `cow`).
+    fn slot_write(&mut self, s: At, v: V) {
+        let v = self.deref(v);
+        let old = self.slot_get(s);
+        if let (Some(O::Ref(_)), V::Obj(r)) = (self.obj(old), old) {
+            self.heap[r] = O::Ref(v);
+            return;
+        }
+        if !matches!(s, At::Field(..)) {
+            self.write(s.obj());
+        }
+        self.slot_put(s, v);
+    }
+
+    /// The position of a key in a map.
+    fn map_pos(&self, o: usize, k: V) -> Option<usize> {
+        match &self.heap[o] {
+            O::Map(mm) => mm.entries.iter().position(|&(x, _)| self.key_eq(x, k)),
+            _ => None,
+        }
+    }
+
+    /// Appends an entry as it is (after the container was written).
+    fn map_append(&mut self, o: usize, k: V, v: V) {
+        if let O::Map(mm) = &mut self.heap[o] {
+            mm.entries.push((k, v));
+            if let V::Int(i) = k {
+                let next = i128::from(i) + 1;
+                if mm.next.is_none_or(|n| next > n) {
+                    mm.next = Some(next);
+                }
+            }
+        }
+    }
+
+    /// `map_set` (transparent).
+    fn map_set(&mut self, o: usize, k: V, v: V) {
+        match self.map_pos(o, k) {
+            Some(p) => self.slot_write(At::Map(o, p), v),
+            None => {
+                let v = self.deref(v);
+                self.write(o);
+                self.map_append(o, k, v);
+            }
+        }
+    }
+
+    /// Stores `v` under `k` as it is (`dbind_*`).
+    fn map_set_raw(&mut self, o: usize, k: V, v: V) {
+        self.write(o);
+        match self.map_pos(o, k) {
+            Some(p) => self.slot_put(At::Map(o, p), v),
+            None => self.map_append(o, k, v),
+        }
+    }
+
+    /// A new string object (keys of names).
+    fn new_str(&mut self, b: &[u8]) -> V {
+        self.alloc(O::Str(b.to_vec()))
+    }
+
+    /// The field slot of `name` in the generated struct ("a", "b").
+    fn field_of(&self, o: usize, name: &[u8]) -> Option<At> {
+        match (&self.heap[o], name) {
+            (O::Struct(_), b"a") => Some(At::Field(o, 0)),
+            (O::Struct(_), b"b") => Some(At::Field(o, 1)),
+            _ => None,
+        }
+    }
+
+    /// The in-range index of an int key into array `o`: `Err(TypeError)`
+    /// for another key kind, `Ok(None)` out of range.
+    fn arr_index(&self, o: usize, k: V) -> Result<Option<usize>, ErrorKind> {
+        let V::Int(i) = k else {
+            return Err(ErrorKind::TypeError);
+        };
+        let len = match &self.heap[o] {
+            O::Arr(items) => items.len(),
+            _ => 0,
+        };
+        Ok(usize::try_from(i).ok().filter(|&i| i < len))
+    }
+
+    /// A slot's value separated for a write in place (`dsep_*`).
+    fn separate_slot(&mut self, s: At) -> Result<V, ErrorKind> {
+        let w = self.slot_get(s);
+        let e = self.deref(w);
+        if !self.is_aliased(e) {
+            return Ok(e);
+        }
+        let c = self.dup(e)?;
+        match w {
+            V::Obj(r) if self.is_ref(w) => self.heap[r] = O::Ref(c),
+            _ => self.slot_put(s, c),
+        }
+        Ok(c)
+    }
+
+    /// The reference a slot becomes (`dref_*`).
+    fn make_ref(&mut self, s: At) -> Result<V, ErrorKind> {
+        let w = self.slot_get(s);
+        if self.is_ref(w) {
+            return Ok(w);
+        }
+        let e = if self.is_aliased(w) { self.dup(w)? } else { w };
+        let b = self.alloc(O::Ref(e));
+        self.slot_put(s, b);
+        Ok(b)
+    }
+
+    /// `dunref_*` of one slot.
+    fn unref(&mut self, s: At) {
+        let w = self.slot_get(s);
+        let Some(O::Ref(v)) = self.obj(w) else {
+            return;
+        };
+        let v = *v;
+        let v = self.separated(v);
+        if !matches!(s, At::Field(..)) {
+            self.write(s.obj());
+        }
+        self.slot_put(s, v);
+    }
+
+    fn dget_index(&mut self, o: V, k: V) -> Result<V, ErrorKind> {
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => match self.arr_index(i, k)? {
+                Some(x) => Ok(self.deref(self.slot_get(At::Arr(i, x)))),
+                None => Err(ErrorKind::IndexOutOfBounds),
+            },
+            (V::Obj(i), Some(O::Map(_))) => match self.map_pos(i, k) {
+                Some(p) => Ok(self.deref(self.slot_get(At::Map(i, p)))),
+                None => Err(ErrorKind::KeyNotFound),
+            },
+            (_, Some(O::Str(b))) => {
+                let V::Int(x) = k else {
+                    return Err(ErrorKind::TypeError);
+                };
+                match usize::try_from(x).ok().and_then(|x| b.get(x)) {
+                    Some(&byte) => Ok(V::Int(i64::from(byte))),
+                    None => Err(ErrorKind::IndexOutOfBounds),
+                }
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dset_index(&mut self, o: V, k: V, v: V) -> Result<(), ErrorKind> {
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => match self.arr_index(i, k) {
+                Ok(Some(x)) => {
+                    self.slot_write(At::Arr(i, x), v);
+                    Ok(())
+                }
+                _ => Err(ErrorKind::IndexOutOfBounds),
+            },
+            (V::Obj(i), Some(O::Map(_))) => {
+                self.map_set(i, k, v);
+                Ok(())
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn get_prop(&self, o: V, name: &[u8]) -> Result<V, ErrorKind> {
+        let V::Obj(i) = o else {
+            return Err(ErrorKind::UndefinedProperty);
+        };
+        if let Some(s) = self.field_of(i, name) {
+            return Ok(self.deref(self.slot_get(s)));
+        }
+        if let O::Map(mm) = &self.heap[i] {
+            let found = mm
+                .entries
+                .iter()
+                .find(|&&(k, _)| self.str_bytes(k) == Some(name));
+            if let Some(&(_, v)) = found {
+                return Ok(self.deref(v));
+            }
+        }
+        Err(ErrorKind::UndefinedProperty)
+    }
+
+    fn set_prop(&mut self, o: V, name: &[u8], v: V) -> Result<(), ErrorKind> {
+        let V::Obj(i) = o else {
+            return Err(ErrorKind::UndefinedProperty);
+        };
+        if let Some(s) = self.field_of(i, name) {
+            self.slot_write(s, v);
+            return Ok(());
+        }
+        if matches!(self.heap[i], O::Map(_)) {
+            let k = self.new_str(name);
+            self.map_set(i, k, v);
+            return Ok(());
+        }
+        Err(ErrorKind::UndefinedProperty)
+    }
+
+    /// The map position of the string key `name`.
+    fn name_pos(&self, o: usize, name: &[u8]) -> Option<usize> {
+        match &self.heap[o] {
+            O::Map(mm) => mm
+                .entries
+                .iter()
+                .position(|&(k, _)| self.str_bytes(k) == Some(name)),
+            _ => None,
+        }
+    }
+
+    fn dsep_index(&mut self, o: V, k: V) -> Result<V, ErrorKind> {
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => {
+                let x = self.arr_index(i, k)?;
+                self.write(i);
+                match x {
+                    Some(x) => self.separate_slot(At::Arr(i, x)),
+                    None => Ok(V::Nil),
+                }
+            }
+            (V::Obj(i), Some(O::Map(_))) => {
+                self.write(i);
+                match self.map_pos(i, k) {
+                    Some(p) => self.separate_slot(At::Map(i, p)),
+                    None => Ok(V::Nil),
+                }
+            }
+            _ => self.dget_index(o, k),
+        }
+    }
+
+    fn dsep_prop(&mut self, o: V, name: &[u8]) -> Result<V, ErrorKind> {
+        if let V::Obj(i) = o {
+            if let Some(s) = self.field_of(i, name) {
+                return self.separate_slot(s);
+            }
+            if matches!(self.heap[i], O::Map(_)) {
+                self.write(i);
+                return match self.name_pos(i, name) {
+                    Some(p) => self.separate_slot(At::Map(i, p)),
+                    None => Ok(V::Nil),
+                };
+            }
+        }
+        self.get_prop(o, name)
+    }
+
+    /// The reference to map entry `k`, appended holding nil when absent.
+    fn map_ref_at(&mut self, o: usize, k: V) -> Result<V, ErrorKind> {
+        self.write(o);
+        match self.map_pos(o, k) {
+            Some(p) => self.make_ref(At::Map(o, p)),
+            None => {
+                let b = self.alloc(O::Ref(V::Nil));
+                self.map_append(o, k, b);
+                Ok(b)
+            }
+        }
+    }
+
+    fn dref_index(&mut self, o: V, k: V) -> Result<V, ErrorKind> {
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => {
+                let Some(x) = self.arr_index(i, k)? else {
+                    return Err(ErrorKind::IndexOutOfBounds);
+                };
+                self.write(i);
+                self.make_ref(At::Arr(i, x))
+            }
+            (V::Obj(i), Some(O::Map(_))) => self.map_ref_at(i, k),
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dref_prop(&mut self, o: V, name: &[u8]) -> Result<V, ErrorKind> {
+        let V::Obj(i) = o else {
+            return Err(ErrorKind::TypeError);
+        };
+        match &self.heap[i] {
+            O::Struct(_) => match self.field_of(i, name) {
+                Some(s) => self.make_ref(s),
+                None => Err(ErrorKind::UndefinedProperty),
+            },
+            O::Map(_) => {
+                let k = self.new_str(name);
+                match self.name_pos(i, name) {
+                    Some(p) => {
+                        self.write(i);
+                        self.make_ref(At::Map(i, p))
+                    }
+                    None => self.map_ref_at(i, k),
+                }
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dbind_index(&mut self, o: V, k: V, src: V) -> Result<(), ErrorKind> {
+        if !self.is_ref(src) {
+            return Err(ErrorKind::TypeError);
+        }
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => {
+                let Some(x) = self.arr_index(i, k)? else {
+                    return Err(ErrorKind::IndexOutOfBounds);
+                };
+                self.write(i);
+                self.slot_put(At::Arr(i, x), src);
+                Ok(())
+            }
+            (V::Obj(i), Some(O::Map(_))) => {
+                self.map_set_raw(i, k, src);
+                Ok(())
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dbind_prop(&mut self, o: V, name: &[u8], src: V) -> Result<(), ErrorKind> {
+        if !self.is_ref(src) {
+            return Err(ErrorKind::TypeError);
+        }
+        let V::Obj(i) = o else {
+            return Err(ErrorKind::TypeError);
+        };
+        match &self.heap[i] {
+            O::Struct(_) => match self.field_of(i, name) {
+                Some(s) => {
+                    self.slot_put(s, src);
+                    Ok(())
+                }
+                None => Err(ErrorKind::UndefinedProperty),
+            },
+            O::Map(_) => {
+                match self.name_pos(i, name) {
+                    Some(p) => {
+                        self.write(i);
+                        self.slot_put(At::Map(i, p), src);
+                    }
+                    None => {
+                        let k = self.new_str(name);
+                        self.write(i);
+                        self.map_append(i, k, src);
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dunref_index(&mut self, o: V, k: V) -> Result<(), ErrorKind> {
+        match (o, self.obj(o)) {
+            (V::Obj(i), Some(O::Arr(_))) => {
+                if let Ok(Some(x)) = self.arr_index(i, k) {
+                    self.unref(At::Arr(i, x));
+                }
+                Ok(())
+            }
+            (V::Obj(i), Some(O::Map(_))) => {
+                if let Some(p) = self.map_pos(i, k) {
+                    self.unref(At::Map(i, p));
+                }
+                Ok(())
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    fn dunref_prop(&mut self, o: V, name: &[u8]) -> Result<(), ErrorKind> {
+        let V::Obj(i) = o else {
+            return Err(ErrorKind::TypeError);
+        };
+        match &self.heap[i] {
+            O::Struct(_) => {
+                if let Some(s) = self.field_of(i, name) {
+                    self.unref(s);
+                }
+                Ok(())
+            }
+            O::Map(_) => {
+                if let Some(p) = self.name_pos(i, name) {
+                    self.unref(At::Map(i, p));
+                }
+                Ok(())
+            }
+            _ => Err(ErrorKind::TypeError),
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Dynamic calls (LSB §5.15), written from the spec's steps
+    // ------------------------------------------------------------------
+
+    fn params_of(&self, v: V) -> Option<ParamList> {
+        match self.obj(v) {
+            Some(O::Func { func, .. }) => self.func(*func).params().cloned(),
+            _ => None,
+        }
+    }
+
+    /// Step 2: the window as items.
+    fn flatten(&mut self, shape: &CallShape, window: &[V]) -> Result<Vec<Item>, ErrorKind> {
+        let mut items = Vec::new();
+        for (arg, &w) in shape.args.iter().zip(window) {
+            match *arg {
+                ArgKind::Positional => items.push((w, None)),
+                ArgKind::Named(s) => {
+                    let name = self.m.string(s).unwrap_or("").as_bytes().to_vec();
+                    items.push((w, Some(name)));
+                }
+                ArgKind::Spread | ArgKind::SpreadNamed => {
+                    let named = matches!(arg, ArgKind::SpreadNamed);
+                    match self.obj(w).cloned() {
+                        Some(O::Arr(xs)) if !named => {
+                            for x in xs {
+                                items.push((self.deref(x), None));
+                            }
+                        }
+                        Some(O::Map(mm)) => {
+                            for (k, v) in mm.entries {
+                                let v = self.deref(v);
+                                match (self.str_bytes(k), k) {
+                                    (Some(b), _) => items.push((v, Some(b.to_vec()))),
+                                    (None, V::Int(_)) if !named => items.push((v, None)),
+                                    _ => return Err(ErrorKind::ArgumentError),
+                                }
+                            }
+                        }
+                        _ => return Err(ErrorKind::TypeError),
+                    }
+                }
+            }
+        }
+        Ok(items)
+    }
+
+    /// Step 3: items to slots and the presence mask; `Err` is `ArgumentError`.
+    fn bind(
+        &self,
+        list: Option<&ParamList>,
+        nparams: usize,
+        items: &[Item],
+    ) -> Result<(Vec<Slot>, u64), ()> {
+        let Some(list) = list else {
+            if items.len() != nparams || items.iter().any(|(_, n)| n.is_some()) {
+                return Err(());
+            }
+            return Ok(((0..nparams).map(Slot::Arg).collect(), 0));
+        };
+        let ps = &list.params;
+        let mut slots: Vec<Slot> = ps
+            .iter()
+            .map(|p| {
+                if p.kind.is_rest() {
+                    Slot::Rest(Vec::new())
+                } else {
+                    Slot::Default
+                }
+            })
+            .collect();
+        let positional: Vec<usize> = (0..ps.len())
+            .filter(|&i| matches!(ps[i].kind, ParamKind::PositionalOnly | ParamKind::Normal))
+            .collect();
+        let pos_rest = ps
+            .iter()
+            .position(|p| matches!(p.kind, ParamKind::Rest | ParamKind::RestMap));
+        let named_rest = ps
+            .iter()
+            .position(|p| p.kind == ParamKind::RestNamed)
+            .or_else(|| ps.iter().position(|p| p.kind == ParamKind::RestMap));
+        let (mut npos, mut named_seen) = (0usize, false);
+        let mut rest_names: Vec<Vec<u8>> = Vec::new();
+        for (k, (_, name)) in items.iter().enumerate() {
+            match name {
+                None => {
+                    if named_seen {
+                        return Err(());
+                    }
+                    if let Some(&p) = positional.get(npos) {
+                        slots[p] = Slot::Arg(k);
+                    } else if let Some(r) = pos_rest {
+                        if let Slot::Rest(l) = &mut slots[r] {
+                            l.push(k);
+                        }
+                    } else if !list.ignore_extra {
+                        return Err(());
+                    }
+                    npos += 1;
+                }
+                Some(n) => {
+                    named_seen = true;
+                    let target = ps.iter().position(|p| {
+                        matches!(p.kind, ParamKind::Normal | ParamKind::NamedOnly)
+                            && p.name.and_then(|s| self.m.string(s)).map(str::as_bytes)
+                                == Some(&n[..])
+                    });
+                    match target {
+                        Some(p) => match slots[p] {
+                            Slot::Default => slots[p] = Slot::Arg(k),
+                            _ => return Err(()),
+                        },
+                        None => {
+                            let Some(r) = named_rest else { return Err(()) };
+                            if rest_names.contains(n) {
+                                return Err(());
+                            }
+                            rest_names.push(n.clone());
+                            if let Slot::Rest(l) = &mut slots[r] {
+                                l.push(k);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let mut mask = 0u64;
+        for (i, (s, p)) in slots.iter().zip(ps).enumerate() {
+            let present = match s {
+                Slot::Arg(_) => true,
+                Slot::Rest(l) => !l.is_empty(),
+                Slot::Default if p.default => false,
+                Slot::Default => return Err(()),
+            };
+            if present && i < 64 {
+                mask |= 1 << i;
+            }
+        }
+        Ok((slots, mask))
+    }
+
+    /// Step 5: the callee's arguments.
+    fn build(
+        &mut self,
+        list: Option<&ParamList>,
+        items: &[Item],
+        slots: &[Slot],
+        mask: u64,
+    ) -> Vec<V> {
+        let by_value = |m: &mut Self, w: V| {
+            if m.is_ref(w) {
+                let x = m.deref(w);
+                m.separated(x)
+            } else {
+                w
+            }
+        };
+        let by_ref = |m: &mut Self, w: V| if m.is_ref(w) { w } else { m.alloc(O::Ref(w)) };
+        let Some(list) = list else {
+            return items.iter().map(|&(w, _)| by_value(self, w)).collect();
+        };
+        let mut args = Vec::new();
+        for (p, s) in list.params.iter().zip(slots) {
+            let v = match s {
+                Slot::Arg(k) => {
+                    let w = items[*k].0;
+                    if p.by_ref {
+                        by_ref(self, w)
+                    } else {
+                        by_value(self, w)
+                    }
+                }
+                Slot::Default => V::Nil,
+                Slot::Rest(ks) => {
+                    let mut vals = Vec::new();
+                    for &k in ks {
+                        let w = items[k].0;
+                        vals.push(if p.by_ref {
+                            by_ref(self, w)
+                        } else {
+                            by_value(self, w)
+                        });
+                    }
+                    if p.kind == ParamKind::Rest {
+                        self.alloc(O::Arr(vals))
+                    } else {
+                        let mut entries = Vec::new();
+                        let mut next: i64 = 0;
+                        for (&k, v) in ks.iter().zip(vals) {
+                            match &items[k].1 {
+                                None => {
+                                    entries.push((V::Int(next), v));
+                                    next += 1;
+                                }
+                                Some(n) => {
+                                    let key = self.new_str(n);
+                                    entries.push((key, v));
+                                }
+                            }
+                        }
+                        let next = (next > 0).then_some(i128::from(next));
+                        self.alloc(O::Map(RMap { entries, next }))
+                    }
+                }
+            };
+            args.push(v);
+        }
+        if list.params.iter().any(|p| p.default) {
+            args.push(V::I(i128::from(mask)));
+        }
+        args
+    }
+
+    /// A dynamic call of `cv` with `items` (LSB §5.15).
+    fn dyn_call(
+        &mut self,
+        func: usize,
+        pc: usize,
+        dst: u16,
+        cv: V,
+        items: Vec<Item>,
+    ) -> Result<Flow, End> {
+        let target = match self.obj(cv) {
+            Some(O::Func { func, .. }) => *func,
+            // No `call`/`call_shape` hook is bound.
+            _ => return Ok(Flow::Kind(ErrorKind::TypeError)),
+        };
+        let list = self.func(target).params().cloned();
+        let Ok((slots, mask)) = self.bind(list.as_ref(), self.nparams(target), &items) else {
+            return Ok(Flow::Kind(ErrorKind::ArgumentError));
+        };
+        self.charge(func, pc)?;
+        let args = self.build(list.as_ref(), &items, &slots, mask);
+        let closure = match cv {
+            V::Obj(i) => Some(i),
+            _ => None,
+        };
+        if !self.push_call(target, args, closure, Ret::Dyn(dst)) {
+            return Ok(Flow::Kind(ErrorKind::StackOverflow));
+        }
+        Ok(Flow::Stay)
+    }
+
+    /// `dparam_ref`.
+    fn param_ref(&self, cv: V, pos: i128) -> bool {
+        let Some(list) = self.params_of(cv) else {
+            return false;
+        };
+        if pos < 0 {
+            return false;
+        }
+        let positional: Vec<_> = list
+            .params
+            .iter()
+            .filter(|p| matches!(p.kind, ParamKind::PositionalOnly | ParamKind::Normal))
+            .collect();
+        match usize::try_from(pos).ok().and_then(|i| positional.get(i)) {
+            Some(p) => p.by_ref,
+            None => list
+                .params
+                .iter()
+                .find(|p| matches!(p.kind, ParamKind::Rest | ParamKind::RestMap))
+                .is_some_and(|p| p.by_ref),
+        }
+    }
+
+    /// `dparam_ref_named`.
+    fn param_ref_named(&self, cv: V, name: &[u8]) -> bool {
+        let Some(list) = self.params_of(cv) else {
+            return false;
+        };
+        let by_name = list.params.iter().find(|p| {
+            matches!(p.kind, ParamKind::Normal | ParamKind::NamedOnly)
+                && p.name.and_then(|s| self.m.string(s)).map(str::as_bytes) == Some(name)
+        });
+        if let Some(p) = by_name {
+            return p.by_ref;
+        }
+        let rest = list
+            .params
+            .iter()
+            .find(|p| p.kind == ParamKind::RestNamed)
+            .or_else(|| list.params.iter().find(|p| p.kind == ParamKind::RestMap));
+        rest.is_some_and(|p| p.by_ref)
     }
 
     // ------------------------------------------------------------------
@@ -533,7 +1412,12 @@ impl<'a> M<'a> {
 
     fn uncaught(&self, value: V, origin: (usize, usize)) -> End {
         match self.obj(value) {
-            Some(O::Err { kind, func, pc }) => End::Raised(*kind, *func, *pc),
+            Some(O::Err {
+                kind,
+                func,
+                pc,
+                payload,
+            }) => End::Raised(*kind, *func, *pc, self.shape(*payload, SHAPE_DEPTH)),
             _ => End::Thrown(
                 self.shape(value, SHAPE_DEPTH),
                 origin.0 as u32,
@@ -599,6 +1483,7 @@ impl<'a> M<'a> {
             kind,
             func: func as u32,
             pc: pc as u32,
+            payload: V::Nil,
         });
         self.unwind(e)
     }
@@ -774,6 +1659,15 @@ impl<'a> M<'a> {
             Inst::DSub { dst, lhs, rhs, pol } => dynop!("sub", dst, lhs, rhs, pol),
             Inst::DMul { dst, lhs, rhs, pol } => dynop!("mul", dst, lhs, rhs, pol),
             Inst::DDiv { dst, lhs, rhs, pol } => dynop!("div", dst, lhs, rhs, pol),
+            Inst::DPow { dst, lhs, rhs, pol } => dynop!("pow", dst, lhs, rhs, pol),
+            Inst::DShl { dst, lhs, rhs, pol } => dynop!("shl", dst, lhs, rhs, pol),
+            Inst::DShr { dst, lhs, rhs, pol } => dynop!("shr", dst, lhs, rhs, pol),
+            Inst::DAbs { dst, src, pol } => match dyn_abs(pol, Self::dv(r!(src))) {
+                Some(Ok(v)) if Self::is_num(r!(src)) => set!(dst, Self::from_dv(v)),
+                Some(Err((k, true))) => return Err(self.trap(k, func, pc)),
+                Some(Err((k, false))) => kind!(k),
+                _ => kind!(ErrorKind::TypeError),
+            },
             Inst::DLt { dst, lhs, rhs } => {
                 let (a, b) = (r!(lhs), r!(rhs));
                 let lt = if Self::is_num(a) && Self::is_num(b) {
@@ -868,14 +1762,10 @@ impl<'a> M<'a> {
                 *self.top() = fr;
                 return Ok(Flow::Stay);
             }
-            Inst::CallIndirect { dst, callee, argc } | Inst::DCall { dst, callee, argc } => {
-                let dynamic = matches!(inst, Inst::DCall { .. });
+            Inst::CallIndirect { dst, callee, argc } => {
                 let cv = r!(callee);
                 let target = match self.obj(cv) {
                     Some(O::Func { func, .. }) => *func,
-                    // `dcall` on a non-callable is the `call` hook's, and
-                    // none is bound.
-                    _ if dynamic => kind!(ErrorKind::TypeError),
                     _ => kind!(Self::not_a(cv)),
                 };
                 if self.nparams(target) != usize::from(argc) {
@@ -888,15 +1778,18 @@ impl<'a> M<'a> {
                     V::Obj(i) => Some(i),
                     _ => None,
                 };
-                let ret = if dynamic {
-                    Ret::Dyn(dst.0)
-                } else {
-                    Ret::Write(dst.0)
-                };
-                if !self.push_call(target, args, closure, ret) {
+                if !self.push_call(target, args, closure, Ret::Write(dst.0)) {
                     kind!(ErrorKind::StackOverflow);
                 }
                 return Ok(Flow::Stay);
+            }
+            Inst::DCall { dst, callee, argc } => {
+                let first = dst.index() + 1;
+                let items: Vec<Item> = self.cur().regs[first..first + usize::from(argc)]
+                    .iter()
+                    .map(|&w| (w, None))
+                    .collect();
+                return self.dyn_call(func, pc, dst.0, r!(callee), items);
             }
             Inst::MakeClosure { dst, func: f } => {
                 let n = self.func(f.index()).captures().len();
@@ -937,54 +1830,55 @@ impl<'a> M<'a> {
             }
             Inst::ArrayGet { dst, arr, idx } => {
                 let (a, i) = (r!(arr), int!(r!(idx)));
-                let v = match self.obj(a) {
-                    Some(O::Arr(items)) => match usize::try_from(i).ok().and_then(|i| items.get(i))
-                    {
-                        Some(&v) => v,
-                        None => kind!(ErrorKind::IndexOutOfBounds),
-                    },
-                    _ => kind!(Self::not_a(a)),
+                let V::Obj(o) = a else { kind!(Self::not_a(a)) };
+                let O::Arr(items) = &self.heap[o] else {
+                    kind!(Self::not_a(a))
                 };
+                let Some(&w) = usize::try_from(i).ok().and_then(|i| items.get(i)) else {
+                    kind!(ErrorKind::IndexOutOfBounds)
+                };
+                let v = self.deref(w);
                 set!(dst, v);
             }
             Inst::ArraySet { arr, idx, src } => {
                 let (a, i, v) = (r!(arr), int!(r!(idx)), r!(src));
-                match a {
-                    V::Obj(o) if matches!(self.heap[o], O::Arr(_)) => {
-                        if let O::Arr(items) = &mut self.heap[o] {
-                            match usize::try_from(i).ok().and_then(|i| items.get_mut(i)) {
-                                Some(slot) => *slot = v,
-                                None => kind!(ErrorKind::IndexOutOfBounds),
-                            }
-                        }
-                    }
-                    other => kind!(Self::not_a(other)),
-                }
+                let V::Obj(o) = a else { kind!(Self::not_a(a)) };
+                let O::Arr(items) = &self.heap[o] else {
+                    kind!(Self::not_a(a))
+                };
+                let Some(x) = usize::try_from(i).ok().filter(|&x| x < items.len()) else {
+                    kind!(ErrorKind::IndexOutOfBounds)
+                };
+                self.slot_write(At::Arr(o, x), v);
             }
             Inst::ArrayPush { arr, src } => {
                 let (a, v) = (r!(arr), r!(src));
-                match a {
-                    V::Obj(o) if matches!(self.heap[o], O::Arr(_)) => {
-                        if let O::Arr(items) = &mut self.heap[o] {
-                            items.push(v);
-                        }
-                    }
-                    other => kind!(Self::not_a(other)),
+                let V::Obj(o) = a else { kind!(Self::not_a(a)) };
+                if !matches!(self.heap[o], O::Arr(_)) {
+                    kind!(Self::not_a(a));
+                }
+                let v = self.deref(v);
+                self.write(o);
+                if let O::Arr(items) = &mut self.heap[o] {
+                    items.push(v);
                 }
             }
             Inst::ArrayPop { dst, arr } => {
                 let a = r!(arr);
-                let popped = match a {
-                    V::Obj(o) if matches!(self.heap[o], O::Arr(_)) => match &mut self.heap[o] {
-                        O::Arr(items) => items.pop(),
-                        _ => None,
-                    },
-                    other => kind!(Self::not_a(other)),
+                let V::Obj(o) = a else { kind!(Self::not_a(a)) };
+                let O::Arr(items) = &self.heap[o] else {
+                    kind!(Self::not_a(a))
                 };
-                match popped {
-                    Some(v) => set!(dst, v),
-                    None => kind!(ErrorKind::IndexOutOfBounds),
+                if items.is_empty() {
+                    kind!(ErrorKind::IndexOutOfBounds);
                 }
+                self.write(o);
+                let popped = match &mut self.heap[o] {
+                    O::Arr(items) => items.pop().unwrap_or(V::Nil),
+                    _ => V::Nil,
+                };
+                let v = self.deref(popped);
+                set!(dst, v);
             }
             Inst::NewMap { dst, .. } => {
                 let v = self.alloc(O::Map(RMap {
@@ -995,38 +1889,24 @@ impl<'a> M<'a> {
             }
             Inst::MapSet { map, key, src } => {
                 let (mv, k, v) = (r!(map), r!(key), r!(src));
-                let Some(O::Map(mm)) = self.obj(mv) else {
-                    kind!(Self::not_a(mv));
+                let V::Obj(o) = mv else {
+                    kind!(Self::not_a(mv))
                 };
-                let pos = mm.entries.iter().position(|&(x, _)| self.key_eq(x, k));
-                let V::Obj(o) = mv else { unreachable!() };
-                if let O::Map(mm) = &mut self.heap[o] {
-                    match pos {
-                        Some(p) => mm.entries[p].1 = v,
-                        None => {
-                            mm.entries.push((k, v));
-                            if let V::Int(i) = k {
-                                let next = i128::from(i) + 1;
-                                if mm.next.is_none_or(|n| next > n) {
-                                    mm.next = Some(next);
-                                }
-                            }
-                        }
-                    }
+                if !matches!(self.heap[o], O::Map(_)) {
+                    kind!(Self::not_a(mv));
                 }
+                self.map_set(o, k, v);
             }
             Inst::MapGet { dst, map, key } | Inst::MapFind { dst, map, key } => {
                 let (mv, k) = (r!(map), r!(key));
-                let Some(O::Map(mm)) = self.obj(mv) else {
-                    kind!(Self::not_a(mv));
+                let V::Obj(o) = mv else {
+                    kind!(Self::not_a(mv))
                 };
-                let found = mm
-                    .entries
-                    .iter()
-                    .find(|&&(x, _)| self.key_eq(x, k))
-                    .map(|e| e.1);
-                let v = match (found, inst) {
-                    (Some(v), _) => v,
+                if !matches!(self.heap[o], O::Map(_)) {
+                    kind!(Self::not_a(mv));
+                }
+                let v = match (self.map_pos(o, k), inst) {
+                    (Some(p), _) => self.deref(self.slot_get(At::Map(o, p))),
                     (None, Inst::MapFind { .. }) => V::Nil,
                     (None, _) => kind!(ErrorKind::KeyNotFound),
                 };
@@ -1034,39 +1914,47 @@ impl<'a> M<'a> {
             }
             Inst::MapHas { dst, map, key } => {
                 let (mv, k) = (r!(map), r!(key));
-                let Some(O::Map(mm)) = self.obj(mv) else {
-                    kind!(Self::not_a(mv));
+                let V::Obj(o) = mv else {
+                    kind!(Self::not_a(mv))
                 };
-                let has = mm.entries.iter().any(|&(x, _)| self.key_eq(x, k));
+                if !matches!(self.heap[o], O::Map(_)) {
+                    kind!(Self::not_a(mv));
+                }
+                let has = self.map_pos(o, k).is_some();
                 set!(dst, V::Bool(has));
             }
             Inst::MapDel { map, key } => {
                 let (mv, k) = (r!(map), r!(key));
-                let Some(O::Map(mm)) = self.obj(mv) else {
-                    kind!(Self::not_a(mv));
+                let V::Obj(o) = mv else {
+                    kind!(Self::not_a(mv))
                 };
-                let pos = mm.entries.iter().position(|&(x, _)| self.key_eq(x, k));
-                let V::Obj(o) = mv else { unreachable!() };
-                if let (Some(p), O::Map(mm)) = (pos, &mut self.heap[o]) {
-                    let _ = mm.entries.remove(p);
+                if !matches!(self.heap[o], O::Map(_)) {
+                    kind!(Self::not_a(mv));
+                }
+                if let Some(p) = self.map_pos(o, k) {
+                    self.write(o);
+                    if let O::Map(mm) = &mut self.heap[o] {
+                        let _ = mm.entries.remove(p);
+                    }
                 }
             }
             Inst::MapPush { map, src } => {
                 let (mv, v) = (r!(map), r!(src));
-                let Some(O::Map(mm)) = self.obj(mv) else {
-                    kind!(Self::not_a(mv));
+                let V::Obj(o) = mv else {
+                    kind!(Self::not_a(mv))
+                };
+                let O::Map(mm) = &self.heap[o] else {
+                    kind!(Self::not_a(mv))
                 };
                 let next = mm.next.unwrap_or(0);
                 let Ok(k) = i64::try_from(next) else {
                     kind!(ErrorKind::ArithOverflow);
                 };
-                let V::Obj(o) = mv else { unreachable!() };
-                if let O::Map(mm) = &mut self.heap[o] {
-                    // The next key is never present: every integer key ever
-                    // inserted is below it.
-                    mm.entries.push((V::Int(k), v));
-                    mm.next = Some(next + 1);
-                }
+                let v = self.deref(v);
+                self.write(o);
+                // The next key is never present: every integer key ever
+                // inserted is below it.
+                self.map_append(o, V::Int(k), v);
             }
             Inst::MapLen { dst, map } => {
                 let mv = r!(map);
@@ -1094,21 +1982,152 @@ impl<'a> M<'a> {
                     },
                     _ => kind!(Self::not_a(o)),
                 };
+                let v = self.deref(v);
                 set!(dst, v);
             }
             Inst::SetField { obj, field, src } => {
                 let (o, v) = (r!(obj), r!(src));
-                match o {
-                    V::Obj(i) if matches!(self.heap[i], O::Struct(_)) => {
-                        if let O::Struct(f) = &mut self.heap[i] {
-                            match f.get_mut(field.index()) {
-                                Some(slot) => *slot = v,
-                                None => kind!(ErrorKind::TypeError),
-                            }
+                match (o, self.obj(o)) {
+                    (V::Obj(i), Some(O::Struct(f))) => {
+                        if field.index() >= f.len() {
+                            kind!(ErrorKind::TypeError);
                         }
+                        self.slot_write(At::Field(i, field.index()), v);
                     }
-                    other => kind!(Self::not_a(other)),
+                    _ => kind!(Self::not_a(o)),
                 }
+            }
+            Inst::DGetIndex { dst, obj, key } => match self.dget_index(r!(obj), r!(key)) {
+                Ok(v) => set!(dst, v),
+                Err(k) => kind!(k),
+            },
+            Inst::DSetIndex { obj, key, src } => {
+                if let Err(k) = self.dset_index(r!(obj), r!(key), r!(src)) {
+                    kind!(k);
+                }
+            }
+            Inst::DSepIndex { dst, obj, key } => match self.dsep_index(r!(obj), r!(key)) {
+                Ok(v) => set!(dst, v),
+                Err(k) => kind!(k),
+            },
+            Inst::GetProp { dst, obj, name }
+            | Inst::DSepProp { dst, obj, name }
+            | Inst::DRefProp { dst, obj, name } => {
+                let n = self.name(func, name);
+                let o = r!(obj);
+                let r = match inst {
+                    Inst::GetProp { .. } => self.get_prop(o, &n),
+                    Inst::DSepProp { .. } => self.dsep_prop(o, &n),
+                    _ => self.dref_prop(o, &n),
+                };
+                match r {
+                    Ok(v) => set!(dst, v),
+                    Err(k) => kind!(k),
+                }
+            }
+            Inst::SetProp { obj, name, src } => {
+                let n = self.name(func, name);
+                if let Err(k) = self.set_prop(r!(obj), &n, r!(src)) {
+                    kind!(k);
+                }
+            }
+            Inst::Dup { dst, src } => match self.dup(r!(src)) {
+                Ok(v) => set!(dst, v),
+                Err(k) => kind!(k),
+            },
+            Inst::NewRef { dst, src } => {
+                let v = self.deref(r!(src));
+                let b = self.alloc(O::Ref(v));
+                set!(dst, b);
+            }
+            Inst::CellGet { dst, cell } => {
+                let c = r!(cell);
+                match self.obj(c) {
+                    Some(O::Ref(v)) => {
+                        let v = *v;
+                        set!(dst, v);
+                    }
+                    _ => kind!(Self::not_a(c)),
+                }
+            }
+            Inst::CellSet { cell, src } => {
+                let (c, v) = (r!(cell), r!(src));
+                let v = self.deref(v);
+                match c {
+                    V::Obj(i) if self.is_ref(c) => self.heap[i] = O::Ref(v),
+                    _ => kind!(Self::not_a(c)),
+                }
+            }
+            Inst::DRefIndex { dst, obj, key } => match self.dref_index(r!(obj), r!(key)) {
+                Ok(v) => set!(dst, v),
+                Err(k) => kind!(k),
+            },
+            Inst::DBindIndex { obj, key, src } => {
+                if let Err(k) = self.dbind_index(r!(obj), r!(key), r!(src)) {
+                    kind!(k);
+                }
+            }
+            Inst::DBindProp { obj, name, src } => {
+                let n = self.name(func, name);
+                if let Err(k) = self.dbind_prop(r!(obj), &n, r!(src)) {
+                    kind!(k);
+                }
+            }
+            Inst::DUnrefIndex { obj, key } => {
+                if let Err(k) = self.dunref_index(r!(obj), r!(key)) {
+                    kind!(k);
+                }
+            }
+            Inst::DUnrefProp { obj, name } => {
+                let n = self.name(func, name);
+                if let Err(k) = self.dunref_prop(r!(obj), &n) {
+                    kind!(k);
+                }
+            }
+            Inst::Raise { src, kind } => {
+                let e = self.alloc(O::Err {
+                    kind,
+                    func: func as u32,
+                    pc: pc as u32,
+                    payload: r!(src),
+                });
+                return Ok(Flow::Throw(e));
+            }
+            Inst::ErrPayload { dst, src } => {
+                let v = match self.obj(r!(src)) {
+                    Some(O::Err { payload, .. }) => *payload,
+                    _ => V::Nil,
+                };
+                set!(dst, v);
+            }
+            Inst::DParamRef { dst, callee, pos } => {
+                let b = self.param_ref(r!(callee), int!(r!(pos)));
+                set!(dst, V::Bool(b));
+            }
+            Inst::DParamRefNamed { dst, callee, name } => {
+                let n = self.name(func, name);
+                let b = self.param_ref_named(r!(callee), &n);
+                set!(dst, V::Bool(b));
+            }
+            Inst::DCallShape { dst, callee, shape } => {
+                let sh = self.func(func).shapes()[shape.index()].clone();
+                let first = dst.index() + 1;
+                let window = self.cur().regs[first..first + sh.args.len()].to_vec();
+                let items = match self.flatten(&sh, &window) {
+                    Ok(items) => items,
+                    Err(k) => kind!(k),
+                };
+                return self.dyn_call(func, pc, dst.0, r!(callee), items);
+            }
+            Inst::IAnd { dst, lhs, rhs, op } => {
+                match int_bin("and", op.ty(), op.policy(), int!(r!(lhs)), int!(r!(rhs))) {
+                    Ok(v) => set!(dst, V::I(v)),
+                    Err((k, _)) => kind!(k),
+                }
+            }
+            Inst::IEq { dst, lhs, rhs, .. } => {
+                let e = int!(r!(lhs)) == int!(r!(rhs));
+                set!(dst, V::Bool(e));
             }
             Inst::StrConcat { dst, lhs, rhs } => {
                 let (a, b) = (r!(lhs), r!(rhs));
@@ -1148,11 +2167,18 @@ impl<'a> M<'a> {
                     Some(O::Func { func, .. }) => *func,
                     _ => kind!(Self::not_a(cv)),
                 };
-                if self.nparams(target) != usize::from(argc) {
-                    kind!(ErrorKind::TypeError);
-                }
+                // A `dyn` callee binds its window as `dcall` does (§5.15).
                 let first = dst.index() + 1;
-                let args = self.cur().regs[first..first + usize::from(argc)].to_vec();
+                let items: Vec<Item> = self.cur().regs[first..first + usize::from(argc)]
+                    .iter()
+                    .map(|&w| (w, None))
+                    .collect();
+                let list = self.func(target).params().cloned();
+                let Ok((slots, mask)) = self.bind(list.as_ref(), self.nparams(target), &items)
+                else {
+                    kind!(ErrorKind::ArgumentError)
+                };
+                let args = self.build(list.as_ref(), &items, &slots, mask);
                 let closure = match cv {
                     V::Obj(i) => Some(i),
                     _ => None,
@@ -1170,26 +2196,25 @@ impl<'a> M<'a> {
                 let c = level.coro;
                 let payload = r!(src);
                 let awaiting = matches!(inst, Inst::Await { .. });
+                // Rule 10 (PHP's generators): the counter starts at -1, an
+                // explicit integer key raises it, `yield` takes one more.
                 let (key, max) = match inst {
                     Inst::Await { .. } => (None, self.co(c).max_key),
                     Inst::YieldKv { key, .. } => {
                         let k = r!(key);
                         let max = self.co(c).max_key;
                         let max = match k {
-                            V::Int(i) => Some(max.map_or(i, |m| m.max(i))),
+                            V::Int(i) => max.max(i),
                             _ => max,
                         };
                         (Some(k), max)
                     }
                     _ => {
-                        let next = match self.co(c).max_key {
-                            None => 0,
-                            Some(m) => match m.checked_add(1) {
-                                Some(n) => n,
-                                None => kind!(ErrorKind::ArithOverflow),
-                            },
+                        let next = match self.co(c).max_key.checked_add(1) {
+                            Some(n) => n,
+                            None => kind!(ErrorKind::ArithOverflow),
                         };
-                        (Some(V::Int(next)), Some(next))
+                        (Some(V::Int(next)), next)
                     }
                 };
                 let level = self.chain.pop().unwrap();
@@ -1392,7 +2417,7 @@ impl<'a> M<'a> {
             stack: Vec::new(),
             resume_dst: 0,
             key: V::Nil,
-            max_key: None,
+            max_key: -1,
             result: V::Nil,
         })))
     }
@@ -1416,6 +2441,8 @@ pub fn run(
         fuel,
         depth,
         strs: HashMap::new(),
+        cow: HashSet::new(),
+        aliased: HashSet::new(),
     };
     let fr = m.new_frame(entry.index(), args, None, Ret::Entry);
     m.main.push(fr);

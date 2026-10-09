@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bvm-lang"
-version = "2.0.0-alpha.2"
+version = "2.0.0-alpha.3"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -56,7 +56,7 @@ std = ["bytecode-lang/std"]
 [dependencies]
 # LSB: the instruction set, module model, and budgeted decoder the VM executes.
 # bvm-lang 2.0 runs exactly this format; it has no instruction set of its own.
-bytecode-lang = { version = "0.2", default-features = false }
+bytecode-lang = { version = "0.3", default-features = false }
 
 
 # DEV DEPENDENCIES

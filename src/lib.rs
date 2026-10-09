@@ -70,6 +70,14 @@
 //!   stack limits bound frames. The crate is `#![forbid(unsafe_code)]`.
 //! - **Precise errors.** A failing instruction raises at its own pc without
 //!   writing its destination, so handlers see the registers as they were.
+//! - **LSB format 2** (bytecode-lang 0.3): dynamic calls bind to parameter
+//!   lists (named arguments, variadics, defaults through a presence mask,
+//!   by-reference parameters decided at run time with `dparam_ref`, host
+//!   functions as values), PHP references with transparent reference slots,
+//!   copy-on-write separation of nested writes (`dsep_*`), OPS v2 `pow`
+//!   (float powers by the family's shared `ls_pow` routine), `abs`, and
+//!   saturating shifts, and `raise` with error payloads. Format 1 is
+//!   refused.
 //! - **Every LSB instruction executes**, the coroutine group included:
 //!   stackful coroutines (a `yield` may sit any number of calls below the
 //!   coroutine's body), keys and return values, throwing in, closing with
@@ -139,6 +147,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod bind;
 mod coll;
 mod conv;
 mod coro;
@@ -154,7 +163,9 @@ mod host;
 mod int;
 mod machine;
 mod map;
+mod pow;
 mod program;
+mod refs;
 mod value;
 mod vm;
 

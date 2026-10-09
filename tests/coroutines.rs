@@ -586,6 +586,7 @@ fn yield_and_await_outside_a_coroutine_raise_cannot_suspend() {
             out,
             Err(VmError::Raised {
                 kind: ErrorKind::CannotSuspend,
+                payload: bvm_lang::Value::Nil,
                 func: FuncId(0),
                 pc: 1
             }),
@@ -684,7 +685,7 @@ fn op_coro_new_indirect_with_closures_dyn_conversion_and_errors() {
             argc: 1,
         });
     });
-    // Wrong arity.
+    // Wrong arity: an ArgumentError (E0114, format 2), as `dcall` binds.
     try_code(&mut f, &|f| {
         let w = window(f, 0);
         f.emit(Inst::CoroNewIndirect {
@@ -725,7 +726,7 @@ fn op_coro_new_indirect_with_closures_dyn_conversion_and_errors() {
     use Value::Int;
     assert_eq!(
         ints(&vm, v),
-        vec![Int(77), Int(42), Int(100), Int(100), Int(101), Int(100)]
+        vec![Int(77), Int(42), Int(100), Int(114), Int(101), Int(100)]
     );
 }
 
@@ -911,6 +912,7 @@ fn errors_escaping_a_coroutine_end_the_run_with_their_origin() {
         Vm::new(&p).run(main, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::DivByZero,
+            payload: bvm_lang::Value::Nil,
             func: gid,
             pc: 2
         })
@@ -1029,9 +1031,10 @@ fn op_yield_kv_keys_and_the_automatic_key_rule() {
 }
 
 #[test]
-fn the_automatic_key_after_only_negative_keys_follows_map_push() {
-    // Rule 10 as written: "one more than the largest integer key yielded so
-    // far" (the map_push rule, PHP 8.3 arrays): after only -5, the next is -4.
+fn the_automatic_key_after_only_negative_keys_is_zero_as_in_php_generators() {
+    // Rule 10 (format 2, PHP's generators): the counter starts at -1 and an
+    // explicit key only raises it, so after only `yield -5 => x` the next
+    // automatic key is 0 (format 1's map_push rule gave -4).
     let mut m = ModuleBuilder::new();
     let mut g = m.function("gen", &[], &[]);
     let s = g.reg(D);
@@ -1065,7 +1068,7 @@ fn the_automatic_key_after_only_negative_keys_follows_map_push() {
     f.ret(k);
     let main = m.add_function(f).unwrap();
     let p = load(m);
-    assert_eq!(Vm::new(&p).run(main, &[]), Ok(Value::Int(-4)));
+    assert_eq!(Vm::new(&p).run(main, &[]), Ok(Value::Int(0)));
 }
 
 #[test]
@@ -1098,6 +1101,7 @@ fn a_coroutine_body_returns_typed_results_through_to_dyn() {
         Vm::new(&p).run(main, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::ArithOverflow,
+            payload: bvm_lang::Value::Nil,
             func: gid,
             pc: 1
         })
@@ -1839,6 +1843,7 @@ fn op_spawn_without_a_hook_is_no_scheduler_and_with_a_function_hook_calls_it() {
         Vm::new(&p).run(main, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::NoScheduler,
+            payload: bvm_lang::Value::Nil,
             func: main,
             pc: 1
         })
@@ -1938,6 +1943,7 @@ fn coroutines_have_kind_coroutine_cast_and_cannot_be_duplicated() {
         Vm::new(&p).run(main, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: main,
             pc: 4
         })

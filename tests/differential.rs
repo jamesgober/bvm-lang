@@ -9,8 +9,8 @@ mod common;
 
 use bvm_lang::{Host, Limits, Program, Value, Vm, VmError};
 use bytecode_lang::{
-    DivZero, FloatToInt, FloatTy, FuncId, Inst, IntConv, IntOp, IntTy, ModuleBuilder, Overflow,
-    Policy, Prim, Reg, Shift, Target, ValType,
+    DivZero, FloatConv, FloatToInt, FloatTy, FuncId, Inst, IntConv, IntOp, IntTy, ModuleBuilder,
+    Overflow, Policy, Prim, Reg, Shift, Target, ValType,
 };
 use common::reference::{self, Dv, Outcome, Rv};
 use proptest::prelude::*;
@@ -47,11 +47,11 @@ fn reg(set: &'static [u16]) -> impl Strategy<Value = Reg> {
 }
 
 fn policy() -> impl Strategy<Value = Policy> {
-    (0u8..3, any::<bool>(), any::<bool>(), any::<bool>()).prop_map(|(o, d, s, f)| {
+    (0u8..3, any::<bool>(), 0u8..3, any::<bool>()).prop_map(|(o, d, s, f)| {
         Policy::new()
             .with_overflow([Overflow::Error, Overflow::Wrap, Overflow::Trap][usize::from(o)])
             .with_div_zero(if d { DivZero::Trap } else { DivZero::Error })
-            .with_shift(if s { Shift::Mask } else { Shift::Error })
+            .with_shift([Shift::Error, Shift::Mask, Shift::Saturate][usize::from(s)])
             .with_float_to_int(if f {
                 FloatToInt::Saturate
             } else {
@@ -61,7 +61,7 @@ fn policy() -> impl Strategy<Value = Policy> {
 }
 
 fn dyn_policy() -> impl Strategy<Value = Policy> {
-    (0u8..4, any::<bool>(), any::<bool>()).prop_map(|(o, d, s)| {
+    (0u8..4, any::<bool>(), 0u8..3).prop_map(|(o, d, s)| {
         Policy::new()
             .with_overflow(
                 [
@@ -72,7 +72,7 @@ fn dyn_policy() -> impl Strategy<Value = Policy> {
                 ][usize::from(o)],
             )
             .with_div_zero(if d { DivZero::Trap } else { DivZero::Error })
-            .with_shift(if s { Shift::Mask } else { Shift::Error })
+            .with_shift([Shift::Error, Shift::Mask, Shift::Saturate][usize::from(s)])
     })
 }
 
@@ -93,7 +93,7 @@ fn imm() -> impl Strategy<Value = i32> {
 
 /// One non-branching instruction over well-typed registers.
 fn straight() -> impl Strategy<Value = Inst> {
-    let int_bin = (0usize..14, 0usize..3, policy()).prop_flat_map(|(which, width, p)| {
+    let int_bin = (0usize..15, 0usize..3, policy()).prop_flat_map(|(which, width, p)| {
         let (set, ty): (&'static [u16], IntTy) = match width {
             0 => (&I64S, IntTy::I64),
             1 => (&I32S, IntTy::I32),
@@ -115,6 +115,7 @@ fn straight() -> impl Strategy<Value = Inst> {
                 10 => Inst::IShl { dst, lhs, rhs, op },
                 11 => Inst::IShr { dst, lhs, rhs, op },
                 12 => Inst::IMin { dst, lhs, rhs, op },
+                13 => Inst::IPow { dst, lhs, rhs, op },
                 _ => Inst::IMax { dst, lhs, rhs, op },
             }
         })
@@ -123,7 +124,7 @@ fn straight() -> impl Strategy<Value = Inst> {
         let op = IntOp::new(IntTy::I64).with_policy(p);
         match w {
             0 => Inst::INeg { dst, src, op },
-            1 => Inst::INot { dst, src, op },
+            1 => Inst::IBitNot { dst, src, op },
             _ => Inst::IAbs { dst, src, op },
         }
     });
@@ -199,15 +200,15 @@ fn straight() -> impl Strategy<Value = Inst> {
         (reg(&I64S), reg(&F64S), policy()).prop_map(|(dst, src, p)| Inst::F64ToInt {
             dst,
             src,
-            op: IntOp::new(IntTy::I64).with_policy(p)
+            conv: FloatConv::new(IntTy::I64).with_policy(p)
         }),
         (reg(&I32S), reg(&F64S), policy()).prop_map(|(dst, src, p)| Inst::F64ToInt {
             dst,
             src,
-            op: IntOp::new(IntTy::I32).with_policy(p)
+            conv: FloatConv::new(IntTy::I32).with_policy(p)
         }),
     ];
-    let floats = (0usize..5, reg(&F64S), reg(&F64S), reg(&F64S), reg(&BOOLS)).prop_map(
+    let floats = (0usize..6, reg(&F64S), reg(&F64S), reg(&F64S), reg(&BOOLS)).prop_map(
         |(w, dst, lhs, rhs, b)| {
             let ty = FloatTy::F64;
             match w {
@@ -215,6 +216,7 @@ fn straight() -> impl Strategy<Value = Inst> {
                 1 => Inst::FSub { dst, lhs, rhs, ty },
                 2 => Inst::FMul { dst, lhs, rhs, ty },
                 3 => Inst::FDiv { dst, lhs, rhs, ty },
+                4 => Inst::FPow { dst, lhs, rhs, ty },
                 _ => Inst::FLt {
                     dst: b,
                     lhs,
@@ -252,7 +254,7 @@ fn straight() -> impl Strategy<Value = Inst> {
             src,
             to: Prim::I64
         }),
-        (0usize..7, dyn_policy(), reg(&DYNS), reg(&DYNS), reg(&DYNS)).prop_map(
+        (0usize..11, dyn_policy(), reg(&DYNS), reg(&DYNS), reg(&DYNS)).prop_map(
             |(w, pol, dst, lhs, rhs)| match w {
                 0 => Inst::DAdd { dst, lhs, rhs, pol },
                 1 => Inst::DSub { dst, lhs, rhs, pol },
@@ -260,6 +262,10 @@ fn straight() -> impl Strategy<Value = Inst> {
                 3 => Inst::DDiv { dst, lhs, rhs, pol },
                 4 => Inst::DRem { dst, lhs, rhs, pol },
                 5 => Inst::DFloorDiv { dst, lhs, rhs, pol },
+                6 => Inst::DPow { dst, lhs, rhs, pol },
+                7 => Inst::DShl { dst, lhs, rhs, pol },
+                8 => Inst::DShr { dst, lhs, rhs, pol },
+                9 => Inst::DAbs { dst, src: lhs, pol },
                 _ => Inst::DFloorMod { dst, lhs, rhs, pol },
             }
         ),
@@ -667,8 +673,8 @@ fn reference_and_vm_agree_on_a_known_loop() {
 mod whole {
     use super::*;
     use bytecode_lang::{
-        Const, ConstId, Field, FieldIdx, FunctionBuilder, GlobalId, Kind, Label, StructDef,
-        TypeDef, TypeRef,
+        ArgKind, Const, ConstId, ErrorKind, Field, FieldIdx, FunctionBuilder, GlobalId, Kind,
+        Label, NameRef, Param, ParamKind, ParamList, ShapeId, StrId, StructDef, TypeDef, TypeRef,
     };
     use common::full::{self, End, Shape, V, float_bits};
 
@@ -678,14 +684,19 @@ mod whole {
     // r10 bool, r11/r12 and r21/r22 `finally` completion kind (i8) and
     // value (dyn) per level, r13 catch, r14..r16 call window, r17 u8,
     // r18 u32, r23 callee, r24 i64 scratch, r25 iterator, r26 bool, r27 i64
-    // constant 1.
+    // constant 1, r28..r32 a dynamic-call window (dst r28, up to four
+    // arguments), r33 i64 position, r34 bool, r35 dyn key.
     pub(super) fn regs() -> Vec<ValType> {
         use ValType::{Bool as B, Dyn as Dy, I8, I64 as I, U8, U32};
         vec![
             Dy, Dy, Dy, Dy, Dy, Dy, Dy, Dy, I, I, B, I8, Dy, Dy, Dy, Dy, Dy, U8, U32, I, I, I8, Dy,
-            Dy, I, Dy, B, I,
+            Dy, I, Dy, B, I, Dy, Dy, Dy, Dy, Dy, I, B, Dy,
         ]
     }
+    const W2: Reg = Reg(28);
+    const POS: Reg = Reg(33);
+    const FLAG: Reg = Reg(34);
+    const KEYR: Reg = Reg(35);
     const COND: Reg = Reg(10);
     const CATCH: Reg = Reg(13);
     const WIN: Reg = Reg(14);
@@ -746,6 +757,32 @@ mod whole {
         Current(u8),
         Spawn(u8, u8),
         ForGen(u8, u8, u8, u8, bool),
+        // Format 2.
+        Pow(u8, u8, u8, Policy),
+        Abs(u8, u8, Policy),
+        Shift(u8, u8, u8, Policy, bool),
+        Dup(u8, u8),
+        DGet(u8, u8, u8, i32),
+        DSet(u8, u8, i32, u8),
+        Sep(u8, u8, u8, i32),
+        GetP(u8, u8, u8),
+        SetP(u8, u8, u8),
+        SepP(u8, u8, u8),
+        NewRef(u8, u8),
+        CellGet(u8, u8),
+        CellSet(u8, u8),
+        RefIdx(u8, u8, u8, i32),
+        BindIdx(u8, u8, i32, u8),
+        UnrefIdx(u8, u8, i32),
+        RefP(u8, u8, u8),
+        BindP(u8, u8, u8),
+        UnrefP(u8, u8),
+        Raise(u8, u8),
+        Payload(u8, u8),
+        DCallN(u8, u8, u8, [u8; 4]),
+        DCallS(u8, u8, u8, [u8; 4]),
+        ParamRef(u8, u8, i32),
+        ParamRefNamed(u8, u8, u8),
         OpenIf(u8, u8),
         OpenLoop(i32, bool),
         OpenTry,
@@ -809,15 +846,61 @@ mod whole {
             89..92 => Op::OpenTry,
             92..95 => Op::OpenFinally(a % 3 == 0),
             95..97 => Op::Else,
-            _ => Op::End,
+            97..100 => Op::End,
+            100 => Op::Pow(a, b, c, p),
+            101 => Op::Abs(a, b, p),
+            102 => Op::Shift(a, b, c, p, d % 2 == 0),
+            103..105 => Op::Dup(a, b),
+            105 => Op::DGet(a, b, c, i % 4),
+            106 => Op::DSet(a, b, i % 4, c),
+            107..109 => Op::Sep(a, b, c, i % 4),
+            109 => Op::GetP(a, b, c),
+            110 => Op::SetP(a, b, c),
+            111 => Op::SepP(a, b, c),
+            112..114 => Op::NewRef(a, b),
+            114 => Op::CellGet(a, b),
+            115 => Op::CellSet(a, b),
+            116..118 => Op::RefIdx(a, b, c, i % 4),
+            118 => Op::BindIdx(a, b, i % 4, c),
+            119 => Op::UnrefIdx(a, b, i % 4),
+            120 => Op::RefP(a, b, c),
+            121 => Op::BindP(a, b, c),
+            122 => Op::UnrefP(a, b),
+            123 => Op::Raise(a, b),
+            124 => Op::Payload(a, b),
+            125..128 => Op::DCallN(a, b, c, [d, e, f, a ^ b]),
+            128..131 => Op::DCallS(a, b, c, [d, e, f, a ^ c]),
+            131 => Op::ParamRef(a, b, i % 6 - 1),
+            _ => Op::ParamRefNamed(a, b, c),
         }
     }
 
     /// An op and whether it gets its own catch-all region (most do, so a
     /// run continues past the errors random code raises).
     pub(super) fn op() -> impl Strategy<Value = (Op, bool)> {
-        (0u8..100, any::<[u8; 6]>(), -3i32..12, dyn_policy(), 0u8..10)
+        (0u8..133, any::<[u8; 6]>(), -3i32..12, dyn_policy(), 0u8..10)
             .prop_map(|(k, x, i, p, g)| (make_op(k, x, i, p), g < 6))
+    }
+
+    /// The op kinds of PHP-style container code: loads and moves, typed and
+    /// dynamic container access, `dup`, separation, references, dynamic
+    /// calls with shapes and by-reference decisions, `raise`.
+    const PHP_KINDS: &[u8] = &[
+        0, 20, 21, 27, 29, 30, 31, 32, 34, 35, 37, 39, 40, 42, 43, 45, 46, 47, 100, 101, 103, 104,
+        105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+        123, 124, 125, 126, 128, 129, 131, 132,
+    ];
+
+    /// An op of [`PHP_KINDS`], always guarded (so errors never end a run
+    /// early and the final state is compared after every op ran).
+    pub(super) fn php_op() -> impl Strategy<Value = (Op, bool)> {
+        (
+            proptest::sample::select(PHP_KINDS),
+            any::<[u8; 6]>(),
+            -1i32..5,
+            dyn_policy(),
+        )
+            .prop_map(|(k, x, i, p)| (make_op(k, x, i, p), true))
     }
 
     /// A generic destination: r0..r3, mostly r2/r3.
@@ -838,6 +921,16 @@ mod whole {
     fn func(v: u8) -> FuncId {
         FuncId(u32::from(v % 5))
     }
+    /// A container role: the array, the map, the struct, or a generic.
+    fn cont(v: u8) -> Reg {
+        Reg([4, 5, 3, 4, 5, 2][usize::from(v % 6)])
+    }
+    /// The property names the generator uses: the struct's two fields, an
+    /// absent name, and a parameter name.
+    const NAMES: [&str; 4] = ["a", "b", "x", "p"];
+    /// Dynamic-call targets without captures: three generated functions and
+    /// the two with parameter lists (f6, f7).
+    const CALLEES: [u32; 7] = [0, 1, 2, 3, 4, 6, 7];
 
     enum Open {
         If {
@@ -877,6 +970,8 @@ mod whole {
         strs: [ConstId; 3],
         closure_fn: FuncId,
         open: Vec<Open>,
+        names: [NameRef; 4],
+        shapes: Vec<(ShapeId, Vec<ArgKind>)>,
     }
 
     impl Gen<'_> {
@@ -910,6 +1005,28 @@ mod whole {
         fn args(&mut self, a: u8, b: u8) {
             self.mov(A0, src(a));
             self.mov(A1, src(b));
+        }
+        /// A key: a small int in `KEYR`, or any register.
+        fn key(&mut self, k: u8, i: i32) -> Reg {
+            if k % 3 == 0 {
+                src(k)
+            } else {
+                self.e(Inst::DLoadInt { dst: KEYR, val: i });
+                KEYR
+            }
+        }
+        /// A callee in `CALLEE`: a function value, or (sometimes) any
+        /// register, a non-callable included.
+        fn callee(&mut self, v: u8) -> Reg {
+            if v % 8 == 7 {
+                return src(v / 8);
+            }
+            let f = FuncId(CALLEES[usize::from(v % 7)]);
+            self.e(Inst::MakeClosure {
+                dst: CALLEE,
+                func: f,
+            });
+            CALLEE
         }
         fn box_dyn(&mut self, d: Reg, s: Reg, from: Prim) {
             self.e(Inst::ToDyn {
@@ -1292,6 +1409,197 @@ mod whole {
                     let _ = self.f.jmp(top);
                     self.f.bind(done);
                 }
+                Op::Pow(d, a, b, pol) => self.e(Inst::DPow {
+                    dst: dst(d),
+                    lhs: src(a),
+                    rhs: src(b),
+                    pol,
+                }),
+                Op::Abs(d, a, pol) => self.e(Inst::DAbs {
+                    dst: dst(d),
+                    src: src(a),
+                    pol,
+                }),
+                Op::Shift(d, a, b, pol, left) => {
+                    let (dst, lhs, rhs) = (dst(d), src(a), src(b));
+                    if left {
+                        self.e(Inst::DShl { dst, lhs, rhs, pol });
+                    } else {
+                        self.e(Inst::DShr { dst, lhs, rhs, pol });
+                    }
+                }
+                Op::Dup(d, s) => self.e(Inst::Dup {
+                    dst: Reg([2, 3, 4, 5, 2, 3][usize::from(d % 6)]),
+                    src: src(s),
+                }),
+                Op::DGet(d, c, k, i) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DGetIndex {
+                        dst: dst(d),
+                        obj: cont(c),
+                        key,
+                    });
+                }
+                Op::DSet(c, k, i, s) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DSetIndex {
+                        obj: cont(c),
+                        key,
+                        src: src(s),
+                    });
+                }
+                Op::Sep(d, c, k, i) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DSepIndex {
+                        dst: Reg([2, 3, 4, 5][usize::from(d % 4)]),
+                        obj: cont(c),
+                        key,
+                    });
+                }
+                Op::GetP(d, c, n) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::GetProp {
+                        dst: dst(d),
+                        obj: cont(c),
+                        name,
+                    });
+                }
+                Op::SetP(c, n, s) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::SetProp {
+                        obj: cont(c),
+                        name,
+                        src: src(s),
+                    });
+                }
+                Op::SepP(d, c, n) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::DSepProp {
+                        dst: Reg([2, 3, 4, 5][usize::from(d % 4)]),
+                        obj: cont(c),
+                        name,
+                    });
+                }
+                Op::NewRef(d, s) => self.e(Inst::NewRef {
+                    dst: dst(d),
+                    src: src(s),
+                }),
+                Op::CellGet(d, c) => self.e(Inst::CellGet {
+                    dst: dst(d),
+                    cell: src(c),
+                }),
+                Op::CellSet(c, s) => self.e(Inst::CellSet {
+                    cell: src(c),
+                    src: src(s),
+                }),
+                Op::RefIdx(d, c, k, i) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DRefIndex {
+                        dst: dst(d),
+                        obj: cont(c),
+                        key,
+                    });
+                }
+                Op::BindIdx(c, k, i, s) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DBindIndex {
+                        obj: cont(c),
+                        key,
+                        src: src(s),
+                    });
+                }
+                Op::UnrefIdx(c, k, i) => {
+                    let key = self.key(k, i);
+                    self.e(Inst::DUnrefIndex { obj: cont(c), key });
+                }
+                Op::RefP(d, c, n) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::DRefProp {
+                        dst: dst(d),
+                        obj: cont(c),
+                        name,
+                    });
+                }
+                Op::BindP(c, n, s) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::DBindProp {
+                        obj: cont(c),
+                        name,
+                        src: src(s),
+                    });
+                }
+                Op::UnrefP(c, n) => {
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::DUnrefProp { obj: cont(c), name });
+                }
+                Op::Raise(k, s) => {
+                    let kind = [
+                        ErrorKind::NoMatch,
+                        ErrorKind::TypeError,
+                        ErrorKind::ArgumentError,
+                        ErrorKind::KeyNotFound,
+                        ErrorKind::NegativeExponent,
+                    ][usize::from(k % 5)];
+                    self.e(Inst::Raise { src: src(s), kind });
+                }
+                Op::Payload(d, s) => self.e(Inst::ErrPayload {
+                    dst: dst(d),
+                    src: src(s),
+                }),
+                Op::DCallN(d, cv, n, a) => {
+                    let callee = self.callee(cv);
+                    let n = n % 5;
+                    for (i, &x) in a.iter().take(usize::from(n)).enumerate() {
+                        self.mov(Reg(29 + i as u16), src(x));
+                    }
+                    self.e(Inst::DCall {
+                        dst: W2,
+                        callee,
+                        argc: n,
+                    });
+                    self.mov(dst(d), W2);
+                }
+                Op::DCallS(d, cv, sh, a) => {
+                    let callee = self.callee(cv);
+                    let (shape, kinds) = self.shapes[usize::from(sh) % self.shapes.len()].clone();
+                    for (i, (k, &x)) in kinds.iter().zip(a.iter()).enumerate() {
+                        let r = match k {
+                            ArgKind::Spread | ArgKind::SpreadNamed if x % 4 != 3 => cont(x % 2),
+                            _ => src(x),
+                        };
+                        self.mov(Reg(29 + i as u16), r);
+                    }
+                    self.e(Inst::DCallShape {
+                        dst: W2,
+                        callee,
+                        shape,
+                    });
+                    self.mov(dst(d), W2);
+                }
+                Op::ParamRef(d, cv, pos) => {
+                    let callee = self.callee(cv);
+                    self.e(Inst::LoadInt {
+                        dst: POS,
+                        val: pos,
+                        ty: IntTy::I64,
+                    });
+                    self.e(Inst::DParamRef {
+                        dst: FLAG,
+                        callee,
+                        pos: POS,
+                    });
+                    self.box_dyn(dst(d), FLAG, Prim::Bool);
+                }
+                Op::ParamRefNamed(d, cv, n) => {
+                    let callee = self.callee(cv);
+                    let name = self.names[usize::from(n % 4)];
+                    self.e(Inst::DParamRefNamed {
+                        dst: FLAG,
+                        callee,
+                        name,
+                    });
+                    self.box_dyn(dst(d), FLAG, Prim::Bool);
+                }
                 Op::OpenIf(a, b) => {
                     if self.open.len() < 2 {
                         let (else_l, end_l) = (self.f.label(), self.f.label());
@@ -1651,9 +1959,31 @@ mod whole {
         let _g0 = m.global("g0", ValType::Dyn, true, None);
         let _g1 = m.global("g1", ValType::Dyn, true, None);
         let d = ValType::Dyn;
+        let names: Vec<StrId> = NAMES.iter().map(|n| m.string(n)).collect();
+        let (sq, sr) = (m.string("q"), m.string("r"));
         let mut builders: Vec<FunctionBuilder> = (0..6)
             .map(|i| m.function(&format!("f{i}"), &[d, d], &[d]))
             .collect();
+        // Every call shape the generator uses: positional, named (known,
+        // unknown, a positional-only parameter's name), spreads, mixes.
+        let shape_kinds: Vec<Vec<ArgKind>> = {
+            use ArgKind::{Named, Positional as P, Spread, SpreadNamed};
+            let (a, b, x, p) = (names[0], names[1], names[2], names[3]);
+            vec![
+                vec![P, P],
+                vec![P, Named(b)],
+                vec![Named(b), Named(a)],
+                vec![Spread],
+                vec![P, SpreadNamed],
+                vec![P, P, P, Named(sq)],
+                vec![Named(p)],
+                vec![Spread, Named(sr)],
+                vec![P, Named(x), Named(sr)],
+                vec![Named(sq), Named(a)],
+                vec![],
+                vec![P, P, P, P],
+            ]
+        };
         let closure_fn = builders[5].id();
         for (i, fb) in builders.iter_mut().enumerate() {
             if i == 5 {
@@ -1664,6 +1994,16 @@ mod whole {
                 let _ = fb.reg(t);
             }
             let (arr, map, sty) = (fb.type_ref(at), fb.type_ref(mt), fb.type_ref(st));
+            let fnames = [
+                fb.name_ref(names[0]),
+                fb.name_ref(names[1]),
+                fb.name_ref(names[2]),
+                fb.name_ref(names[3]),
+            ];
+            let shapes = shape_kinds
+                .iter()
+                .map(|k| (fb.call_shape(k), k.clone()))
+                .collect();
             let _ = fb.emit(Inst::LoadInt {
                 dst: ONE,
                 val: 1,
@@ -1696,6 +2036,53 @@ mod whole {
                 dst: Reg(5),
                 ty: map,
             });
+            // Seed them with nested containers: r4 = [r0, r1, [r0]],
+            // r5 = [0 => r1, 'a' => [0 => r0]], so separation, references,
+            // and copy-on-write meet shared inner containers from the start.
+            let _ = fb.emit(Inst::ArrayPush {
+                arr: Reg(4),
+                src: Reg(0),
+            });
+            let _ = fb.emit(Inst::ArrayPush {
+                arr: Reg(4),
+                src: Reg(1),
+            });
+            let _ = fb.emit(Inst::NewArray {
+                dst: Reg(2),
+                len: SCRATCH,
+                ty: arr,
+            });
+            let _ = fb.emit(Inst::ArrayPush {
+                arr: Reg(2),
+                src: Reg(0),
+            });
+            let _ = fb.emit(Inst::ArrayPush {
+                arr: Reg(4),
+                src: Reg(2),
+            });
+            let _ = fb.emit(Inst::MapPush {
+                map: Reg(5),
+                src: Reg(1),
+            });
+            let _ = fb.emit(Inst::NewMap {
+                dst: Reg(3),
+                ty: map,
+            });
+            let _ = fb.emit(Inst::MapPush {
+                map: Reg(3),
+                src: Reg(0),
+            });
+            let _ = fb.emit(Inst::DLoadConst {
+                dst: Reg(2),
+                k: strs[0],
+            });
+            let _ = fb.emit(Inst::MapSet {
+                map: Reg(5),
+                key: Reg(2),
+                src: Reg(3),
+            });
+            let _ = fb.emit(Inst::LoadNil { dst: Reg(2) });
+            let _ = fb.emit(Inst::LoadNil { dst: Reg(3) });
             if i == 0 {
                 for (r, body) in [(6u16, 1u32), (7, 2)] {
                     let _ = fb.mov(A0, Reg(0));
@@ -1716,6 +2103,8 @@ mod whole {
                 strs,
                 closure_fn,
                 open: Vec::new(),
+                names: fnames,
+                shapes,
             };
             for (op, guard) in &bodies[i] {
                 g.guarded(op, *guard);
@@ -1731,8 +2120,134 @@ mod whole {
         for fb in builders {
             let _ = m.add_function(fb).expect("generated functions build");
         }
+        add_param_list_functions(&mut m, at, &names, (sq, sr));
         Program::load(m.finish().expect("module builds"), &Host::new())
             .expect("generated programs load")
+    }
+
+    /// f6 and f7, fixed bodies with parameter lists (LSB §5.15):
+    ///
+    /// - f6 is PHP's `function f6($a, &$b = ?, ...$rest)`: when `$b` was
+    ///   passed (presence bit 1) it increments it through the reference,
+    ///   then returns `[$a, $b, $rest, mask]`.
+    /// - f7 is Python's `def f7(p, /, q, *, r=?, **kw)`, returning
+    ///   `[p, q, r, kw, mask]`.
+    fn add_param_list_functions(
+        m: &mut ModuleBuilder,
+        at: bytecode_lang::TypeId,
+        names: &[StrId],
+        (sq, sr): (StrId, StrId),
+    ) {
+        let d = ValType::Dyn;
+        let (a, b, p) = (names[0], names[1], names[3]);
+        let mut f6 = m.function("f6", &[d, d, d, ValType::I64], &[d]);
+        f6.set_params(ParamList::new(vec![
+            Param::normal(a),
+            Param::normal(b).by_ref().with_default(),
+            Param::new(ParamKind::RestMap, None),
+        ]));
+        let (k, t, c, v, one, out) = (
+            f6.reg(ValType::I64),
+            f6.reg(ValType::I64),
+            f6.reg(ValType::Bool),
+            f6.reg(d),
+            f6.reg(d),
+            f6.reg(d),
+        );
+        let arr = f6.type_ref(at);
+        let skip = f6.label();
+        let _ = f6.emit(Inst::LoadInt {
+            dst: k,
+            val: 2,
+            ty: IntTy::I64,
+        });
+        let _ = f6.emit(Inst::IAnd {
+            dst: t,
+            lhs: Reg(3),
+            rhs: k,
+            op: IntOp::new(IntTy::I64),
+        });
+        let _ = f6.emit(Inst::LoadInt {
+            dst: k,
+            val: 0,
+            ty: IntTy::I64,
+        });
+        let _ = f6.emit(Inst::IEq {
+            dst: c,
+            lhs: t,
+            rhs: k,
+            ty: IntTy::I64,
+        });
+        let _ = f6.jmp_if(c, skip);
+        let _ = f6.emit(Inst::CellGet {
+            dst: v,
+            cell: Reg(1),
+        });
+        let _ = f6.emit(Inst::DLoadInt { dst: one, val: 1 });
+        let _ = f6.emit(Inst::DAdd {
+            dst: v,
+            lhs: v,
+            rhs: one,
+            pol: Policy::new(),
+        });
+        let _ = f6.emit(Inst::CellSet {
+            cell: Reg(1),
+            src: v,
+        });
+        f6.bind(skip);
+        let _ = f6.emit(Inst::NewArray {
+            dst: out,
+            len: k,
+            ty: arr,
+        });
+        for r in 0..3 {
+            let _ = f6.emit(Inst::ArrayPush {
+                arr: out,
+                src: Reg(r),
+            });
+        }
+        let _ = f6.emit(Inst::ToDyn {
+            dst: v,
+            src: Reg(3),
+            from: Prim::I64,
+        });
+        let _ = f6.emit(Inst::ArrayPush { arr: out, src: v });
+        let _ = f6.ret(out);
+        let _ = m.add_function(f6).expect("f6 builds");
+
+        let mut f7 = m.function("f7", &[d, d, d, d, ValType::I64], &[d]);
+        f7.set_params(ParamList::new(vec![
+            Param::new(ParamKind::PositionalOnly, Some(p)),
+            Param::normal(sq),
+            Param::new(ParamKind::NamedOnly, Some(sr)).with_default(),
+            Param::new(ParamKind::RestNamed, None),
+        ]));
+        let (k, v, out) = (f7.reg(ValType::I64), f7.reg(d), f7.reg(d));
+        let arr = f7.type_ref(at);
+        let _ = f7.emit(Inst::LoadInt {
+            dst: k,
+            val: 0,
+            ty: IntTy::I64,
+        });
+        let _ = f7.emit(Inst::NewArray {
+            dst: out,
+            len: k,
+            ty: arr,
+        });
+        for r in 0..4 {
+            let _ = f7.emit(Inst::ArrayPush {
+                arr: out,
+                src: Reg(r),
+            });
+        }
+        let _ = f7.emit(Inst::ToDyn {
+            dst: v,
+            src: Reg(4),
+            from: Prim::I64,
+        });
+        let _ = f7.emit(Inst::ArrayPush { arr: out, src: v });
+        let _ = f7.ret(out);
+        let _ = m.add_function(f7).expect("f7 builds");
     }
 
     pub(super) fn vm_shape(vm: &Vm<'_>, v: Value, depth: usize) -> Shape {
@@ -1768,7 +2283,19 @@ mod whole {
                         .collect(),
                 ),
                 Kind::Function => Shape::Func,
-                Kind::Error => Shape::Err(vm.error_code(v).unwrap_or(0)),
+                Kind::Error => Shape::Err(
+                    vm.error_code(v).unwrap_or(0),
+                    Box::new(vm_shape(
+                        vm,
+                        vm.error_payload(v).unwrap_or(Value::Nil),
+                        depth - 1,
+                    )),
+                ),
+                Kind::Reference => Shape::Ref(Box::new(vm_shape(
+                    vm,
+                    vm.ref_value(v).unwrap_or(Value::Nil),
+                    depth - 1,
+                ))),
                 Kind::Iter => Shape::Iter,
                 Kind::Coroutine => {
                     Shape::Coro(vm.coro_state(v).map_or(255, bytecode_lang::CoroState::code))
@@ -1795,7 +2322,12 @@ mod whole {
         }
         let end = match out {
             Ok(v) => End::Ret(vm_shape(&vm, v, full::SHAPE_DEPTH)),
-            Err(VmError::Raised { kind, func, pc }) => End::Raised(kind, func.0, pc),
+            Err(VmError::Raised {
+                kind,
+                payload,
+                func,
+                pc,
+            }) => End::Raised(kind, func.0, pc, vm_shape(&vm, payload, full::SHAPE_DEPTH)),
             Err(VmError::Thrown { value, func, pc }) => {
                 End::Thrown(vm_shape(&vm, value, full::SHAPE_DEPTH), func.0, pc)
             }
@@ -1827,6 +2359,21 @@ fn bodies() -> impl Strategy<Value = [Vec<(whole::Op, bool)>; 6]> {
     (one(), one(), one(), one(), one(), one()).prop_map(|(a, b, c, d, e, f)| [a, b, c, d, e, f])
 }
 
+/// PHP-style container programs: a long entry function of container,
+/// reference, separation, and dynamic-call ops, short helpers.
+fn php_bodies() -> impl Strategy<Value = [Vec<(whole::Op, bool)>; 6]> {
+    let short = || proptest::collection::vec(whole::php_op(), 0..6);
+    (
+        proptest::collection::vec(whole::php_op(), 8..64),
+        short(),
+        short(),
+        short(),
+        short(),
+        short(),
+    )
+        .prop_map(|(a, b, c, d, e, f)| [a, b, c, d, e, f])
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(3_000))]
 
@@ -1837,6 +2384,26 @@ proptest! {
     /// `coro_close`, keys, iteration): the VM and the reference agree on the
     /// outcome (value, error kind and location, trap), the fuel used, and the
     /// globals, under random fuel and call-depth limits.
+    /// PHP-style programs (LSB format 2): nested containers shared by
+    /// `dup` and copy-on-write, separation, references in slots, struct
+    /// fields and map entries (`dref_*`, `dbind_*`, `dunref_*`, transparent
+    /// reads and writes), and dynamic calls binding positional, named, and
+    /// spread arguments to parameter lists with by-reference parameters,
+    /// defaults, and rest collections: the VM and the reference agree on
+    /// the final state, the outcome, and the fuel used.
+    #[test]
+    fn prop_php_programs_match_the_reference(
+        b in php_bodies(),
+        args in (-3i32..5, -3i32..5),
+        fuel in 200u64..3_000,
+    ) {
+        let p = whole::build(&b);
+        if let Some(vm) = whole::vm_run(&p, args, fuel, 40) {
+            let r = whole::ref_run(&p, args, fuel, 40);
+            prop_assert_eq!(vm, r);
+        }
+    }
+
     #[test]
     fn prop_whole_programs_match_the_reference(
         b in bodies(),

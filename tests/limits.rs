@@ -50,6 +50,7 @@ fn infinite_recursion_hits_the_depth_limit_or_fuel() {
         err,
         VmError::Raised {
             kind: ErrorKind::StackOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         }
@@ -117,6 +118,7 @@ fn the_stack_slot_limit_bounds_wide_frames() {
         err,
         VmError::Raised {
             kind: ErrorKind::StackOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         }
@@ -327,6 +329,7 @@ fn deep_hook_recursion_is_bounded_by_depth() {
             err,
             VmError::Raised {
                 kind: ErrorKind::StackOverflow,
+                payload: bvm_lang::Value::Nil,
                 ..
             }
         ),

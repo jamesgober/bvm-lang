@@ -18,14 +18,22 @@
 //!   100k `await`s in all (each a suspension, a trip through the host
 //!   scheduler, and a resume).
 //!
+//! - `call/dcall_*`: 100k dynamic calls through a function value: to a
+//!   function without a parameter list, to PHP's `f($a, $b = .., ...$r)`
+//!   with positional arguments (the allocation-free binder), and with named
+//!   arguments (`ParamList::bind`).
+//! - `php/*`: `$g[$i % 64][] = $i` for 100k `$i`, with `dsep_index` and with
+//!   the `dup`-per-write lowering format 1 required; `foreach ($a as &$v)
+//!   $v++` over 100k elements (`dref_index`, `cell_get`, `cell_set`).
+//!
 //! Run with `cargo bench`.
 
 use std::hint::black_box;
 
 use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{
-    Callee, Const, FuncId, FunctionBuilder, Hook, Inst, IntOp, IntTy, ModuleBuilder, Policy, Prim,
-    Reg, TypeDef, ValType,
+    ArgKind, Callee, Const, FuncId, FunctionBuilder, Hook, Inst, IntOp, IntTy, ModuleBuilder,
+    Param, ParamKind, ParamList, Policy, Prim, Reg, TypeDef, ValType,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -773,6 +781,201 @@ fn bench_async(c: &mut Criterion) {
     g.finish();
 }
 
+/// `function f($a, $b = <default>, ...$rest) { return $a; }` (or, with
+/// `list = false`, a plain two-parameter function) called `n` times through
+/// a function value: `f($i, $i)` with `dcall`, or `f(b: $i, a: $i)` with
+/// `dcall_shape` (`named`). Returns (callee, loop) program and the loop id.
+fn dcall_program(list: bool, named: bool) -> (Program, FuncId) {
+    let mut m = ModuleBuilder::new();
+    let (a, b) = (m.string("a"), m.string("b"));
+    let callee = if list {
+        let mut c = m.function("f", &[D, D, D, I64], &[D]);
+        c.set_params(ParamList::new(vec![
+            Param::normal(a),
+            Param::normal(b).with_default(),
+            Param::new(ParamKind::RestMap, None),
+        ]));
+        c.ret(Reg(0));
+        m.add_function(c).expect("builds")
+    } else {
+        let mut c = m.function("f", &[D, D], &[D]);
+        c.ret(Reg(0));
+        m.add_function(c).expect("builds")
+    };
+    let mut f = m.function("loop", &[I64], &[D]);
+    let (fv, out) = (f.reg(D), f.reg(D));
+    let w = f.regs(&[D, D, D]);
+    f.emit(Inst::MakeClosure {
+        dst: fv,
+        func: callee,
+    });
+    counted(&mut f, Reg(0), |f, i| {
+        f.emit(Inst::ToDyn {
+            dst: Reg(w.0 + 1),
+            src: i,
+            from: Prim::I64,
+        });
+        f.mov(Reg(w.0 + 2), Reg(w.0 + 1));
+        if named {
+            f.dcall_shape(w, fv, &[ArgKind::Named(b), ArgKind::Named(a)]);
+        } else {
+            f.emit(Inst::DCall {
+                dst: w,
+                callee: fv,
+                argc: 2,
+            });
+        }
+        f.mov(out, w);
+    });
+    f.ret(out);
+    let id = m.add_function(f).expect("builds");
+    (load(m), id)
+}
+
+/// `$g = [64 empty arrays]; for ($i = 0; $i < n; $i++) $g[$i % 64][] = $i;`
+/// lowered with `dsep_index` (`sep`), or as format 1 had to:
+/// `$t = $g[$i % 64]; $t = dup($t); $t[] = $i; $g[$i % 64] = $t;`.
+fn nested_append_program(sep: bool) -> Program {
+    let mut m = ModuleBuilder::new();
+    let map_t = m.add_type(TypeDef::Map { key: D, value: D });
+    let mut f = m.function("nested", &[I64], &[D]);
+    let mt = f.type_ref(map_t);
+    let (g, inner, k, di, n64) = (f.reg(D), f.reg(D), f.reg(D), f.reg(D), f.reg(D));
+    f.emit(Inst::NewMap { dst: g, ty: mt });
+    for _ in 0..64 {
+        f.emit(Inst::NewMap { dst: inner, ty: mt });
+        f.emit(Inst::MapPush { map: g, src: inner });
+    }
+    f.emit(Inst::DLoadInt { dst: n64, val: 64 });
+    counted(&mut f, Reg(0), |f, i| {
+        f.emit(Inst::ToDyn {
+            dst: di,
+            src: i,
+            from: Prim::I64,
+        });
+        f.emit(Inst::DFloorMod {
+            dst: k,
+            lhs: di,
+            rhs: n64,
+            pol: Policy::new(),
+        });
+        if sep {
+            f.emit(Inst::DSepIndex {
+                dst: inner,
+                obj: g,
+                key: k,
+            });
+            f.emit(Inst::MapPush {
+                map: inner,
+                src: di,
+            });
+        } else {
+            f.emit(Inst::DGetIndex {
+                dst: inner,
+                obj: g,
+                key: k,
+            });
+            f.emit(Inst::Dup {
+                dst: inner,
+                src: inner,
+            });
+            f.emit(Inst::MapPush {
+                map: inner,
+                src: di,
+            });
+            f.emit(Inst::DSetIndex {
+                obj: g,
+                key: k,
+                src: inner,
+            });
+        }
+    });
+    f.ret(g);
+    m.add_function(f).expect("builds");
+    load(m)
+}
+
+/// `$a = [0, 1, ..., n-1]; foreach ($a as $k => &$v) { $v = $v + 1; }`:
+/// per element a `dref_index`, `cell_get`, `dadd`, `cell_set`.
+fn foreach_by_ref_program() -> Program {
+    let mut m = ModuleBuilder::new();
+    let map_t = m.add_type(TypeDef::Map { key: D, value: D });
+    let mut f = m.function("by_ref", &[I64], &[D]);
+    let mt = f.type_ref(map_t);
+    let (a, di, r, v, one) = (f.reg(D), f.reg(D), f.reg(D), f.reg(D), f.reg(D));
+    f.emit(Inst::NewMap { dst: a, ty: mt });
+    f.emit(Inst::DLoadInt { dst: one, val: 1 });
+    counted(&mut f, Reg(0), |f, i| {
+        f.emit(Inst::ToDyn {
+            dst: di,
+            src: i,
+            from: Prim::I64,
+        });
+        f.emit(Inst::MapPush { map: a, src: di });
+    });
+    counted(&mut f, Reg(0), |f, i| {
+        f.emit(Inst::ToDyn {
+            dst: di,
+            src: i,
+            from: Prim::I64,
+        });
+        f.emit(Inst::DRefIndex {
+            dst: r,
+            obj: a,
+            key: di,
+        });
+        f.emit(Inst::CellGet { dst: v, cell: r });
+        f.emit(Inst::DAdd {
+            dst: v,
+            lhs: v,
+            rhs: one,
+            pol: Policy::new(),
+        });
+        f.emit(Inst::CellSet { cell: r, src: v });
+    });
+    f.ret(a);
+    m.add_function(f).expect("builds");
+    load(m)
+}
+
+fn bench_php(c: &mut Criterion) {
+    let mut g = c.benchmark_group("call");
+    g.sample_size(20);
+    let n = 100_000i64;
+    g.throughput(Throughput::Elements(100_000));
+    for (name, list, named) in [
+        ("dcall_plain_100k", false, false),
+        ("dcall_bind_100k", true, false),
+        ("dcall_shape_named_100k", true, true),
+    ] {
+        let (p, id) = dcall_program(list, named);
+        let mut vm = Vm::new(&p);
+        g.bench_function(name, |b| {
+            b.iter(|| black_box(vm.run(id, &[Value::Int(n)]).expect("runs")));
+        });
+    }
+    g.finish();
+    let mut g = c.benchmark_group("php");
+    g.sample_size(20);
+    g.throughput(Throughput::Elements(100_000));
+    for (name, sep) in [
+        ("nested_append_100k", true),
+        ("nested_append_dup_100k", false),
+    ] {
+        let p = nested_append_program(sep);
+        let mut vm = Vm::new(&p);
+        g.bench_function(name, |b| {
+            b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(n)]).expect("runs")));
+        });
+    }
+    let p = foreach_by_ref_program();
+    let mut vm = Vm::new(&p);
+    g.bench_function("foreach_by_ref_100k", |b| {
+        b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(n)]).expect("runs")));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_dispatch,
@@ -782,6 +985,7 @@ criterion_group!(
     bench_gc,
     bench_load,
     bench_coroutines,
-    bench_async
+    bench_async,
+    bench_php
 );
 criterion_main!(benches);

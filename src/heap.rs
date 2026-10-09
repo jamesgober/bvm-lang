@@ -3,11 +3,30 @@
 //!
 //! Objects live in a slot vector addressed by the 32-bit index inside a
 //! reference word (see [`dynv`](crate::dynv)); each slot carries a 16-bit
-//! generation that the reference must match. A freed slot's generation
-//! advances, so a stale reference (only producible by a module a verifier
-//! would reject, or by a host holding a value across runs) reads as `nil`
-//! instead of aliasing a newer object. A slot whose generation would wrap is
-//! retired rather than reused, so aliasing is impossible, not merely unlikely.
+//! tag that the reference must match: a 15-bit generation, and in bit 15 the
+//! flag that the object is a PHP reference box (so the word itself says so,
+//! [`dynv::is_box`]). A freed slot's generation advances, so a stale
+//! reference (only producible by a module a verifier would reject, or by a
+//! host holding a value across runs) reads as `nil` instead of aliasing a
+//! newer object. A slot whose generation would wrap is retired rather than
+//! reused, so aliasing is impossible, not merely unlikely.
+//!
+//! **Sharing** (LSB §5.16). Arrays and maps keep their contents behind an
+//! `Arc`, shared copy-on-write between a container and its `dup`s (and the
+//! loads of an aggregate constant). Each carries the two bits of LSB §5.16's
+//! conforming implementation for tracing collectors: `cow`, "my contents may
+//! be shared" (`dup` sets it on both containers, a constant load on the
+//! copy; the first write clears it on the written container), and `aliased`,
+//! "another container's contents may hold me" (set on every array and map in
+//! contents that a write to a `cow` container, or an eager `dup` of a struct
+//! or cell, copies; see [`Heap::mark_aliased`]). `dsep_*` replaces exactly
+//! the aliased elements. The decisions follow the bits, never the `Arc`'s
+//! count (which only says whether the physical copy is still needed), so
+//! which writes copy and which elements separate is a deterministic function
+//! of the program, independent of when collections run. Both questions are
+//! asked only through `contents_shared` (on [`ArrayObj`] and [`MapObj`]) and
+//! [`Heap::is_aliased`]: the seam a reference-counting memory profile (D22)
+//! replaces with "the count is above one".
 //!
 //! Collection is a stop-the-world mark and sweep with an explicit work list
 //! (no recursion, whatever the object graph's depth) over the exact roots the
@@ -53,6 +72,27 @@ pub(crate) enum Object {
     Error(ErrorObj),
     /// A coroutine (LSB §5.13).
     Coro(Box<CoroObj>),
+    /// A PHP reference (LSB §5.17, kind `reference`): a box holding one
+    /// `dyn` value, never itself a box. Its word carries
+    /// [`dynv::BOX_FLAG`].
+    Ref(u64),
+}
+
+impl ArrayObj {
+    /// LSB §5.16 `cow` for this array: the one definition every
+    /// copy-on-write decision reads.
+    #[inline]
+    pub(crate) fn contents_shared(&self) -> bool {
+        self.cow
+    }
+}
+
+impl MapObj {
+    /// As [`ArrayObj::contents_shared`].
+    #[inline]
+    pub(crate) fn contents_shared(&self) -> bool {
+        self.cow
+    }
 }
 
 /// An array. The element storage is shared copy-on-write between an array
@@ -64,6 +104,10 @@ pub(crate) struct ArrayObj {
     /// shared by every load of it: mutation raises `TypeError` (LSB §3.2
     /// requires a `dup` first).
     pub(crate) frozen: bool,
+    /// LSB §5.16 `cow`: the elements may be shared with another container.
+    pub(crate) cow: bool,
+    /// LSB §5.16 `aliased`: another container's contents may hold this one.
+    pub(crate) aliased: bool,
     pub(crate) items: Arc<Vec<u64>>,
 }
 
@@ -73,6 +117,10 @@ pub(crate) struct MapObj {
     pub(crate) key: ValType,
     pub(crate) value: ValType,
     pub(crate) frozen: bool,
+    /// As [`ArrayObj::cow`].
+    pub(crate) cow: bool,
+    /// As [`ArrayObj::aliased`].
+    pub(crate) aliased: bool,
     pub(crate) store: Arc<MapStore>,
 }
 
@@ -159,8 +207,9 @@ pub(crate) struct CoroObj {
     pub(crate) payload: u64,
     /// The key of the value most recently yielded (nil before the first).
     pub(crate) key: u64,
-    /// The largest integer key yielded so far (rule 10).
-    pub(crate) max_key: Option<i64>,
+    /// PHP's generator key counter (rule 10, format 2): the largest integer
+    /// key yielded so far, starting at -1 and never below it.
+    pub(crate) max_key: i64,
     /// The return value (`returned`) or the error that escaped (`failed`).
     pub(crate) result: u64,
     /// The close signal while `closing`.
@@ -177,12 +226,14 @@ impl CoroObj {
 /// Bytes charged per suspended frame record.
 pub(crate) const FRAME_BYTES: usize = core::mem::size_of::<Frame>();
 
-/// A runtime error value (kind `error`): its code and where it was raised.
+/// A runtime error value (kind `error`): its code, where it was raised, and
+/// its payload (`raise`'s operand; nil for an error an instruction raised).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ErrorObj {
     pub(crate) kind: ErrorKind,
     pub(crate) func: u32,
     pub(crate) pc: u32,
+    pub(crate) payload: u64,
 }
 
 impl Object {
@@ -199,6 +250,7 @@ impl Object {
             Object::Iter(_) => Kind::Iter,
             Object::Error(_) => Kind::Error,
             Object::Coro(_) => Kind::Coroutine,
+            Object::Ref(_) => Kind::Reference,
         }
     }
 
@@ -208,7 +260,7 @@ impl Object {
         SLOT_BYTES
             + match self {
                 Object::Str(b) => b.len(),
-                Object::Int(_) | Object::Cell(_) | Object::Error(_) => 0,
+                Object::Int(_) | Object::Cell(_) | Object::Error(_) | Object::Ref(_) => 0,
                 Object::Array(a) => a.items.capacity() * 8 / Arc::strong_count(&a.items).max(1),
                 Object::Map(m) => m.store.bytes() / Arc::strong_count(&m.store).max(1),
                 Object::Struct(s) => s.fields.len() * 8,
@@ -227,9 +279,16 @@ const MIN_GC_BYTES: usize = 256 * 1024;
 
 #[derive(Debug)]
 struct Slot {
-    generation: u16,
+    /// The generation (bits 0..15) and, while the slot holds a reference
+    /// box, [`TAG_BOX`]: the 16 bits a reference word must carry.
+    tag: u16,
     obj: Option<Object>,
 }
+
+/// The box flag within a slot tag (bit 47 of the word).
+const TAG_BOX: u16 = (dynv::BOX_FLAG >> 32) as u16;
+/// The generation within a slot tag.
+const TAG_GEN: u16 = 0x7FFF;
 
 /// Collection counters.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -289,9 +348,9 @@ impl Heap {
         if !dynv::is_ref(v) {
             return None;
         }
-        let (index, generation) = dynv::ref_parts(v);
+        let (index, tag) = dynv::ref_parts(v);
         let slot = self.slots.get(index as usize)?;
-        if slot.generation != generation {
+        if slot.tag != tag {
             return None;
         }
         slot.obj.as_ref()
@@ -303,12 +362,73 @@ impl Heap {
         if !dynv::is_ref(v) {
             return None;
         }
-        let (index, generation) = dynv::ref_parts(v);
+        let (index, tag) = dynv::ref_parts(v);
         let slot = self.slots.get_mut(index as usize)?;
-        if slot.generation != generation {
+        if slot.tag != tag {
             return None;
         }
         slot.obj.as_mut()
+    }
+
+    /// The value a slot word reads as (LSB §5.17: reference slots are
+    /// transparent): a box's value, anything else itself. A stale box reads
+    /// as nil.
+    #[inline(always)]
+    pub(crate) fn deref(&self, v: u64) -> u64 {
+        if dynv::is_box(v) {
+            self.box_value(v).unwrap_or(dynv::NIL)
+        } else {
+            v
+        }
+    }
+
+    /// The value held by the box `v` names.
+    #[inline]
+    pub(crate) fn box_value(&self, v: u64) -> Option<u64> {
+        match self.get(v)? {
+            Object::Ref(x) => Some(*x),
+            _ => None,
+        }
+    }
+
+    /// Writes into the box `v` names (the caller has dereferenced `value`,
+    /// so a box never holds a box). Returns whether `v` is a live box.
+    #[inline]
+    pub(crate) fn set_box(&mut self, v: u64, value: u64) -> bool {
+        match self.get_mut(v) {
+            Some(Object::Ref(x)) => {
+                *x = value;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether `v` is an array or map that another container's contents
+    /// may hold (LSB §5.16 `aliased`; a frozen constant part always is), so
+    /// a nested write must separate it.
+    #[inline]
+    pub(crate) fn is_aliased(&self, v: u64) -> bool {
+        match self.get(v) {
+            Some(Object::Array(a)) => a.aliased || a.frozen,
+            Some(Object::Map(m)) => m.aliased || m.frozen,
+            _ => false,
+        }
+    }
+
+    /// Marks the arrays and maps among `words` as aliased: they were in
+    /// contents that have just been copied, so two containers now hold them.
+    pub(crate) fn mark_aliased(&mut self, words: impl IntoIterator<Item = u64>) {
+        for w in words {
+            if !dynv::is_ref(w) || dynv::is_box(w) {
+                continue;
+            }
+            match self.get_mut(w) {
+                Some(Object::Array(a)) => a.aliased = true,
+                Some(Object::Map(m)) => m.aliased = true,
+                _ => {}
+            }
+        }
     }
 
     /// The bytes of a string object.
@@ -368,26 +488,37 @@ impl Heap {
     pub(crate) fn alloc(&mut self, obj: Object) -> Result<u64, Fault> {
         self.charge(obj.bytes())?;
         let coro = matches!(obj, Object::Coro(_));
+        let flag = if matches!(obj, Object::Ref(_)) {
+            TAG_BOX
+        } else {
+            0
+        };
         if let Some(index) = self.free.pop() {
             if let Some(slot) = self.slots.get_mut(index as usize) {
                 slot.obj = Some(obj);
+                slot.tag = (slot.tag & TAG_GEN) | flag;
                 if coro {
                     self.coros.push(index);
                 }
-                return Ok(dynv::from_ref(index, slot.generation));
+                return Ok(dynv::from_ref(index, slot.tag));
             }
         }
         let Ok(index) = u32::try_from(self.slots.len()) else {
             return Err(Fault::Trap(ErrorKind::OutOfMemory));
         };
         self.slots.push(Slot {
-            generation: 0,
+            tag: flag,
             obj: Some(obj),
         });
         if coro {
             self.coros.push(index);
         }
-        Ok(dynv::from_ref(index, 0))
+        Ok(dynv::from_ref(index, flag))
+    }
+
+    /// A new PHP reference box holding `value` (already dereferenced).
+    pub(crate) fn alloc_box(&mut self, value: u64) -> Result<u64, Fault> {
+        self.alloc(Object::Ref(value))
     }
 
     /// The coroutine a word names.
@@ -444,13 +575,13 @@ impl Heap {
                 continue;
             }
             if let Some(Slot {
-                generation,
+                tag,
                 obj: Some(Object::Coro(c)),
             }) = self.slots.get(i as usize)
             {
                 let suspended = matches!(c.state, CoroState::Yielded | CoroState::Awaiting);
                 if suspended && !c.finalized {
-                    found.push((c.seq, dynv::from_ref(i, *generation)));
+                    found.push((c.seq, dynv::from_ref(i, *tag)));
                 }
             }
         }
@@ -484,7 +615,9 @@ impl Heap {
             let mut children: [u64; 2] = [0; 2];
             let mut extra: Option<(usize, usize)> = None;
             match self.slots.get(index as usize).and_then(|s| s.obj.as_ref()) {
-                None | Some(Object::Str(_) | Object::Int(_) | Object::Error(_)) => {}
+                None | Some(Object::Str(_) | Object::Int(_)) => {}
+                Some(Object::Error(e)) => children[0] = e.payload,
+                Some(Object::Ref(v)) => children[0] = *v,
                 Some(Object::Cell(c)) => {
                     if c.elem.is_reference() {
                         children[0] = c.value;
@@ -525,11 +658,13 @@ impl Heap {
             }
             slot.obj = None;
             freed += 1;
-            if slot.generation == u16::MAX {
+            let generation = slot.tag & TAG_GEN;
+            if generation == TAG_GEN {
                 // Retired: never reused, so no stale reference can alias.
+                slot.tag = generation;
                 continue;
             }
-            slot.generation += 1;
+            slot.tag = generation + 1;
             self.free.push(i as u32);
         }
         self.used = used;
@@ -553,12 +688,12 @@ impl Heap {
         if !dynv::is_ref(v) {
             return;
         }
-        let (index, generation) = dynv::ref_parts(v);
+        let (index, tag) = dynv::ref_parts(v);
         let i = index as usize;
         let live = self
             .slots
             .get(i)
-            .is_some_and(|s| s.generation == generation && s.obj.is_some());
+            .is_some_and(|s| s.tag == tag && s.obj.is_some());
         if !live {
             return;
         }
@@ -635,5 +770,63 @@ impl Heap {
         if let Some(slot) = self.slots.get_mut(i) {
             slot.obj = Some(obj);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::host::Host;
+
+    fn program() -> Program {
+        let module = bytecode_lang::ModuleBuilder::new()
+            .finish()
+            .unwrap_or_default();
+        match Program::load(module, &Host::new()) {
+            Ok(p) => p,
+            Err(e) => panic!("{e}"),
+        }
+    }
+
+    #[test]
+    fn test_a_slot_is_retired_after_32767_reuses_and_stale_words_never_alias() {
+        let p = program();
+        let mut heap = Heap::new(usize::MAX);
+        let mut dropped = Vec::new();
+        let first = heap.alloc(Object::Int(0)).unwrap_or(0);
+        let mut last = first;
+        // Free and reallocate the same slot until its generation is spent.
+        for i in 1..=i64::from(TAG_GEN) {
+            heap.collect(core::iter::empty(), &p, &mut dropped);
+            last = heap.alloc(Object::Int(i)).unwrap_or(0);
+            assert_eq!(dynv::ref_parts(last).0, 0, "reuse {i}");
+        }
+        assert_eq!(dynv::ref_parts(last).1, TAG_GEN);
+        // Every earlier word is stale: it reads as nothing.
+        assert!(heap.get(first).is_none());
+        // The next free of slot 0 retires it: a new object takes slot 1.
+        heap.collect(core::iter::empty(), &p, &mut dropped);
+        let next = heap.alloc(Object::Int(-1)).unwrap_or(0);
+        assert_eq!(dynv::ref_parts(next).0, 1);
+        assert!(heap.get(last).is_none());
+    }
+
+    #[test]
+    fn test_a_box_word_carries_the_flag_and_a_plain_word_for_its_slot_is_stale() {
+        let p = program();
+        let mut heap = Heap::new(usize::MAX);
+        let mut dropped = Vec::new();
+        let plain = heap.alloc(Object::Int(7)).unwrap_or(0);
+        assert!(!dynv::is_box(plain));
+        heap.collect(core::iter::empty(), &p, &mut dropped);
+        let b = heap.alloc_box(dynv::from_bool(true)).unwrap_or(0);
+        assert!(dynv::is_box(b));
+        assert_eq!(dynv::ref_parts(b).0, dynv::ref_parts(plain).0);
+        assert_eq!(heap.box_value(b), Some(dynv::from_bool(true)));
+        // The old word names the same slot without the flag: stale.
+        assert!(heap.get(plain).is_none());
+        assert_eq!(heap.deref(b), dynv::from_bool(true));
+        assert_eq!(heap.deref(plain), plain);
+        assert_eq!(heap.kind(b), bytecode_lang::Kind::Reference);
     }
 }

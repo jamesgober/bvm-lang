@@ -421,6 +421,7 @@ fn push_past(max_key: Const, key: ValType) -> Result<Value, VmError> {
 fn map_push_raises_when_the_next_key_overflows() {
     let overflow = Err(VmError::Raised {
         kind: ErrorKind::ArithOverflow,
+        payload: bvm_lang::Value::Nil,
         func: FuncId(0),
         pc: 3,
     });
@@ -453,6 +454,7 @@ fn map_push_on_a_non_integer_keyed_map_is_a_type_error() {
         Vm::new(&p).run(FuncId(0), &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 1
         })

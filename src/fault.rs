@@ -9,6 +9,9 @@ pub(crate) enum Fault {
     /// A catchable runtime error with its OPS/LSB kind. The VM allocates the
     /// `error` value when it starts unwinding.
     Raise(ErrorKind),
+    /// A catchable runtime error with a payload: `raise` (LSB §5.9), whose
+    /// `src` `err_payload` reads back.
+    RaiseWith(ErrorKind, u64),
     /// A catchable error carrying an arbitrary `dyn` value (`throw`,
     /// `resume_throw`, `coro_close`, or a host function's thrown value).
     Throw(u64),

@@ -21,6 +21,10 @@ use core::fmt;
 
 use bytecode_lang::{ErrorKind, Kind};
 
+use crate::coll;
+use crate::conv;
+use crate::fault::Fault;
+use crate::hash::Seed;
 use crate::heap::{Heap, Object};
 use crate::value::{Obj, Value};
 
@@ -222,6 +226,7 @@ impl fmt::Debug for Host {
 /// ```
 pub struct HostCtx<'a> {
     pub(crate) heap: &'a mut Heap,
+    pub(crate) seed: Seed,
 }
 
 impl HostCtx<'_> {
@@ -295,6 +300,204 @@ impl HostCtx<'_> {
             },
             _ => None,
         }
+    }
+
+    /// The value a PHP reference holds (LSB §5.17), if `v` is one. A host
+    /// function receives a reference for every `by_ref` parameter of its
+    /// import's parameter list.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Value};
+    ///
+    /// let mut host = Host::new();
+    /// // PHP: function inc(&$x) { $x = $x + 1; }
+    /// host.register("env", "inc", |ctx, args| {
+    ///     let r = args[0];
+    ///     let n = ctx.ref_get(r).and_then(|v| v.as_int()).unwrap_or(0);
+    ///     ctx.ref_set(r, Value::Int(n + 1))?;
+    ///     Ok(Value::Nil)
+    /// });
+    /// ```
+    #[must_use]
+    pub fn ref_get(&self, v: Value) -> Option<Value> {
+        match v {
+            Value::Obj(Obj(bits)) => self
+                .heap
+                .box_value(bits)
+                .map(|w| conv::dyn_value(self.heap, w)),
+            _ => None,
+        }
+    }
+
+    /// Stores `value` into the PHP reference `r` (a reference given as the
+    /// value stores its value: a reference never holds a reference).
+    ///
+    /// # Errors
+    ///
+    /// [`HostError::Raise`] with `TypeError` when `r` is not a reference,
+    /// `ArithOverflow` for a `UInt` above `i64::MAX`, `OutOfMemory` when the
+    /// value needs memory the budget does not have.
+    ///
+    /// # Examples
+    ///
+    /// See [`ref_get`](HostCtx::ref_get).
+    pub fn ref_set(&mut self, r: Value, value: Value) -> Result<(), HostError> {
+        let Value::Obj(Obj(bits)) = r else {
+            return Err(HostError::Raise(ErrorKind::TypeError));
+        };
+        if self.heap.box_value(bits).is_none() {
+            return Err(HostError::Raise(ErrorKind::TypeError));
+        }
+        let w = conv::dyn_of(self.heap, value).map_err(fault_error)?;
+        let w = self.heap.deref(w);
+        let _ = self.heap.set_box(bits, w);
+        Ok(())
+    }
+
+    /// The elements of an array value, in order (a reference slot as its
+    /// value).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Value};
+    ///
+    /// let mut host = Host::new();
+    /// // A rest parameter arrives as an array: count its elements.
+    /// host.register("env", "count", |ctx, args| {
+    ///     let n = args.first().and_then(|v| ctx.elements(*v)).map_or(0, |e| e.len());
+    ///     Ok(Value::Int(n as i64))
+    /// });
+    /// ```
+    #[must_use]
+    pub fn elements(&self, v: Value) -> Option<Vec<Value>> {
+        let Value::Obj(Obj(bits)) = v else {
+            return None;
+        };
+        match self.heap.get(bits)? {
+            Object::Array(a) => Some(
+                a.items
+                    .iter()
+                    .map(|&w| {
+                        let w = if a.elem == bytecode_lang::ValType::Dyn {
+                            self.heap.deref(w)
+                        } else {
+                            w
+                        };
+                        conv::value_of(self.heap, a.elem, w)
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The entries of a map value, in insertion order (a reference slot as
+    /// its value).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Value};
+    ///
+    /// let mut host = Host::new();
+    /// // A named rest parameter (`**kwargs`) arrives as a map.
+    /// host.register("env", "nkw", |ctx, args| {
+    ///     let n = args.first().and_then(|v| ctx.entries(*v)).map_or(0, |e| e.len());
+    ///     Ok(Value::Int(n as i64))
+    /// });
+    /// ```
+    #[must_use]
+    pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>> {
+        let Value::Obj(Obj(bits)) = v else {
+            return None;
+        };
+        match self.heap.get(bits)? {
+            Object::Map(m) => Some(
+                m.store
+                    .entries()
+                    .iter()
+                    .filter(|e| e.live)
+                    .map(|e| {
+                        let w = if m.value == bytecode_lang::ValType::Dyn {
+                            self.heap.deref(e.value)
+                        } else {
+                            e.value
+                        };
+                        (
+                            conv::value_of(self.heap, m.key, e.key),
+                            conv::value_of(self.heap, m.value, w),
+                        )
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// A new `dyn` array of `items` (references are stored as their values).
+    ///
+    /// # Errors
+    ///
+    /// As [`ref_set`](HostCtx::ref_set), without the `TypeError`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Value};
+    ///
+    /// let mut host = Host::new();
+    /// host.register("env", "pair", |ctx, args| ctx.new_array(&[args[0], args[1]]));
+    /// ```
+    pub fn new_array(&mut self, items: &[Value]) -> Result<Value, HostError> {
+        let mut words = Vec::with_capacity(items.len());
+        for &v in items {
+            let w = conv::dyn_of(self.heap, v).map_err(fault_error)?;
+            words.push(self.heap.deref(w));
+        }
+        coll::new_dyn_array(self.heap, words)
+            .map(|w| Value::Obj(Obj(w)))
+            .map_err(fault_error)
+    }
+
+    /// A new `dyn` map of `entries`, in order (a repeated key keeps its first
+    /// position and its last value, as `map_set` does).
+    ///
+    /// # Errors
+    ///
+    /// As [`new_array`](HostCtx::new_array).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Value};
+    ///
+    /// let mut host = Host::new();
+    /// host.register("env", "one", |ctx, _| ctx.new_map(&[(Value::Int(1), Value::Bool(true))]));
+    /// ```
+    pub fn new_map(&mut self, entries: &[(Value, Value)]) -> Result<Value, HostError> {
+        let map = coll::new_map(
+            self.heap,
+            bytecode_lang::ValType::Dyn,
+            bytecode_lang::ValType::Dyn,
+        )
+        .map_err(fault_error)?;
+        for &(k, v) in entries {
+            let k = conv::dyn_of(self.heap, k).map_err(fault_error)?;
+            let v = conv::dyn_of(self.heap, v).map_err(fault_error)?;
+            coll::map_set(self.heap, self.seed, map, k, v).map_err(fault_error)?;
+        }
+        Ok(Value::Obj(Obj(map)))
+    }
+}
+
+/// A fault inside a host-context helper as the host's error.
+fn fault_error(f: Fault) -> HostError {
+    match f {
+        Fault::Raise(k) | Fault::RaiseWith(k, _) | Fault::Trap(k) => HostError::Raise(k),
+        Fault::Throw(_) => HostError::Raise(ErrorKind::TypeError),
     }
 }
 

@@ -15,6 +15,7 @@ use crate::fault::Fault;
 use crate::fmath;
 use crate::heap::{Heap, Object};
 use crate::int::{self, Bin};
+use crate::pow;
 
 /// The binary dynamic arithmetic instructions.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -31,6 +32,8 @@ pub(crate) enum DOp {
     Xor,
     Shl,
     Shr,
+    /// `dpow` (OPS v2).
+    Pow,
 }
 
 impl DOp {
@@ -48,6 +51,7 @@ impl DOp {
             DOp::Xor => Bin::Xor,
             DOp::Shl => Bin::Shl,
             DOp::Shr => Bin::Shr,
+            DOp::Pow => Bin::Pow,
         }
     }
 }
@@ -111,6 +115,14 @@ pub(crate) fn int_arith(op: DOp, pol: Policy, a: i64, b: i64) -> Result<Out, Fau
                     return Ok(Out::F(9_223_372_036_854_775_808.0));
                 }
             }
+            // The exact power when it fits, else its nearest f64; a
+            // negative exponent takes the float rule (PHP's `2 ** -1`).
+            DOp::Pow => {
+                return Ok(match pow::pow_promote(a, b) {
+                    Ok(i) => Out::I(i),
+                    Err(f) => Out::F(f),
+                });
+            }
             // rem, floor_mod, bitwise ops, and shifts never overflow.
             _ => {}
         }
@@ -130,6 +142,7 @@ pub(crate) fn float_arith(op: DOp, a: f64, b: f64) -> Option<f64> {
         DOp::Rem => a % b,
         DOp::FloorDiv => fmath::py_divmod(a, b).0,
         DOp::FloorMod => fmath::py_divmod(a, b).1,
+        DOp::Pow => pow::ls_pow(a, b),
         _ => return None,
     })
 }
@@ -212,7 +225,25 @@ pub(crate) fn neg(heap: &mut Heap, pol: Policy, a: u64) -> Result<Option<u64>, F
     out.encode(heap).map(Some)
 }
 
-/// `dnot` (bitwise complement) on the fast path.
+/// `dabs` on the fast path: `abs` at `i64` (`abs(MIN)` per `overflow`,
+/// `promote` giving `2^63`), `fabs` on a float.
+pub(crate) fn abs(heap: &mut Heap, pol: Policy, a: u64) -> Result<Option<u64>, Fault> {
+    let out = match conv::dyn_num(heap, a) {
+        Some(Num::I(i)) => match i.checked_abs() {
+            Some(r) => Out::I(r),
+            None => match pol.overflow() {
+                Overflow::Wrap => Out::I(i),
+                Overflow::Promote => Out::F(9_223_372_036_854_775_808.0),
+                other => return Err(int::overflow_fault(other)),
+            },
+        },
+        Some(Num::F(f)) => Out::F(f64::from_bits(f.to_bits() & !(1 << 63))),
+        None => return Ok(None),
+    };
+    out.encode(heap).map(Some)
+}
+
+/// `dbit_not` (bitwise complement) on the fast path.
 pub(crate) fn not(heap: &mut Heap, a: u64) -> Result<Option<u64>, Fault> {
     match conv::dyn_num(heap, a) {
         Some(Num::I(i)) => conv::encode_int(heap, !i).map(Some),

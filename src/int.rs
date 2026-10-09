@@ -30,6 +30,8 @@ pub(crate) enum Bin {
     Shr,
     Min,
     Max,
+    /// OPS v2 `pow`: the exact power by repeated squaring.
+    Pow,
 }
 
 /// The unary integer operations of LSB §5.2.
@@ -280,20 +282,89 @@ fn on_overflow<T: Int>(policy: Policy, wrapped: T) -> Result<T, Fault> {
     }
 }
 
-/// The shift amount `n` under `policy`, or the fault.
+/// `shl` (`left`) or `shr` of `a` by the amount `n` under `policy` (OPS v2):
+/// an amount in `0..width` shifts; otherwise `mask` shifts by `n mod
+/// width`, `saturate` (PHP) gives 0, or -1 for `shr` of a negative signed
+/// value, and `error` raises. A negative amount is `ShiftOutOfRange` under
+/// `saturate` too.
 #[inline]
-fn shift_amount<T: Int>(n: T, policy: Policy) -> Result<u32, Fault> {
+fn shift<T: Int>(a: T, n: T, policy: Policy, left: bool) -> Result<T, Fault> {
     let bits = n.to_bits();
     let in_range = !n.is_negative() && bits < u64::from(T::BITS);
-    if in_range {
+    let amount = if in_range {
         // In range, so the narrowing is exact.
-        Ok(bits as u32)
-    } else if policy.shift() == Shift::Mask {
-        // `n mod width`, taken on the two's-complement bits, so a negative
-        // signed amount masks the same way the hardware would.
-        Ok((bits & u64::from(T::BITS - 1)) as u32)
+        bits as u32
     } else {
-        Err(shift_fault())
+        match policy.shift() {
+            // `n mod width`, taken on the two's-complement bits, so a
+            // negative signed amount masks the same way the hardware would.
+            Shift::Mask => (bits & u64::from(T::BITS - 1)) as u32,
+            Shift::Saturate if !n.is_negative() => {
+                let zero = T::from_bits(0);
+                return Ok(if !left && a.is_negative() {
+                    !zero
+                } else {
+                    zero
+                });
+            }
+            _ => return Err(shift_fault()),
+        }
+    };
+    Ok(if left {
+        a.wrapping_shl(amount)
+    } else {
+        a.wrapping_shr(amount)
+    })
+}
+
+/// OPS v2 `pow` at type `T`: the exact power by repeated squaring (`0 ** 0 =
+/// 1`); a result that does not fit follows `overflow` (`wrap` keeps the low
+/// bits of the exact power, which wrapping multiplication computes); a
+/// negative exponent is `NegativeExponent` under every policy (it is not an
+/// overflow, so `trap` does not apply).
+#[inline]
+pub(crate) fn pow_t<T: Int>(policy: Policy, base: T, exp: T) -> Result<T, Fault> {
+    if exp.is_negative() {
+        return Err(Fault::raise(ErrorKind::NegativeExponent));
+    }
+    let (r, overflowed) = pow_exact(base, exp.to_bits());
+    if overflowed {
+        on_overflow(policy, r)
+    } else {
+        Ok(r)
+    }
+}
+
+/// `base ** e` with wrapping multiplication, and whether the exact power
+/// overflows `T`. A square is taken only when a higher exponent bit remains,
+/// so it is multiplied in later: an overflowing square (or product) means the
+/// exact power overflows too, since every later factor has magnitude at
+/// least 2 when `|base| >= 2`, and `|base| < 2` never overflows.
+pub(crate) fn pow_exact<T: Int>(base: T, mut e: u64) -> (T, bool) {
+    let mut acc = T::from_bits(1);
+    let mut b = base;
+    let mut overflowed = false;
+    loop {
+        if e & 1 == 1 {
+            acc = match acc.checked_mul(b) {
+                Some(r) => r,
+                None => {
+                    overflowed = true;
+                    acc.wrapping_mul(b)
+                }
+            };
+        }
+        e >>= 1;
+        if e == 0 {
+            return (acc, overflowed);
+        }
+        b = match b.checked_mul(b) {
+            Some(r) => r,
+            None => {
+                overflowed = true;
+                b.wrapping_mul(b)
+            }
+        };
     }
 }
 
@@ -362,10 +433,11 @@ pub(crate) fn bin_t<T: Int>(op: Bin, policy: Policy, a: T, b: T) -> Result<T, Fa
         Bin::And => a & b,
         Bin::Or => a | b,
         Bin::Xor => a ^ b,
-        Bin::Shl => a.wrapping_shl(shift_amount(b, policy)?),
-        Bin::Shr => a.wrapping_shr(shift_amount(b, policy)?),
+        Bin::Shl => shift(a, b, policy, true)?,
+        Bin::Shr => shift(a, b, policy, false)?,
         Bin::Min => a.min(b),
         Bin::Max => a.max(b),
+        Bin::Pow => pow_t(policy, a, b)?,
     })
 }
 
@@ -598,6 +670,120 @@ mod tests {
             Ok(-1i64 as u64),
             "signed shr is arithmetic"
         );
+    }
+
+    #[test]
+    fn test_saturating_shifts_follow_php() {
+        let sat = Policy::new().with_shift(Shift::Saturate);
+        let neg = |v: i64| v as u64;
+        // Amount >= width: 0, or -1 for shr of a negative signed value.
+        assert_eq!(bin(Bin::Shl, op(IntTy::I64, sat), 1, 64), Ok(0));
+        assert_eq!(bin(Bin::Shl, op(IntTy::I64, sat), 1, 1000), Ok(0));
+        assert_eq!(bin(Bin::Shr, op(IntTy::I64, sat), neg(-8), 64), Ok(neg(-1)));
+        assert_eq!(bin(Bin::Shr, op(IntTy::I64, sat), 8, 64), Ok(0));
+        assert_eq!(bin(Bin::Shr, op(IntTy::U8, sat), 0x80, 8), Ok(0));
+        assert_eq!(bin(Bin::Shr, op(IntTy::I8, sat), neg(-1), 100), Ok(neg(-1)));
+        // In range: an ordinary shift.
+        assert_eq!(bin(Bin::Shl, op(IntTy::I64, sat), 1, 63), Ok(1 << 63));
+        // A negative amount is an error under saturate too (PHP's
+        // ArithmeticError).
+        assert_eq!(
+            bin(Bin::Shl, op(IntTy::I64, sat), 1, neg(-1)),
+            Err(Fault::Raise(ErrorKind::ShiftOutOfRange))
+        );
+        assert_eq!(
+            bin(Bin::Shr, op(IntTy::I32, sat), 1, neg(-5)),
+            Err(Fault::Raise(ErrorKind::ShiftOutOfRange))
+        );
+    }
+
+    #[test]
+    fn test_pow_is_exact_with_policies() {
+        let p = Policy::new();
+        let wrap = p.with_overflow(Overflow::Wrap);
+        let neg = |v: i64| v as u64;
+        assert_eq!(bin(Bin::Pow, op(IntTy::I64, p), 0, 0), Ok(1));
+        assert_eq!(bin(Bin::Pow, op(IntTy::I64, p), 3, 4), Ok(81));
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I64, p), neg(-2), 63),
+            Ok(neg(i64::MIN))
+        );
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I64, p), 2, 63),
+            Err(Fault::Raise(ErrorKind::ArithOverflow))
+        );
+        assert_eq!(bin(Bin::Pow, op(IntTy::I64, wrap), 2, 64), Ok(0));
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I64, wrap), 3, 41),
+            Ok(3u64.wrapping_pow(41))
+        );
+        assert_eq!(bin(Bin::Pow, op(IntTy::U8, wrap), 3, 5), Ok(243));
+        assert_eq!(bin(Bin::Pow, op(IntTy::U8, wrap), 3, 6), Ok(729 % 256));
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I8, p), neg(-1), 255),
+            Err(Fault::Raise(ErrorKind::NegativeExponent))
+        );
+        assert_eq!(bin(Bin::Pow, op(IntTy::U8, p), 1, 255), Ok(1));
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I64, p), neg(-1), neg(i64::MAX)),
+            Ok(neg(-1))
+        );
+        // A negative exponent is never an overflow: not even `trap` traps.
+        let trap = p.with_overflow(Overflow::Trap);
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I32, trap), 2, neg(-1)),
+            Err(Fault::Raise(ErrorKind::NegativeExponent))
+        );
+        assert_eq!(
+            bin(Bin::Pow, op(IntTy::I32, trap), 2, 40),
+            Err(Fault::Trap(ErrorKind::ArithOverflow))
+        );
+    }
+
+    #[test]
+    fn test_pow_matches_i128_for_every_small_case() {
+        let wrap = Policy::new().with_overflow(Overflow::Wrap);
+        for ty in [IntTy::I8, IntTy::U8, IntTy::I16] {
+            let (lo, hi) = if ty.is_signed() {
+                (-(1i128 << (ty.bits() - 1)), (1i128 << (ty.bits() - 1)) - 1)
+            } else {
+                (0, (1i128 << ty.bits()) - 1)
+            };
+            for base in [lo, lo + 1, -3, -2, -1, 0, 1, 2, 3, 7, hi - 1, hi] {
+                if base < lo || base > hi {
+                    continue;
+                }
+                for e in 0..20i128 {
+                    let exact = (0..e).try_fold(1i128, |acc, _| acc.checked_mul(base));
+                    let b = from_value(ty, base).unwrap_or(0);
+                    let x = from_value(ty, e).unwrap_or(0);
+                    let got = bin(Bin::Pow, op(ty, Policy::new()), b, x);
+                    match exact.filter(|v| (lo..=hi).contains(v)) {
+                        Some(v) => assert_eq!(
+                            got,
+                            from_value(ty, v).ok_or(Fault::Trap(ErrorKind::OutOfFuel)),
+                            "{ty:?} {base}**{e}"
+                        ),
+                        None => assert_eq!(
+                            got,
+                            Err(Fault::Raise(ErrorKind::ArithOverflow)),
+                            "{ty:?} {base}**{e}"
+                        ),
+                    }
+                    // `wrap` keeps the low bits of the exact power.
+                    let mut low: i128 = 1;
+                    for _ in 0..e {
+                        low = (low * base).rem_euclid(1i128 << ty.bits());
+                    }
+                    let wrapped = normalize(ty, low as u64);
+                    assert_eq!(
+                        bin(Bin::Pow, op(ty, wrap), b, x),
+                        Ok(wrapped),
+                        "{ty:?} {base}**{e} wrap"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

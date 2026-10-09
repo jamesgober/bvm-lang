@@ -15,8 +15,8 @@
 
 use bvm_lang::{Host, Program, Value, Vm, VmError};
 use bytecode_lang::{
-    DivZero, ErrorKind, FloatToInt, FloatTy, FuncId, Inst, IntConv, IntOp, IntPair, IntTy,
-    ModuleBuilder, Overflow, Policy, Reg, Shift, ValType,
+    DivZero, ErrorKind, FloatConv, FloatToInt, FloatTy, FuncId, Inst, IntConv, IntOp, IntPair,
+    IntTy, ModuleBuilder, Overflow, Policy, Reg, Shift, ValType,
 };
 
 const TYPES: [IntTy; 8] = [
@@ -369,7 +369,7 @@ fn integer_unary_ops_every_type_policy_and_edge() {
                 src: s,
                 op: o,
             });
-            let not = one_inst(&[t], t, |d, s, _| Inst::INot {
+            let not = one_inst(&[t], t, |d, s, _| Inst::IBitNot {
                 dst: d,
                 src: s,
                 op: o,
@@ -946,12 +946,12 @@ fn float_to_int_every_type_policy_and_edge() {
     for ty in TYPES {
         let (lo, hi) = range(ty);
         for fti in [FloatToInt::Error, FloatToInt::Saturate] {
-            let o = IntOp::new(ty).with_policy(Policy::new().with_float_to_int(fti));
+            let o = FloatConv::new(ty).with_float_to_int(fti);
             let prog = one_inst(&[ValType::F64], ValType::int(ty), |d, s, _| {
                 Inst::F64ToInt {
                     dst: d,
                     src: s,
-                    op: o,
+                    conv: o,
                 }
             });
             let mut vm = Vm::new(&prog);

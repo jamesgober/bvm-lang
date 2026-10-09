@@ -19,6 +19,7 @@ fn op() -> IntOp {
 fn raised(kind: ErrorKind, pc: u32) -> Result<Value, VmError> {
     Err(VmError::Raised {
         kind,
+        payload: Value::Nil,
         func: FuncId(0),
         pc,
     })
@@ -250,6 +251,7 @@ fn get_field_on_nil_and_out_of_range_slot() {
         vm.run(id2, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: id2,
             pc: 1
         })
@@ -1019,6 +1021,7 @@ fn op_str_slice_bounds_and_utf8() {
         slice(2, 4, true),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidStrIndex,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 3
         })
@@ -1027,6 +1030,7 @@ fn op_str_slice_bounds_and_utf8() {
         slice(0, 2, true),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidStrIndex,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 3
         })
@@ -1035,6 +1039,7 @@ fn op_str_slice_bounds_and_utf8() {
         slice(3, 2, false),
         Err(VmError::Raised {
             kind: ErrorKind::IndexOutOfBounds,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 3
         })
@@ -1043,6 +1048,7 @@ fn op_str_slice_bounds_and_utf8() {
         slice(0, 5, false),
         Err(VmError::Raised {
             kind: ErrorKind::IndexOutOfBounds,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 3
         })
@@ -1051,6 +1057,7 @@ fn op_str_slice_bounds_and_utf8() {
         slice(-1, 1, false),
         Err(VmError::Raised {
             kind: ErrorKind::IndexOutOfBounds,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 3
         })

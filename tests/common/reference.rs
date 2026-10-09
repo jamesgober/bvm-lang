@@ -139,10 +139,14 @@ pub fn int_bin(name: &str, ty: IntTy, p: Policy, a: i128, b: i128) -> R<i128> {
         "xor" => Ok(wrap(ty, a ^ b)),
         "shl" | "shr" => {
             let n = if b < 0 || b >= bits {
-                if p.shift() == Shift::Mask {
-                    b.rem_euclid(bits)
-                } else {
-                    return Err((ErrorKind::ShiftOutOfRange, false));
+                match p.shift() {
+                    Shift::Mask => b.rem_euclid(bits),
+                    // PHP: 0, or -1 for a negative value shifted right; a
+                    // negative amount is still an error (OPS v2).
+                    Shift::Saturate if b >= 0 => {
+                        return Ok(if name == "shr" && a < 0 { -1 } else { 0 });
+                    }
+                    _ => return Err((ErrorKind::ShiftOutOfRange, false)),
                 }
             } else {
                 b
@@ -155,6 +159,34 @@ pub fn int_bin(name: &str, ty: IntTy, p: Policy, a: i128, b: i128) -> R<i128> {
         }
         "min" => Ok(a.min(b)),
         "max" => Ok(a.max(b)),
+        "pow" => {
+            // OPS v2: a negative exponent is never an overflow.
+            if b < 0 {
+                return Err((ErrorKind::NegativeExponent, false));
+            }
+            let exact = match a {
+                0 => Some(i128::from(b == 0)),
+                1 => Some(1),
+                -1 => Some(if b % 2 == 0 { 1 } else { -1 }),
+                // |a| >= 2: anything past 2^127 overflows every type.
+                _ if b >= 127 => None,
+                _ => (0..b).try_fold(1i128, |acc, _| acc.checked_mul(a)),
+            };
+            // The low bits of the exact power, by square and multiply with
+            // wrapping at the type after every product.
+            let (mut low, mut base, mut e) = (wrap(ty, 1), wrap(ty, a), b);
+            while e > 0 {
+                if e & 1 == 1 {
+                    low = wrap(ty, low * base);
+                }
+                base = wrap(ty, base * base);
+                e >>= 1;
+            }
+            match exact {
+                Some(x) => fit(ty, o, x),
+                None => overflow(o, low),
+            }
+        }
         _ => unreachable!("{name}"),
     }
 }
@@ -242,6 +274,18 @@ pub fn dyn_bin(name: &str, p: Policy, a: Dv, b: Dv) -> Option<R<Dv>> {
                     "floor_div" if y != 0 && i64::try_from(fdiv(x1, y1)).is_err() => {
                         return Some(Ok(Dv::Float(fdiv(x1, y1) as f64)));
                     }
+                    // PHP's `**`: the exact power, its nearest f64 when it
+                    // does not fit, the float rule for a negative exponent.
+                    "pow" if y < 0 => {
+                        return Some(Ok(Dv::Float(super::lspow::ls_pow(x as f64, y as f64))));
+                    }
+                    "pow" => {
+                        let r = int_bin("pow", IntTy::I64, Policy::new(), x1, y1);
+                        return Some(Ok(match r {
+                            Ok(v) => Dv::Int(v as i64),
+                            Err(_) => Dv::Float(super::lspow::exact_pow_f64(x, y)),
+                        }));
+                    }
                     _ => {}
                 }
             }
@@ -262,9 +306,27 @@ pub fn dyn_bin(name: &str, p: Policy, a: Dv, b: Dv) -> Option<R<Dv>> {
                 "rem" => x % y,
                 "floor_div" => py(x, y).0,
                 "floor_mod" => py(x, y).1,
+                "pow" => super::lspow::ls_pow(x, y),
                 _ => return None,
             })))
         }
+        _ => None,
+    }
+}
+
+/// `dabs` on numbers (`None`: the hook, here `TypeError`).
+pub fn dyn_abs(p: Policy, a: Dv) -> Option<R<Dv>> {
+    match a {
+        Dv::Int(i) => Some(match i.checked_abs() {
+            Some(v) => Ok(Dv::Int(v)),
+            None => match p.overflow() {
+                Overflow::Wrap => Ok(Dv::Int(i)),
+                Overflow::Promote => Ok(Dv::Float(9_223_372_036_854_775_808.0)),
+                Overflow::Trap => Err((ErrorKind::ArithOverflow, true)),
+                _ => Err((ErrorKind::ArithOverflow, false)),
+            },
+        }),
+        Dv::Float(f) => Some(Ok(Dv::Float(f.abs()))),
         _ => None,
     }
 }
@@ -443,11 +505,12 @@ pub fn run(
             Inst::IShr { dst, lhs, rhs, op } => ibin("shr", dst, lhs, rhs, op, &mut regs),
             Inst::IMin { dst, lhs, rhs, op } => ibin("min", dst, lhs, rhs, op, &mut regs),
             Inst::IMax { dst, lhs, rhs, op } => ibin("max", dst, lhs, rhs, op, &mut regs),
+            Inst::IPow { dst, lhs, rhs, op } => ibin("pow", dst, lhs, rhs, op, &mut regs),
             Inst::INeg { dst, src, op } => {
                 fit(op.ty(), op.policy().overflow(), -int(&regs[src.index()]))
                     .map(|v| regs[dst.index()] = Rv::Int(v))
             }
-            Inst::INot { dst, src, op } => {
+            Inst::IBitNot { dst, src, op } => {
                 regs[dst.index()] = Rv::Int(wrap(op.ty(), !int(&regs[src.index()])));
                 Ok(())
             }
@@ -479,8 +542,8 @@ pub fn run(
                 regs[dst.index()] = Rv::Float(int(&regs[src.index()]) as f64);
                 Ok(())
             }
-            Inst::F64ToInt { dst, src, op } => {
-                f2i(fl(&regs[src.index()]), op).map(|v| regs[dst.index()] = Rv::Int(v))
+            Inst::F64ToInt { dst, src, conv } => {
+                f2i(fl(&regs[src.index()]), conv).map(|v| regs[dst.index()] = Rv::Int(v))
             }
             Inst::FAdd {
                 dst,
@@ -565,6 +628,27 @@ pub fn run(
             }
             Inst::DFloorMod { dst, lhs, rhs, pol } => {
                 dyn_op("floor_mod", dst, lhs, rhs, pol, &mut regs)
+            }
+            Inst::DShl { dst, lhs, rhs, pol } => dyn_op("shl", dst, lhs, rhs, pol, &mut regs),
+            Inst::DShr { dst, lhs, rhs, pol } => dyn_op("shr", dst, lhs, rhs, pol, &mut regs),
+            Inst::DPow { dst, lhs, rhs, pol } => dyn_op("pow", dst, lhs, rhs, pol, &mut regs),
+            Inst::DAbs { dst, src, pol } => match dyn_abs(pol, dy(&regs[src.index()])) {
+                Some(Ok(v)) => {
+                    regs[dst.index()] = Rv::Dyn(v);
+                    Ok(())
+                }
+                Some(Err(e)) => Err(e),
+                None => Err((ErrorKind::TypeError, false)),
+            },
+            Inst::FPow {
+                dst,
+                lhs,
+                rhs,
+                ty: FloatTy::F64,
+            } => {
+                let r = super::lspow::ls_pow(fl(&regs[lhs.index()]), fl(&regs[rhs.index()]));
+                regs[dst.index()] = Rv::Float(r);
+                Ok(())
             }
             Inst::DLt { dst, lhs, rhs } => {
                 match dyn_cmp(dy(&regs[lhs.index()]), dy(&regs[rhs.index()])) {
@@ -666,14 +750,14 @@ fn int_cast(conv: IntConv, v: i128) -> R<i128> {
     fit(conv.to(), conv.overflow(), v)
 }
 
-fn f2i(x: f64, op: IntOp) -> R<i128> {
+fn f2i(x: f64, op: bytecode_lang::FloatConv) -> R<i128> {
     let (lo, hi) = range(op.ty());
     let t = x.trunc();
     let ok =
         !x.is_nan() && t >= lo as f64 && t <= hi as f64 && (t as i128) >= lo && (t as i128) <= hi;
     if ok {
         Ok(t as i128)
-    } else if op.policy().float_to_int() == FloatToInt::Saturate {
+    } else if op.float_to_int() == FloatToInt::Saturate {
         Ok(if x.is_nan() {
             0
         } else if t < lo as f64 {

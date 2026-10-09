@@ -10,7 +10,7 @@ use crate::value::Value;
 ///
 /// Errors that unwind (LSB §4.3) reach the host only when no handler caught
 /// them: [`Raised`](VmError::Raised) for a runtime error (with the OPS/LSB
-/// [`ErrorKind`] and the function and pc that raised it) and
+/// [`ErrorKind`], its payload, and the function and pc that raised it) and
 /// [`Thrown`](VmError::Thrown) for a `throw` of any other value. Traps
 /// ([`Trap`](VmError::Trap)) abort at once and carry the instruction that
 /// trapped. Every runtime variant names the function and pc (ISSUES M62).
@@ -31,7 +31,10 @@ use crate::value::Value;
 /// let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
 ///
 /// let err = Vm::new(&program).run(div, &[Value::Int(1), Value::Int(0)]).unwrap_err();
-/// assert_eq!(err, VmError::Raised { kind: ErrorKind::DivByZero, func: div, pc: 0 });
+/// assert_eq!(
+///     err,
+///     VmError::Raised { kind: ErrorKind::DivByZero, payload: Value::Nil, func: div, pc: 0 }
+/// );
 /// assert_eq!(err.code(), Some(2));
 /// assert_eq!(err.to_string(), "uncaught E0002 DivByZero at f0 @0");
 /// ```
@@ -42,6 +45,10 @@ pub enum VmError {
     Raised {
         /// The OPS/LSB error kind.
         kind: ErrorKind,
+        /// Its payload: the operand of the `raise` that raised it (a
+        /// `NoMatch` carries the unmatched value), `nil` for an error an
+        /// instruction raised by itself (LSB §6).
+        payload: Value,
         /// The function that raised it.
         func: FuncId,
         /// The instruction that raised it.
@@ -167,7 +174,18 @@ impl VmError {
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VmError::Raised { kind, func, pc } => write!(f, "uncaught {kind} at {func} @{pc}"),
+            VmError::Raised {
+                kind,
+                payload: Value::Nil,
+                func,
+                pc,
+            } => write!(f, "uncaught {kind} at {func} @{pc}"),
+            VmError::Raised {
+                kind,
+                payload,
+                func,
+                pc,
+            } => write!(f, "uncaught {kind} ({payload}) at {func} @{pc}"),
             VmError::Thrown { value, func, pc } => {
                 write!(f, "uncaught throw of {value} at {func} @{pc}")
             }

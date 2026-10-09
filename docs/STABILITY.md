@@ -16,14 +16,15 @@
 
 `bvm-lang` **2.0** is a new major version: the 1.x instruction set (`Op`, `Chunk`) is gone, replaced by LSB, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang). The 1.x line stays frozen as it was released; it receives no further features.
 
-## 2.0.0-alpha.2 is a pre-release
+## 2.0.0-alpha.3 is a pre-release
 
 Per decision D18 (a crate is frozen only after a real consumer has exercised it), the 2.0 API is **not frozen yet**. It freezes at `2.0.0`, after:
 
-1. the coroutine instructions land (done in `2.0.0-alpha.2`), and
-2. a real consumer (Mox, through the LexerSketch app) has run end to end on it.
+1. the coroutine instructions land (done in `2.0.0-alpha.2`),
+2. LSB format 2 executes (done in `2.0.0-alpha.3`) and the reference-counting memory profile of decision D22 lands (`2.0.0-alpha.4`), and
+3. a real consumer (Mox, through the LexerSketch app) has run end to end on it.
 
-Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.2"`).
+Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.3"`).
 
 ## What the alphas already promise
 
@@ -35,6 +36,7 @@ These are properties of the implementation that will not be weakened before or a
 - **Precise errors.** A failing instruction raises at its own pc without writing its destination; `VmError` carries the OPS/LSB error code, the function, and the pc.
 - **Determinism.** Results do not depend on the platform, the `std` feature, or hash seeds: map order is insertion order, and float results are IEEE (software and hardware paths are bit-identical). Collection timing is observable in exactly one way, which LSB §5.13 rule 13 requires: a dropped suspended coroutine's pending `finally` blocks run when a collection has found it unreachable. For a given module, input, and `Limits` on a fresh `Vm`, collections (and so those closes) happen at the same points on every run; they are not part of what other tiers must reproduce.
 - **Fuel is LSB §5.14's.** Every tier charges the same points; a run under a budget stops at the same function and pc.
+- **Copy-on-write decisions are deterministic.** Which writes copy contents and which elements `dsep_*`/`dref_*` replace by a copy follow LSB §5.16's two bits, never reference counts or collection timing. LSB leaves the identity of a separated element unspecified when nothing was shared (value-semantics code never compares it); the reference-counting profile (alpha.4) may decide differently there, and only there.
 
 ## What may change before 2.0.0
 
@@ -51,4 +53,4 @@ Rust **1.85** (edition 2024). An MSRV increase is a minor-version change after 2
 
 ## Dependencies
 
-`bytecode-lang` `0.2` (the LSB format). The 1.x dependency on `value-lang` was dropped (see the CHANGELOG and `dev/ROADMAP.md` for why).
+`bytecode-lang` `0.3` (LSB format 2; format 1 files are refused and must be regenerated). The 1.x dependency on `value-lang` was dropped (see the CHANGELOG and `dev/ROADMAP.md` for why).

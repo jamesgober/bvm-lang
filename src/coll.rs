@@ -11,6 +11,19 @@
 //! strings bytewise, other references by identity, floats by bits after
 //! folding `-0.0` into `+0.0` (every `dyn` NaN is already one NaN), and for
 //! `dyn` keys the kind is part of the key (`int 1` and `float 1.0` differ).
+//!
+//! **Reference slots** (LSB §5.17). A `dyn` element or map value may hold a
+//! PHP reference box; such a slot is transparent. Every value read here
+//! returns the box's value, every value write stores into the box, and a
+//! box given as the value to store is stored as its value: a slot becomes a
+//! reference slot only through the reference instructions
+//! ([`crate::refs`]), which use the `_raw` operations. The test is one
+//! comparison on the word ([`dynv::is_box`]) plus the slot type being
+//! `dyn`, so containers without references pay one predictable branch.
+//!
+//! **Copies mark what they share** (LSB §5.16). When a write copies shared
+//! contents, every array and map among them becomes `aliased` (two
+//! containers now hold it), before the copy is made.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -173,10 +186,60 @@ pub(crate) fn map_get(heap: &Heap, seed: Seed, map: u64, key: u64) -> Result<Opt
     } else {
         0
     };
-    Ok(m.store
+    let found = m
+        .store
         .find(hash, ik, |k| key_eq(heap, kty, k, key))
         .and_then(|p| m.store.entry(p))
-        .map(|e| e.value))
+        .map(|e| e.value);
+    Ok(match found {
+        Some(w) if dynv::is_box(w) && m.value == ValType::Dyn => Some(heap.deref(w)),
+        other => other,
+    })
+}
+
+/// Where a key is (or would go) in a map: everything a write needs, from
+/// one lookup of the map object.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Found {
+    /// The entry position, if the key is present.
+    pub(crate) pos: Option<usize>,
+    /// The key in the map's key representation, its hash and integer value.
+    key: u64,
+    hash: u64,
+    ik: Option<i128>,
+    /// Bytes an insertion would add.
+    growth: usize,
+}
+
+/// Locates `key` (converted to the map's key representation) in `map`.
+#[inline]
+pub(crate) fn map_find(heap: &Heap, seed: Seed, map: u64, key: u64) -> Result<Found, Fault> {
+    let m = map_ref(heap, map)?;
+    let kty = m.key;
+    let key = normalize_key(kty, key);
+    let hash = hash_key(heap, seed, kty, key);
+    let ik = int_key(heap, kty, key);
+    let pos = m.store.find(hash, ik, |k| key_eq(heap, kty, k, key));
+    let growth = if pos.is_none() {
+        m.store.growth_bytes(ik)
+    } else {
+        0
+    };
+    Ok(Found {
+        pos,
+        key,
+        hash,
+        ik,
+        growth,
+    })
+}
+
+/// The raw word at a map position (a box stays a box).
+pub(crate) fn map_word_at(heap: &Heap, map: u64, pos: usize) -> Option<u64> {
+    match heap.get(map) {
+        Some(Object::Map(m)) => m.store.entry(pos).map(|e| e.value),
+        _ => None,
+    }
 }
 
 /// Looks up a string key given as bytes (property access), without
@@ -189,37 +252,81 @@ pub(crate) fn map_get_bytes(heap: &Heap, seed: Seed, map: u64, name: &[u8]) -> O
         return None;
     }
     let hash = seed.bytes(name);
-    m.store
+    let w = m
+        .store
         .find(hash, None, |k| heap.str(k) == Some(name))
         .and_then(|p| m.store.entry(p))
-        .map(|e| e.value)
+        .map(|e| e.value)?;
+    Some(if m.value == ValType::Dyn {
+        heap.deref(w)
+    } else {
+        w
+    })
 }
 
-/// Mutable access to a map's store for writing: refuses frozen constants,
-/// copies shared storage (charging the copy first).
-fn map_store_mut(heap: &mut Heap, map: u64, extra: usize) -> Result<&mut MapStore, Fault> {
-    let (shared_bytes, frozen) = match heap.get(map) {
-        Some(Object::Map(m)) => (
-            if Arc::strong_count(&m.store) > 1 {
-                m.store.bytes()
-            } else {
-                0
-            },
-            m.frozen,
-        ),
+/// Mutable access to a map's store for writing (LSB §5.16): refuses frozen
+/// constants; a write to a `cow` map marks the containers in its contents
+/// aliased and clears the bit; storage still physically shared is copied
+/// (the copy charged first).
+pub(crate) fn map_store_mut(
+    heap: &mut Heap,
+    map: u64,
+    extra: usize,
+) -> Result<&mut MapStore, Fault> {
+    let (shared_bytes, frozen, old) = match heap.get(map) {
+        Some(Object::Map(m)) => {
+            let cow = m.contents_shared();
+            let holds_refs = m.key.is_reference() || m.value.is_reference();
+            (
+                if Arc::strong_count(&m.store) > 1 {
+                    m.store.bytes()
+                } else {
+                    0
+                },
+                m.frozen,
+                (cow && holds_refs).then(|| Arc::clone(&m.store)),
+            )
+        }
         _ => return Err(not_a(heap, map)),
     };
     if frozen {
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    if let Some(old) = old {
+        heap.mark_aliased(
+            old.entries()
+                .iter()
+                .filter(|e| e.live)
+                .flat_map(|e| [e.key, e.value]),
+        );
+    }
     match heap.get_mut(map) {
-        Some(Object::Map(m)) => Ok(Arc::make_mut(&mut m.store)),
+        Some(Object::Map(m)) => {
+            m.cow = false;
+            Ok(Arc::make_mut(&mut m.store))
+        }
         _ => Err(Fault::type_error()),
     }
 }
 
-/// `map_set`: updates an existing key in place or appends a new one.
+/// Makes a map's contents its own before a write (copy-on-write).
+pub(crate) fn unique_map(heap: &mut Heap, map: u64) -> Result<(), Fault> {
+    map_store_mut(heap, map, 0).map(|_| ())
+}
+
+/// Makes an array's elements its own before a write (copy-on-write).
+pub(crate) fn unique_array(heap: &mut Heap, arr: u64) -> Result<(), Fault> {
+    array_items_mut(heap, arr, 0).map(|_| ())
+}
+
+/// `map_set`: updates an existing key in place or appends a new one. In a
+/// map of `dyn` values a box is stored as its value, and a reference slot is
+/// written through (LSB §5.17).
+///
+/// One lookup of the map object serves the search, the reference-slot test,
+/// and the growth estimate: splitting them into a search returning a record
+/// and a separate store measured ~15% slower on `map/int_keys_100k_set_get`.
 pub(crate) fn map_set(
     heap: &mut Heap,
     seed: Seed,
@@ -233,11 +340,53 @@ pub(crate) fn map_set(
     let hash = hash_key(heap, seed, kty, key);
     let ik = int_key(heap, kty, key);
     let pos = m.store.find(hash, ik, |k| key_eq(heap, kty, k, key));
+    let mut value = value;
+    let mut through = None;
+    if m.value == ValType::Dyn {
+        if let Some(w) = pos.and_then(|p| m.store.entry(p)).map(|e| e.value) {
+            if dynv::is_box(w) {
+                through = Some(w);
+            }
+        }
+        if dynv::is_box(value) {
+            value = heap.deref(value);
+        }
+    }
     let growth = if pos.is_none() {
         m.store.growth_bytes(ik)
     } else {
         0
     };
+    if let Some(w) = through {
+        if heap.set_box(w, value) {
+            return Ok(());
+        }
+    }
+    store_at(heap, map, (pos, key, hash, ik, growth), value)
+}
+
+/// Stores `value` under `key` as it is (a box makes a reference slot):
+/// updates an existing key in place or appends a new one.
+pub(crate) fn map_set_raw(
+    heap: &mut Heap,
+    seed: Seed,
+    map: u64,
+    key: u64,
+    value: u64,
+) -> Result<(), Fault> {
+    let f = map_find(heap, seed, map, key)?;
+    store_at(heap, map, (f.pos, f.key, f.hash, f.ik, f.growth), value)
+}
+
+/// The store half of a map write: (position, key, hash, integer key,
+/// growth) from the search.
+#[inline(always)]
+fn store_at(
+    heap: &mut Heap,
+    map: u64,
+    (pos, key, hash, ik, growth): (Option<usize>, u64, u64, Option<i128>, usize),
+    value: u64,
+) -> Result<(), Fault> {
     let store = map_store_mut(heap, map, growth)?;
     match pos {
         Some(p) => store.set_value(p, value),
@@ -272,6 +421,19 @@ pub(crate) fn map_del(heap: &mut Heap, seed: Seed, map: u64, key: u64) -> Result
 
 /// `map_push`: appends under the next integer key.
 pub(crate) fn map_push(heap: &mut Heap, seed: Seed, map: u64, value: u64) -> Result<(), Fault> {
+    let key = next_key(heap, map)?;
+    map_set(heap, seed, map, key, value)
+}
+
+/// `map_push` storing `value` as it is (a box makes a reference slot): how a
+/// by-reference `rest_map` parameter collects its positional items.
+pub(crate) fn map_push_raw(heap: &mut Heap, seed: Seed, map: u64, value: u64) -> Result<(), Fault> {
+    let key = next_key(heap, map)?;
+    map_set_raw(heap, seed, map, key, value)
+}
+
+/// The key `map_push` inserts under (the next integer key, LSB §5.10).
+fn next_key(heap: &mut Heap, map: u64) -> Result<u64, Fault> {
     let m = map_ref(heap, map)?;
     let kty = m.key;
     let next = m.store.next_int();
@@ -290,7 +452,7 @@ pub(crate) fn map_push(heap: &mut Heap, seed: Seed, map: u64, value: u64) -> Res
             None => return Err(Fault::type_error()),
         },
     };
-    map_set(heap, seed, map, key, value)
+    Ok(key)
 }
 
 /// A new map whose storage the caller fills.
@@ -299,6 +461,8 @@ pub(crate) fn new_map(heap: &mut Heap, key: ValType, value: ValType) -> Result<u
         key,
         value,
         frozen: false,
+        cow: false,
+        aliased: false,
         store: Arc::new(MapStore::default()),
     }))
 }
@@ -316,53 +480,90 @@ pub(crate) fn array_ref(heap: &Heap, arr: u64) -> Result<&ArrayObj, Fault> {
     }
 }
 
-/// The element at `idx`.
+/// The element at `idx` (a reference slot reads as its value).
 #[inline]
 pub(crate) fn array_get(heap: &Heap, arr: u64, idx: i64) -> Result<u64, Fault> {
     let a = array_ref(heap, arr)?;
-    usize::try_from(idx)
+    let w = usize::try_from(idx)
         .ok()
         .and_then(|i| a.items.get(i).copied())
-        .ok_or_else(out_of_bounds)
+        .ok_or_else(out_of_bounds)?;
+    Ok(if dynv::is_box(w) && a.elem == ValType::Dyn {
+        heap.deref(w)
+    } else {
+        w
+    })
 }
 
-/// Mutable access to an array's storage for writing.
-fn array_items_mut(heap: &mut Heap, arr: u64, extra: usize) -> Result<&mut Vec<u64>, Fault> {
-    let (shared_bytes, frozen) = match heap.get(arr) {
-        Some(Object::Array(a)) => (
-            if Arc::strong_count(&a.items) > 1 {
-                a.items.len() * 8
-            } else {
-                0
-            },
-            a.frozen,
-        ),
+/// Mutable access to an array's storage for writing: as
+/// [`map_store_mut`].
+pub(crate) fn array_items_mut(
+    heap: &mut Heap,
+    arr: u64,
+    extra: usize,
+) -> Result<&mut Vec<u64>, Fault> {
+    let (shared_bytes, frozen, old) = match heap.get(arr) {
+        Some(Object::Array(a)) => {
+            let cow = a.contents_shared();
+            (
+                if Arc::strong_count(&a.items) > 1 {
+                    a.items.len() * 8
+                } else {
+                    0
+                },
+                a.frozen,
+                (cow && a.elem.is_reference()).then(|| Arc::clone(&a.items)),
+            )
+        }
         _ => return Err(not_a(heap, arr)),
     };
     if frozen {
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    if let Some(old) = old {
+        heap.mark_aliased(old.iter().copied());
+    }
     match heap.get_mut(arr) {
-        Some(Object::Array(a)) => Ok(Arc::make_mut(&mut a.items)),
+        Some(Object::Array(a)) => {
+            a.cow = false;
+            Ok(Arc::make_mut(&mut a.items))
+        }
         _ => Err(Fault::type_error()),
     }
 }
 
-/// `array_set`.
+/// `array_set`: in an array of `dyn` a box is stored as its value and a
+/// reference slot is written through (LSB §5.17).
 pub(crate) fn array_set(heap: &mut Heap, arr: u64, idx: i64, v: u64) -> Result<(), Fault> {
-    let len = array_ref(heap, arr)?.items.len();
+    let a = array_ref(heap, arr)?;
+    let len = a.items.len();
+    let dyn_elems = a.elem == ValType::Dyn;
     let i = usize::try_from(idx)
         .ok()
         .filter(|&i| i < len)
         .ok_or_else(out_of_bounds)?;
+    let mut v = v;
+    if dyn_elems {
+        v = heap.deref(v);
+        let old = a.items.get(i).copied().unwrap_or(dynv::NIL);
+        if dynv::is_box(old) && heap.set_box(old, v) {
+            return Ok(());
+        }
+    }
+    array_set_raw(heap, arr, i, v)
+}
+
+/// Stores `v` at the in-range index `i` as it is (a box makes a reference
+/// slot).
+pub(crate) fn array_set_raw(heap: &mut Heap, arr: u64, i: usize, v: u64) -> Result<(), Fault> {
     if let Some(slot) = array_items_mut(heap, arr, 0)?.get_mut(i) {
         *slot = v;
     }
     Ok(())
 }
 
-/// `array_push`.
+/// `array_push` (a box is pushed as its value into an array of `dyn`).
 pub(crate) fn array_push(heap: &mut Heap, arr: u64, v: u64) -> Result<(), Fault> {
     let a = array_ref(heap, arr)?;
     let grow = if a.items.len() == a.items.capacity() {
@@ -370,18 +571,26 @@ pub(crate) fn array_push(heap: &mut Heap, arr: u64, v: u64) -> Result<(), Fault>
     } else {
         0
     };
+    let v = if a.elem == ValType::Dyn {
+        heap.deref(v)
+    } else {
+        v
+    };
     array_items_mut(heap, arr, grow)?.push(v);
     Ok(())
 }
 
-/// `array_pop`.
+/// `array_pop` (a reference slot pops as its value).
 pub(crate) fn array_pop(heap: &mut Heap, arr: u64) -> Result<u64, Fault> {
-    if array_ref(heap, arr)?.items.is_empty() {
+    let a = array_ref(heap, arr)?;
+    if a.items.is_empty() {
         return Err(out_of_bounds());
     }
-    array_items_mut(heap, arr, 0)?
+    let dyn_elems = a.elem == ValType::Dyn;
+    let w = array_items_mut(heap, arr, 0)?
         .pop()
-        .ok_or_else(out_of_bounds)
+        .ok_or_else(out_of_bounds)?;
+    Ok(if dyn_elems { heap.deref(w) } else { w })
 }
 
 /// A new array of `len` default elements.
@@ -396,7 +605,24 @@ pub(crate) fn new_array(heap: &mut Heap, elem: ValType, len: i64) -> Result<u64,
     heap.alloc(Object::Array(ArrayObj {
         elem,
         frozen: false,
+        cow: false,
+        aliased: false,
         items: Arc::new(alloc::vec![0; n]),
+    }))
+}
+
+/// A new `dyn` array holding `items` (already values, never boxes unless
+/// the caller makes reference slots on purpose).
+pub(crate) fn new_dyn_array(heap: &mut Heap, items: Vec<u64>) -> Result<u64, Fault> {
+    if !heap.fits(items.len().saturating_mul(8)) {
+        return Err(Fault::Trap(ErrorKind::OutOfMemory));
+    }
+    heap.alloc(Object::Array(ArrayObj {
+        elem: ValType::Dyn,
+        frozen: false,
+        cow: false,
+        aliased: false,
+        items: Arc::new(items),
     }))
 }
 
@@ -458,6 +684,12 @@ pub(crate) fn iter_next(heap: &mut Heap, it: u64) -> Result<Option<u64>, Fault> 
             i.done = true;
         }
         return Ok(None);
+    };
+    // A reference slot yields its value (LSB §5.10, §5.17).
+    let v = if vty == ValType::Dyn {
+        heap.deref(v)
+    } else {
+        v
     };
     let (k, v) = if dynamic {
         (conv::to_dyn(heap, kty, k)?, conv::to_dyn(heap, vty, v)?)

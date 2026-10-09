@@ -14,8 +14,8 @@ mod common;
 
 use bvm_lang::{Host, Program, Value, Vm, VmError};
 use bytecode_lang::{
-    Const, ErrorKind, FloatTy, FuncId, Inst, IntConv, IntOp, IntPair, IntTy, ModuleBuilder,
-    Overflow, Policy, Reg, ValType,
+    Const, ErrorKind, FloatConv, FloatTy, FuncId, Inst, IntConv, IntOp, IntPair, IntTy,
+    ModuleBuilder, Overflow, Policy, Reg, ValType,
 };
 use common::{BOOL, F64, I64, eval};
 
@@ -172,6 +172,7 @@ fn op_dload_const_kinds() {
         out,
         Err(VmError::Raised {
             kind: ErrorKind::ArithOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -228,6 +229,7 @@ fn op_dload_const_nested_constant_is_immutable_without_dup() {
         out,
         Err(VmError::Raised {
             kind: ErrorKind::TypeError,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 2
         })
@@ -556,6 +558,7 @@ fn op_integer_errors_raise_at_their_pc_and_trap_under_trap() {
         ibin(add, i64op(), max, Value::Int(1)),
         Err(VmError::Raised {
             kind: ErrorKind::ArithOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -589,7 +592,7 @@ fn op_integer_unary_instructions() {
         Ok(Value::Int(-5))
     );
     assert_eq!(
-        un(|d, s, op| Inst::INot { dst: d, src: s, op }, 0),
+        un(|d, s, op| Inst::IBitNot { dst: d, src: s, op }, 0),
         Ok(Value::Int(-1))
     );
     assert_eq!(
@@ -600,6 +603,7 @@ fn op_integer_unary_instructions() {
         un(|d, s, op| Inst::IAbs { dst: d, src: s, op }, i64::MIN),
         Err(VmError::Raised {
             kind: ErrorKind::ArithOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -1168,6 +1172,7 @@ fn op_ref_eq_is_identity() {
         out,
         Err(VmError::Raised {
             kind: ErrorKind::NullReference,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 1
         })
@@ -1260,6 +1265,7 @@ fn op_int_cast_zext_sext_trunc() {
         ),
         Err(VmError::Raised {
             kind: ErrorKind::ArithOverflow,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -1358,7 +1364,7 @@ fn op_int_to_float_rounds_to_nearest_even() {
 
 #[test]
 fn op_float_to_int_truncates_errors_and_saturates() {
-    let conv = |x: f64, op: IntOp| {
+    let conv = |x: f64, op: FloatConv| {
         let t = ValType::int(op.ty());
         run_regs(
             &[F64, t],
@@ -1368,19 +1374,19 @@ fn op_float_to_int_truncates_errors_and_saturates() {
             &[Inst::F64ToInt {
                 dst: Reg(1),
                 src: Reg(0),
-                op,
+                conv: op,
             }],
             1,
         )
     };
-    let i32op = IntOp::new(IntTy::I32);
-    let sat =
-        i32op.with_policy(Policy::new().with_float_to_int(bytecode_lang::FloatToInt::Saturate));
+    let i32op = FloatConv::new(IntTy::I32);
+    let sat = i32op.with_float_to_int(bytecode_lang::FloatToInt::Saturate);
     assert_eq!(conv(-2.9, i32op), Ok(Value::Int(-2)));
     assert_eq!(
         conv(f64::NAN, i32op),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidConversion,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -1389,6 +1395,7 @@ fn op_float_to_int_truncates_errors_and_saturates() {
         conv(3e9, i32op),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidConversion,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -1397,7 +1404,7 @@ fn op_float_to_int_truncates_errors_and_saturates() {
     assert_eq!(conv(-3e9, sat), Ok(Value::Int(i64::from(i32::MIN))));
     assert_eq!(conv(f64::NAN, sat), Ok(Value::Int(0)));
     // -0.9 truncates to 0, which fits an unsigned type.
-    assert_eq!(conv(-0.9, IntOp::new(IntTy::U8)), Ok(Value::UInt(0)));
+    assert_eq!(conv(-0.9, FloatConv::new(IntTy::U8)), Ok(Value::UInt(0)));
     let f32conv = run_regs(
         &[ValType::F32, I64],
         1,
@@ -1406,7 +1413,7 @@ fn op_float_to_int_truncates_errors_and_saturates() {
         &[Inst::F32ToInt {
             dst: Reg(1),
             src: Reg(0),
-            op: i64op(),
+            conv: FloatConv::new(IntTy::I64),
         }],
         1,
     );
@@ -1487,6 +1494,7 @@ fn op_char_conversions_and_bool_to_int() {
         from(0xD800),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidChar,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })
@@ -1495,6 +1503,7 @@ fn op_char_conversions_and_bool_to_int() {
         from(0x11_0000),
         Err(VmError::Raised {
             kind: ErrorKind::InvalidChar,
+            payload: bvm_lang::Value::Nil,
             func: FuncId(0),
             pc: 0
         })

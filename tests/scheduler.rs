@@ -201,6 +201,7 @@ fn the_main_task_failing_ends_the_run_with_its_error() {
         Vm::new(&p).run_async(main, &[]),
         Err(VmError::Raised {
             kind: ErrorKind::DivByZero,
+            payload: bvm_lang::Value::Nil,
             func: main,
             pc: 3
         })

@@ -44,6 +44,7 @@ use alloc::vec::Vec;
 
 use bytecode_lang::{Callee, ErrorKind, FloatTy, Hook, Inst, IntTy, ValType};
 
+use crate::bind;
 use crate::coll::{self, index_of, not_a};
 use crate::conv::{self, prim_type};
 use crate::coro::{self, Entered};
@@ -52,10 +53,12 @@ use crate::dynv;
 use crate::error::VmError;
 use crate::fault::Fault;
 use crate::fmath;
-use crate::heap::{ArrayObj, Callable, CellObj, FuncObj, MapObj, Object, StructObj};
+use crate::heap::{Callable, CellObj, FuncObj, Object, StructObj};
 use crate::int::{self, Bin, Cmp, Un};
 use crate::machine::{Charge, Cont, Driver, Machine, Next, Stop, Wake};
+use crate::pow;
 use crate::program::{FuncInfo, Program, TypeInfo};
+use crate::refs;
 
 const SIGN32: u64 = 0x8000_0000;
 const SIGN64: u64 = 1 << 63;
@@ -81,6 +84,7 @@ pub(crate) fn execute(
             *fuel = end(m, stack, false);
             return Err(VmError::Raised {
                 kind: ErrorKind::StackOverflow,
+                payload: crate::Value::Nil,
                 func: bytecode_lang::FuncId(func),
                 pc: 0,
             });
@@ -147,11 +151,12 @@ pub(crate) fn drive(
                 .and_then(|c| c.frames.last())
                 .map_or((0, 0), |f| (f.func, f.pc));
             let kind = match fault {
-                Fault::Raise(k) | Fault::Trap(k) => k,
+                Fault::Raise(k) | Fault::RaiseWith(k, _) | Fault::Trap(k) => k,
                 Fault::Throw(_) => ErrorKind::TypeError,
             };
             return Err(VmError::Raised {
                 kind,
+                payload: crate::Value::Nil,
                 func: bytecode_lang::FuncId(func),
                 pc,
             });
@@ -217,8 +222,8 @@ fn ordering_word(o: core::cmp::Ordering) -> u64 {
 }
 
 /// Truncation of a float to an integer type (OPS §5 `float_to_int`).
-fn float_to_int(x: f64, op: bytecode_lang::IntOp) -> Result<u64, Fault> {
-    let ty = op.ty();
+fn float_to_int(x: f64, conv: bytecode_lang::FloatConv) -> Result<u64, Fault> {
+    let ty = conv.ty();
     let bits = ty.bits() as i32;
     let (lo, hi) = if ty.is_signed() {
         (-pow2(bits - 1), pow2(bits - 1))
@@ -230,7 +235,7 @@ fn float_to_int(x: f64, op: bytecode_lang::IntOp) -> Result<u64, Fault> {
         // In range and integral: the conversion is exact.
         return int::from_value(ty, t as i128).ok_or(Fault::Raise(ErrorKind::InvalidConversion));
     }
-    if op.policy().float_to_int() == bytecode_lang::FloatToInt::Saturate {
+    if conv.float_to_int() == bytecode_lang::FloatToInt::Saturate {
         let v: i128 = if x.is_nan() {
             0
         } else if t < lo {
@@ -448,7 +453,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 Inst::IMin { dst, lhs, rhs, op } => int_bin!(Bin::Min, dst, lhs, rhs, op),
                 Inst::IMax { dst, lhs, rhs, op } => int_bin!(Bin::Max, dst, lhs, rhs, op),
                 Inst::INeg { dst, src, op } => r!(dst) = t!(int::un(Un::Neg, op, r!(src))),
-                Inst::INot { dst, src, op } => r!(dst) = t!(int::un(Un::Not, op, r!(src))),
+                Inst::IBitNot { dst, src, op } => r!(dst) = t!(int::un(Un::Not, op, r!(src))),
                 Inst::IAbs { dst, src, op } => r!(dst) = t!(int::un(Un::Abs, op, r!(src))),
                 Inst::IEq { dst, lhs, rhs, ty } => {
                     r!(dst) = u64::from(int::cmp(Cmp::Eq, ty, r!(lhs), r!(rhs)));
@@ -654,24 +659,36 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     let c = r!(cell);
                     match m.heap.get(c) {
                         Some(Object::Cell(x)) => r!(dst) = x.value,
+                        // A reference is a cell of `dyn` (LSB §5.17).
+                        Some(Object::Ref(v)) => r!(dst) = *v,
                         _ => fail!(not_a(&m.heap, c)),
                     }
                 }
                 Inst::GetField { dst, obj, field } => {
                     let o = r!(obj);
-                    match m.heap.get(o) {
+                    let w = match m.heap.get(o) {
                         Some(Object::Struct(s)) => match s.fields.get(field.index()) {
-                            Some(&v) => r!(dst) = v,
+                            Some(&v) => v,
                             None => fail!(Fault::type_error()),
                         },
                         _ => fail!(not_a(&m.heap, o)),
-                    }
+                    };
+                    // A reference slot reads as its value (LSB §5.17): one
+                    // compare on the word, the field's type checked only then.
+                    r!(dst) = if dynv::is_box(w) {
+                        field_read(m, prog, o, field.index(), w)
+                    } else {
+                        w
+                    };
                 }
                 Inst::SetField { obj, field, src } => {
                     let (o, v) = (r!(obj), r!(src));
                     match m.heap.get_mut(o) {
                         Some(Object::Struct(s)) => match s.fields.get_mut(field.index()) {
-                            Some(slot) => *slot = v,
+                            // Neither the slot nor the value is a reference:
+                            // a plain store.
+                            Some(slot) if !dynv::is_box(*slot) && !dynv::is_box(v) => *slot = v,
+                            Some(_) => field_write(m, prog, o, field.index(), v),
                             None => fail!(Fault::type_error()),
                         },
                         _ => fail!(not_a(&m.heap, o)),
@@ -946,11 +963,11 @@ fn cold(
         Inst::IntToF32 { dst, src, ty } => {
             r!(dst) = f32_bits(int::value(ty, r!(src)) as f32);
         }
-        Inst::F32ToInt { dst, src, op } => {
-            r!(dst) = t!(float_to_int(f64::from(f32_of(r!(src))), op));
+        Inst::F32ToInt { dst, src, conv } => {
+            r!(dst) = t!(float_to_int(f64::from(f32_of(r!(src))), conv));
         }
-        Inst::F64ToInt { dst, src, op } => {
-            r!(dst) = t!(float_to_int(f64::from_bits(r!(src)), op));
+        Inst::F64ToInt { dst, src, conv } => {
+            r!(dst) = t!(float_to_int(f64::from_bits(r!(src)), conv));
         }
         Inst::F32ToF64 { dst, src } => r!(dst) = f64::from(f32_of(r!(src))).to_bits(),
         Inst::F64ToF32 { dst, src } => {
@@ -1009,6 +1026,37 @@ fn cold(
         Inst::DShr { dst, lhs, rhs, pol } => {
             darith!(DOp::Shr, Hook::Shr, dst, lhs, rhs, pol);
         }
+        Inst::IPow { .. }
+        | Inst::FPow { .. }
+        | Inst::DParamRef { .. }
+        | Inst::DParamRefNamed { .. }
+        | Inst::Raise { .. }
+        | Inst::ErrPayload { .. }
+        | Inst::NewRef { .. }
+        | Inst::DRefIndex { .. }
+        | Inst::DRefProp { .. }
+        | Inst::DBindIndex { .. }
+        | Inst::DBindProp { .. }
+        | Inst::DUnrefIndex { .. }
+        | Inst::DUnrefProp { .. } => return format2(m, stack, prog, cx, inst),
+        Inst::DPow { dst, lhs, rhs, pol } => {
+            darith!(DOp::Pow, Hook::Pow, dst, lhs, rhs, pol);
+        }
+        Inst::DAbs { dst, src, pol } => {
+            let a = r!(src);
+            match t!(dynops::abs(&mut m.heap, pol, a)) {
+                Some(v) => r!(dst) = v,
+                None => {
+                    gc!(0);
+                    hook!(
+                        Hook::Abs,
+                        [a],
+                        Cont::Value(dst.0),
+                        fail!(Fault::type_error())
+                    );
+                }
+            }
+        }
         Inst::DNeg { dst, src, pol } => {
             let a = r!(src);
             match t!(dynops::neg(&mut m.heap, pol, a)) {
@@ -1024,7 +1072,7 @@ fn cold(
                 }
             }
         }
-        Inst::DNot { dst, src, .. } => {
+        Inst::DBitNot { dst, src, .. } => {
             let a = r!(src);
             match t!(dynops::not(&mut m.heap, a)) {
                 Some(v) => r!(dst) = v,
@@ -1087,8 +1135,8 @@ fn cold(
                 }
             }
         }
-        Inst::DTruthy { dst, src } | Inst::DLNot { dst, src } => {
-            let negate = matches!(inst, Inst::DLNot { .. });
+        Inst::DTruthy { dst, src } | Inst::DNot { dst, src } => {
+            let negate = matches!(inst, Inst::DNot { .. });
             let v = r!(src);
             match dynops::truthy(&m.heap, v) {
                 Ok(b) => r!(dst) = u64::from(b != negate),
@@ -1151,8 +1199,17 @@ fn cold(
                 fail!(Fault::type_error());
             }
         }
-        Inst::DGetIndex { dst, obj, key } => {
+        Inst::DGetIndex { dst, obj, key } | Inst::DSepIndex { dst, obj, key } => {
             let (o, k) = (r!(obj), r!(key));
+            if let Inst::DSepIndex { .. } = inst {
+                // Separation (LSB §5.16) of an array or map element; any
+                // other `obj` is exactly `dget_index`.
+                gc!(64);
+                if let Some(v) = t!(refs::dsep_index(m, prog, o, k)) {
+                    r!(dst) = v;
+                    return Step::Next;
+                }
+            }
             match t!(dget_index(m, prog, o, k)) {
                 Lookup::Found(v) => r!(dst) = v,
                 Lookup::Miss(kind) => {
@@ -1178,9 +1235,16 @@ fn cold(
                 );
             }
         }
-        Inst::GetProp { dst, obj, name } => {
+        Inst::GetProp { dst, obj, name } | Inst::DSepProp { dst, obj, name } => {
             let o = r!(obj);
             let id = info.names[name.index()];
+            if let Inst::DSepProp { .. } = inst {
+                gc!(64);
+                if let Some(v) = t!(refs::dsep_prop(m, prog, o, id)) {
+                    r!(dst) = v;
+                    return Step::Next;
+                }
+            }
             match t!(get_prop(m, prog, o, id)) {
                 Some(v) => r!(dst) = v,
                 None => {
@@ -1233,87 +1297,88 @@ fn cold(
             let cv = r!(callee);
             let argc = usize::from(argc);
             let first = base + dst.index() + 1;
-            let target = match m.heap.get(cv) {
-                Some(Object::Func(f)) => Some(f.target),
-                _ => None,
+            if let Some(target) = bind::target_of(m, cv) {
+                return dyn_call(
+                    m,
+                    stack,
+                    prog,
+                    cx,
+                    pc,
+                    (dst.0, cv, target),
+                    (first, argc),
+                    None,
+                );
+            }
+            // A non-callable: the `call` hook with the arguments as an array
+            // (a reference passes its value).
+            if prog.hooks[usize::from(Hook::Call.code())].is_none() {
+                fail!(Fault::type_error());
+            }
+            gc!(argc * 8 + 64);
+            let items: Vec<u64> = stack[first..first + argc]
+                .iter()
+                .map(|&w| m.heap.deref(w))
+                .collect();
+            let arr = t!(coll::new_dyn_array(&mut m.heap, items));
+            hook!(
+                Hook::Call,
+                [cv, arr],
+                Cont::Value(dst.0),
+                fail!(Fault::type_error())
+            );
+        }
+        Inst::DCallShape { dst, callee, shape } => {
+            let cv = r!(callee);
+            let shapes = module_fn_shapes(prog, m.frames[fi].func);
+            let Some(sh) = shapes.get(shape.index()) else {
+                fail!(Fault::type_error());
             };
-            match target {
-                Some(Callable::Func(f)) => {
-                    let Some(c) = prog.func(f) else {
-                        fail!(Fault::type_error());
-                    };
-                    if c.nparams != argc {
-                        fail!(Fault::type_error());
-                    }
-                    charge!();
-                    gc!(0);
-                    let mut args = core::mem::take(&mut m.scratch);
-                    args.clear();
-                    let mut bad = None;
-                    for (i, &ty) in c.regs[..argc].iter().enumerate() {
-                        match conv::from_dyn(&m.heap, prog, ty, stack[first + i]) {
-                            Ok(v) => args.push(v),
-                            Err(e) => {
-                                bad = Some(e);
-                                break;
-                            }
-                        }
-                    }
-                    if let Some(e) = bad {
-                        m.scratch = args;
-                        fail!(e);
-                    }
-                    let pushed = m.push_frame(stack, prog, f, cv, Cont::Dyn(dst.0));
-                    let cb = match pushed {
-                        Ok(cb) => cb,
-                        Err(e) => {
-                            m.scratch = args;
-                            fail!(e);
-                        }
-                    };
-                    stack[cb..cb + argc].copy_from_slice(&args);
-                    m.scratch = args;
-                    m.frames[fi].pc = pc as u32;
-                    return Step::Frame;
+            let n = sh.args.len();
+            let first = base + dst.index() + 1;
+            if let Some(target) = bind::target_of(m, cv) {
+                return dyn_call(
+                    m,
+                    stack,
+                    prog,
+                    cx,
+                    pc,
+                    (dst.0, cv, target),
+                    (first, n),
+                    Some(sh),
+                );
+            }
+            // A non-callable (§5.15): flatten (errors uncharged), then the
+            // `call_shape` hook, or `call` when nothing is named.
+            gc!(n * 8 + 64);
+            let mut flat = core::mem::take(&mut m.flat);
+            let flattened = bind::flatten(m, sh, &stack[first..first + n], &mut flat);
+            let shape_hook = prog.hooks[usize::from(Hook::CallShape.code())].is_some();
+            let call_hook = prog.hooks[usize::from(Hook::Call.code())].is_some();
+            let operands = flattened.and_then(|()| {
+                if shape_hook {
+                    bind::hook_operands(m, prog, &flat).map(|(a, n)| Some((a, Some(n))))
+                } else if call_hook && !flat.named {
+                    let items: Vec<u64> = flat.vals.iter().map(|&w| m.heap.deref(w)).collect();
+                    coll::new_dyn_array(&mut m.heap, items).map(|a| Some((a, None)))
+                } else {
+                    Ok(None)
                 }
-                Some(Callable::Import(i)) => {
-                    let Some(imp) = prog.imports.get(i as usize) else {
-                        fail!(Fault::type_error());
-                    };
-                    if imp.params.len() != argc {
-                        fail!(Fault::type_error());
-                    }
-                    charge!();
-                    m.host_args.clear();
-                    for (k, &ty) in imp.params.iter().enumerate() {
-                        let w = t!(conv::from_dyn(&m.heap, prog, ty, stack[first + k]));
-                        let v = conv::value_of(&m.heap, ty, w);
-                        m.host_args.push(v);
-                    }
-                    let res = t!(m.call_host(prog, i));
-                    r!(dst) = match (res, imp.result) {
-                        (Some(w), Some(ty)) => t!(conv::to_dyn(&mut m.heap, ty, w)),
-                        _ => dynv::NIL,
-                    };
-                }
-                None => {
-                    if prog.hooks[usize::from(Hook::Call.code())].is_none() {
-                        fail!(Fault::type_error());
-                    }
-                    gc!(argc * 8 + 64);
-                    let items: Vec<u64> = stack[first..first + argc].to_vec();
-                    let arr = t!(m.heap.alloc(Object::Array(ArrayObj {
-                        elem: ValType::Dyn,
-                        frozen: false,
-                        items: alloc::sync::Arc::new(items),
-                    })));
-                    hook!(
-                        Hook::Call,
-                        [cv, arr],
-                        Cont::Value(dst.0),
-                        fail!(Fault::type_error())
-                    );
-                }
+            });
+            m.flat = flat;
+            match t!(operands) {
+                Some((arr, Some(named))) => hook!(
+                    Hook::CallShape,
+                    [cv, arr, named],
+                    Cont::Value(dst.0),
+                    fail!(Fault::type_error())
+                ),
+                Some((arr, None)) => hook!(
+                    Hook::Call,
+                    [cv, arr],
+                    Cont::Value(dst.0),
+                    fail!(Fault::type_error())
+                ),
+                None => fail!(Fault::type_error()),
             }
         }
         Inst::DIterNew { dst, src } => {
@@ -1431,10 +1496,7 @@ fn cold(
         }
         Inst::CellSet { cell, src } => {
             let (c, v) = (r!(cell), r!(src));
-            match m.heap.get_mut(c) {
-                Some(Object::Cell(x)) => x.value = v,
-                _ => fail!(not_a(&m.heap, c)),
-            }
+            t!(refs::cell_set(m, c, v));
         }
         Inst::NewStruct { dst, ty } => {
             let t = info.type_refs[ty.index()];
@@ -1542,7 +1604,7 @@ fn cold(
         Inst::IterKey { dst, iter } => r!(dst) = t!(coll::iter_key(&m.heap, r!(iter))),
         Inst::Dup { dst, src } => {
             gc!(64);
-            r!(dst) = t!(dup(m, r!(src)));
+            r!(dst) = t!(refs::dup(m, prog, r!(src)));
         }
         Inst::StrLen { dst, s } => {
             let v = r!(s);
@@ -1660,6 +1722,112 @@ fn cold(
     Step::Next
 }
 
+/// The format 2 instructions without hooks (`ipow`, `fpow`, `dparam_ref*`,
+/// `raise`, `err_payload`, and the reference group), out of line from
+/// [`cold`] so that adding them did not grow it: the helpers `cold` inlines
+/// (map and array access among them) stay inlined.
+#[inline(never)]
+fn format2(m: &mut Machine, stack: &mut [u64], prog: &Program, cx: &Cx<'_>, inst: Inst) -> Step {
+    let Cx { info, base, .. } = *cx;
+    macro_rules! r {
+        ($x:expr) => {
+            stack[base + ($x).index()]
+        };
+    }
+    macro_rules! t {
+        ($e:expr) => {
+            match $e {
+                Ok(v) => v,
+                Err(f) => return Step::Fault(f),
+            }
+        };
+    }
+    macro_rules! fail {
+        ($f:expr) => {
+            return Step::Fault($f)
+        };
+    }
+    macro_rules! gc {
+        ($extra:expr) => {
+            if m.heap.wants_gc($extra) {
+                m.collect(stack, prog);
+            }
+        };
+    }
+    match inst {
+        Inst::IPow { dst, lhs, rhs, op } => {
+            let (a, b) = (r!(lhs), r!(rhs));
+            r!(dst) = t!(int::bin(Bin::Pow, op, a, b));
+        }
+        Inst::FPow { dst, lhs, rhs, ty } => {
+            let (x, y) = (r!(lhs), r!(rhs));
+            r!(dst) = match ty {
+                FloatTy::F32 => f32_bits(pow::ls_pow_f32(f32_of(x), f32_of(y))),
+                FloatTy::F64 => pow::ls_pow(f64::from_bits(x), f64::from_bits(y)).to_bits(),
+            };
+        }
+        Inst::DParamRef { dst, callee, pos } => {
+            let target = bind::target_of(m, r!(callee));
+            r!(dst) = u64::from(bind::param_ref(prog, target, r!(pos) as i64));
+        }
+        Inst::DParamRefNamed { dst, callee, name } => {
+            let target = bind::target_of(m, r!(callee));
+            let id = info.names[name.index()];
+            r!(dst) = u64::from(bind::param_ref_named(
+                prog,
+                target,
+                prog.string(id).as_bytes(),
+            ));
+        }
+        Inst::Raise { src, kind } => fail!(Fault::RaiseWith(kind, r!(src))),
+        Inst::ErrPayload { dst, src } => {
+            r!(dst) = match m.heap.get(r!(src)) {
+                Some(Object::Error(e)) => e.payload,
+                _ => dynv::NIL,
+            };
+        }
+        Inst::NewRef { dst, src } => {
+            gc!(0);
+            r!(dst) = t!(refs::new_ref(m, r!(src)));
+        }
+        Inst::DRefIndex { dst, obj, key } => {
+            gc!(64);
+            let (o, k) = (r!(obj), r!(key));
+            r!(dst) = t!(refs::dref_index(m, prog, o, k));
+        }
+        Inst::DRefProp { dst, obj, name } => {
+            gc!(64);
+            let o = r!(obj);
+            let id = info.names[name.index()];
+            r!(dst) = t!(refs::dref_prop(m, prog, o, id));
+        }
+        Inst::DBindIndex { obj, key, src } => {
+            gc!(64);
+            let (o, k, v) = (r!(obj), r!(key), r!(src));
+            t!(refs::dbind_index(m, prog, o, k, v));
+        }
+        Inst::DBindProp { obj, name, src } => {
+            gc!(64);
+            let (o, v) = (r!(obj), r!(src));
+            let id = info.names[name.index()];
+            t!(refs::dbind_prop(m, prog, o, id, v));
+        }
+        Inst::DUnrefIndex { obj, key } => {
+            gc!(64);
+            let (o, k) = (r!(obj), r!(key));
+            t!(refs::dunref_index(m, prog, o, k));
+        }
+        Inst::DUnrefProp { obj, name } => {
+            gc!(64);
+            let o = r!(obj);
+            let id = info.names[name.index()];
+            t!(refs::dunref_prop(m, prog, o, id));
+        }
+        _ => {}
+    }
+    Step::Next
+}
+
 /// One unit of fuel for the out-of-line instructions (LSB §5.14): `None`
 /// to continue, or the step to take (the `OutOfFuel` trap, or a pending
 /// drop-close that starts before this instruction).
@@ -1673,6 +1841,180 @@ pub(crate) fn charge(m: &mut Machine, stack: &mut Vec<u64>, fi: usize, pc: usize
         Charge::Done => None,
         Charge::Spent => Some(Step::Fault(Fault::Trap(ErrorKind::OutOfFuel))),
         Charge::Close => Some(Step::Unwind(Fault::Throw(dynv::NIL))),
+    }
+}
+
+/// The call shapes of a function (`dcall_shape` operands).
+fn module_fn_shapes(prog: &Program, func: u32) -> &[bytecode_lang::CallShape] {
+    prog.module
+        .function(bytecode_lang::FuncId(func))
+        .map_or(&[], bytecode_lang::Function::shapes)
+}
+
+/// A dynamic call of a function value (`dcall`, `dcall_shape`; LSB §5.15):
+/// flatten the window (with a shape), bind the items to the callee's
+/// parameter list, charge one unit of fuel, build the arguments, and call.
+/// Everything raised before the charge is uncharged; nothing writes `dst`
+/// unless the call returns.
+#[allow(clippy::too_many_arguments)]
+fn dyn_call(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+    cx: &Cx<'_>,
+    pc: usize,
+    (dst, cv, target): (u16, u64, Callable),
+    (first, n): (usize, usize),
+    shape: Option<&bytecode_lang::CallShape>,
+) -> Step {
+    let fi = cx.fi;
+    // Collect before flattening: nothing below collects, so what a spread
+    // allocates (boxed ints of a typed array) stays alive until the
+    // arguments are in the callee's frame.
+    if m.heap.wants_gc(64) {
+        m.collect(stack, prog);
+    }
+    let list = bind::params_of(prog, target);
+    let sig = bind::sig_params(prog, target);
+    let mut flat = core::mem::take(&mut m.flat);
+    let mut bound = core::mem::take(&mut m.bound);
+    let mut args = core::mem::take(&mut m.scratch);
+    let window = &stack[first..first + n];
+    let flattened = match shape {
+        Some(sh)
+            if sh
+                .args
+                .iter()
+                .any(|a| *a != bytecode_lang::ArgKind::Positional) =>
+        {
+            bind::flatten(m, sh, window, &mut flat)
+        }
+        _ => {
+            flat.clear();
+            flat.vals.extend_from_slice(window);
+            Ok(())
+        }
+    };
+    let named = flat.named;
+    let step = 'call: {
+        if let Err(f) = flattened {
+            break 'call Step::Fault(f);
+        }
+        let mask = match bind::bind(
+            prog,
+            list,
+            sig.len(),
+            named.then_some(&flat),
+            flat.vals.len(),
+            &mut bound,
+        ) {
+            Ok(mask) => mask,
+            Err(f) => break 'call Step::Fault(f),
+        };
+        // Step 4: the charge, once the callee is known to take the items.
+        if let Some(step) = charge(m, stack, fi, pc) {
+            break 'call step;
+        }
+        let built = bind::build_args(
+            m,
+            prog,
+            list,
+            sig,
+            &flat.vals,
+            named.then_some(&flat),
+            &bound,
+            mask,
+            &mut args,
+        );
+        if let Err(f) = built {
+            break 'call Step::Fault(f);
+        }
+        match target {
+            Callable::Func(f) => {
+                let cb = match m.push_frame(stack, prog, f, cv, Cont::Dyn(dst)) {
+                    Ok(cb) => cb,
+                    Err(e) => break 'call Step::Fault(e),
+                };
+                if let Some(slots) = stack.get_mut(cb..cb + args.len()) {
+                    slots.copy_from_slice(&args);
+                }
+                m.frames[fi].pc = pc as u32;
+                Step::Frame
+            }
+            Callable::Import(i) => {
+                m.host_args.clear();
+                for (&ty, &w) in sig.iter().zip(args.iter()) {
+                    let v = conv::value_of(&m.heap, ty, w);
+                    m.host_args.push(v);
+                }
+                let res = match m.call_host(prog, i) {
+                    Ok(r) => r,
+                    Err(f) => break 'call Step::Fault(f),
+                };
+                let ty = prog.imports.get(i as usize).and_then(|imp| imp.result);
+                let v = match (res, ty) {
+                    (Some(w), Some(ty)) => match conv::to_dyn(&mut m.heap, ty, w) {
+                        Ok(v) => v,
+                        Err(f) => break 'call Step::Fault(f),
+                    },
+                    _ => dynv::NIL,
+                };
+                stack[cx.base + usize::from(dst)] = v;
+                Step::Next
+            }
+        }
+    };
+    m.flat = flat;
+    m.bound = bound;
+    m.scratch = args;
+    step
+}
+
+/// A struct field word that is a box, read as a value: the box's value when
+/// the field is `dyn` (a reference slot, LSB §5.17); a `ref` field holding a
+/// reference reads the reference itself.
+#[cold]
+#[inline(never)]
+fn field_read(m: &Machine, prog: &Program, o: u64, slot: usize, w: u64) -> u64 {
+    if field_type(m, prog, o, slot) == ValType::Dyn {
+        m.heap.deref(w)
+    } else {
+        w
+    }
+}
+
+/// A store into a struct field when the slot or the value is a box: in a
+/// `dyn` field a reference value stores its value and a reference slot is
+/// written through; any other field stores the word as it is.
+#[cold]
+#[inline(never)]
+fn field_write(m: &mut Machine, prog: &Program, o: u64, slot: usize, v: u64) {
+    let mut v = v;
+    if field_type(m, prog, o, slot) == ValType::Dyn {
+        v = m.heap.deref(v);
+        let old = match m.heap.get(o) {
+            Some(Object::Struct(s)) => s.fields.get(slot).copied().unwrap_or(dynv::NIL),
+            _ => dynv::NIL,
+        };
+        if dynv::is_box(old) && m.heap.set_box(old, v) {
+            return;
+        }
+    }
+    if let Some(Object::Struct(s)) = m.heap.get_mut(o) {
+        if let Some(f) = s.fields.get_mut(slot) {
+            *f = v;
+        }
+    }
+}
+
+/// The declared type of a struct field.
+fn field_type(m: &Machine, prog: &Program, o: u64, slot: usize) -> ValType {
+    match m.heap.get(o) {
+        Some(Object::Struct(s)) => prog
+            .struct_info(s.ty)
+            .and_then(|i| i.fields.get(slot).copied())
+            .unwrap_or(ValType::Dyn),
+        _ => ValType::Dyn,
     }
 }
 
@@ -1715,49 +2057,6 @@ fn concat(m: &mut Machine, parts: &[u64], n: usize) -> Result<u64, Fault> {
     m.heap.alloc(Object::Str(out.into_boxed_slice()))
 }
 
-/// `dup` (LSB §5.10): a shallow copy with a new identity.
-fn dup(m: &mut Machine, v: u64) -> Result<u64, Fault> {
-    let copy = match m.heap.get(v) {
-        None => {
-            return if dynv::is_ref(v) || v == dynv::NIL {
-                Err(coll::null())
-            } else {
-                // A scalar `dyn` value is its own copy.
-                Ok(v)
-            };
-        }
-        Some(Object::Array(a)) => Object::Array(ArrayObj {
-            elem: a.elem,
-            frozen: false,
-            items: alloc::sync::Arc::clone(&a.items),
-        }),
-        Some(Object::Map(mm)) => Object::Map(MapObj {
-            key: mm.key,
-            value: mm.value,
-            frozen: false,
-            store: alloc::sync::Arc::clone(&mm.store),
-        }),
-        Some(Object::Struct(s)) => {
-            if !m.heap.fits(s.fields.len().saturating_mul(8)) {
-                return Err(Fault::Trap(ErrorKind::OutOfMemory));
-            }
-            Object::Struct(StructObj {
-                ty: s.ty,
-                fields: s.fields.clone(),
-            })
-        }
-        Some(Object::Cell(c)) => Object::Cell(CellObj {
-            elem: c.elem,
-            value: c.value,
-        }),
-        // Iterators and coroutines are positions in a computation, not
-        // values: a copy with a new identity has no meaning.
-        Some(Object::Iter(_) | Object::Coro(_)) => return Err(Fault::type_error()),
-        Some(Object::Str(_) | Object::Func(_) | Object::Int(_) | Object::Error(_)) => return Ok(v),
-    };
-    m.heap.alloc(copy)
-}
-
 /// `dget_index`'s built-in cases.
 fn dget_index(m: &mut Machine, prog: &Program, o: u64, k: u64) -> Result<Lookup, Fault> {
     let key_int = conv::dyn_int(&m.heap, k);
@@ -1767,6 +2066,8 @@ fn dget_index(m: &mut Machine, prog: &Program, o: u64, k: u64) -> Result<Lookup,
                 return Ok(Lookup::Miss(ErrorKind::TypeError));
             };
             match usize::try_from(i).ok().and_then(|i| a.items.get(i)) {
+                // A reference slot reads as its value (LSB §5.17).
+                Some(&w) if dynv::is_box(w) && a.elem == ValType::Dyn => (a.elem, m.heap.deref(w)),
                 Some(&w) => (a.elem, w),
                 None => return Ok(Lookup::Miss(ErrorKind::IndexOutOfBounds)),
             }
@@ -1838,7 +2139,10 @@ fn get_prop(m: &mut Machine, prog: &Program, o: u64, name: u32) -> Result<Option
                 if let Ok(i) = info.field_names.binary_search_by_key(&name, |&(n, _)| n) {
                     let slot = usize::from(info.field_names[i].1);
                     let fty = info.fields.get(slot).copied().unwrap_or(ValType::Dyn);
-                    let w = s.fields.get(slot).copied().unwrap_or(0);
+                    let mut w = s.fields.get(slot).copied().unwrap_or(0);
+                    if fty == ValType::Dyn {
+                        w = m.heap.deref(w);
+                    }
                     return conv::to_dyn(&mut m.heap, fty, w).map(Some);
                 }
             }
@@ -1887,11 +2191,7 @@ fn set_prop(m: &mut Machine, prog: &Program, o: u64, name: u32, v: u64) -> Resul
             let slot = usize::from(info.field_names[i].1);
             let fty = info.fields.get(slot).copied().unwrap_or(ValType::Dyn);
             let w = conv::from_dyn(&m.heap, prog, fty, v)?;
-            if let Some(Object::Struct(s)) = m.heap.get_mut(o) {
-                if let Some(f) = s.fields.get_mut(slot) {
-                    *f = w;
-                }
-            }
+            field_write(m, prog, o, slot, w);
             Ok(true)
         }
         Some(Object::Map(mm)) => {
