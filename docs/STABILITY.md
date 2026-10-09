@@ -14,56 +14,39 @@
 </div>
 <br>
 
-As of **`1.0.0`**, the public API of `bvm-lang` is **frozen**. The crate follows [Semantic Versioning](https://semver.org/): the surface listed below will not change in a breaking way within the `1.x` series. A breaking change requires a `2.0.0`.
+`bvm-lang` **2.0** is a new major version: the 1.x instruction set (`Op`, `Chunk`) is gone, replaced by LSB, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang). The 1.x line stays frozen as it was released; it receives no further features.
 
-## What "frozen" covers
+## 2.0.0-alpha.1 is a pre-release
 
-The following are the stable, public surface. Their names, shapes, and documented behavior are the contract:
+Per decision D18 (a crate is frozen only after a real consumer has exercised it), the 2.0 API is **not frozen yet**. It freezes at `2.0.0`, after:
 
-### Types
+1. the coroutine instructions land (`2.0.0-alpha.2`), and
+2. a real consumer (Mox, through the LexerSketch app) has run end to end on it.
 
-- **`Vm`** — `new`, `with_capacity`, `run`.
-- **`Chunk`** — `new`, `emit`, `constant`, `patch`, `code`, `constants`, `registers`, `len`, `is_empty`.
-- **`Op`** — the instruction enum. Marked `#[non_exhaustive]`.
-- **`VmError`** — the error enum. Marked `#[non_exhaustive]`.
-- **Type aliases** — `Reg` (`u16`), `Const` (`u16`), `Addr` (`u32`).
-- **Re-exports** — `Value`, `Unpacked`, `Symbol` from [`value-lang`](https://docs.rs/value-lang) `1.x`.
+Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.1"`).
 
-### Behavior
+## What alpha.1 already promises
 
-- The numeric semantics: one integer/float tower, overflow-checked integer arithmetic, integer division/remainder-by-zero as `DivideByZero`, float division following IEEE-754, boolean-only branch conditions, and the equality rules — all as documented in [`API.md`](./API.md).
-- The safety guarantee: executing any `Chunk`, well-formed or malformed, returns a `Result` and never panics or triggers undefined behavior. `unsafe` is forbidden crate-wide.
-- The register-file sizing rule: a `Chunk` sizes itself to the highest register any emitted instruction names.
+These are properties of the implementation that will not be weakened before or after 2.0.0:
 
-## What is allowed to change within `1.x`
+- **Semantics are LSB's and OPS's.** Every executed instruction behaves as `_lexersketch/specs/LSB.md` and `OPS.md` define it. Where the VM and the specification disagree, the VM has a bug. A change to an instruction's meaning comes with a new LSB format version, never silently.
+- **No panics, no unsafe.** `#![forbid(unsafe_code)]`; no module, however malformed or hostile, can make loading or running panic or read outside the VM. Loading refuses what the interpreter cannot index safely; everything else is a value (`LoadError`, `VmError`).
+- **Bounded work.** With finite `Limits`, every run ends: fuel bounds instructions, the memory budget bounds the heap, depth and stack limits bound frames.
+- **Precise errors.** A failing instruction raises at its own pc without writing its destination; `VmError` carries the OPS/LSB error code, the function, and the pc.
+- **Determinism.** Results do not depend on the platform, the `std` feature, hash seeds, or collection timing: map order is insertion order, float results are IEEE (software and hardware paths are bit-identical), and collection is unobservable except through `heap_*` statistics.
 
-These are **not** breaking under SemVer and may appear in a `1.x` minor release:
+## What may change before 2.0.0
 
-- **New `Op` variants.** `Op` is `#[non_exhaustive]`, so new instructions can be added. Downstream `match`es already require a wildcard arm. Code that constructs only existing variants is unaffected.
-- **New `VmError` variants.** `VmError` is `#[non_exhaustive]` for the same reason.
-- **New inherent methods** on `Vm` or `Chunk` (for example, a pre-sizing constructor, an execution fuel limit, or call-frame support), and **new types** (for example, wiring `gc-lang` or `ir-lang`), added additively.
-- Performance improvements, internal refactors, and documentation changes with no observable behavioral change.
+- The public types' shapes: `Value` and `VmError` are `#[non_exhaustive]` (new variants may appear), `Limits` gains fields only through new methods, `LoadErrorKind` is `#[non_exhaustive]`.
+- The host interface (`Host`, `HostCtx`, `HostError`): host-lang will replace or extend it; the seam is deliberately small.
+- Inspection methods on `Vm` may be reorganised once a consumer's needs are known.
+- The coroutine group will start executing in alpha.2 (today: `VmError::Unsupported`).
+- Fuel accounting may change in its constants (which instructions cost how much) but will keep bounding every loop.
 
-## The `serde` format
+## MSRV
 
-Behind the optional `serde` feature, `Op` and `Chunk` derive `Serialize`/`Deserialize` using serde's default **externally-tagged** encoding. This bakes the `Op` variant names and their field names (`dst`, `src`, `lhs`, `rhs`, `index`, `val`, `target`, `cond`) into the wire format.
+Rust **1.85** (edition 2024). An MSRV increase is a minor-version change after 2.0.0 and is always noted in the CHANGELOG.
 
-The format promise for `1.x`:
+## Dependencies
 
-- A `Chunk` serialized by one `1.x` version deserializes on any `1.x` version **that supports every instruction it contains**.
-- Because new instructions may be added in a `1.x` minor (see above), a chunk that uses a newer instruction will fail to deserialize on an older `1.x`. This is expected; forward compatibility to older versions is not promised.
-- Variant and field identifiers will not be renamed within `1.x`.
-
-The `serde` representation is a convenience for persisting compiled bytecode, not a long-term archival format; if you need one, pin the `bvm-lang` minor version you serialized with.
-
-## What is not covered
-
-- Private modules and items (anything not re-exported from the crate root).
-- The exact `Display` text of `VmError` messages — the variants and their meaning are stable, but the human-readable strings may be reworded.
-- Benchmark numbers and internal performance characteristics (though regressions are tracked; see the CHANGELOG).
-- The MSRV: `1.85`. Raising the MSRV is treated as a minor, not a breaking, change, and will be noted in the CHANGELOG.
-
-<br>
-<hr>
-
-<sub>Copyright &copy; 2026 <strong>James Gober</strong>. Licensed under <code>Apache-2.0 OR MIT</code>.</sub>
+`bytecode-lang` `0.2` (the LSB format). The 1.x dependency on `value-lang` was dropped (see the CHANGELOG and `dev/ROADMAP.md` for why).

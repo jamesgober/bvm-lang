@@ -1,551 +1,854 @@
-<h1 align="center" id="top">
-    <img width="99" alt="Rust logo" src="https://raw.githubusercontent.com/jamesgober/rust-collection/72baabd71f00e14aa9184efcb16fa3deddda3a0a/assets/rust-logo.svg">
-    <br><b>bvm-lang</b><br>
-    <sub><sup>API REFERENCE</sup></sub>
-</h1>
-<div align="center">
-    <sup>
-        <a href="../README.md" title="Project Home"><b>HOME</b></a>
-        <span>&nbsp;│&nbsp;</span>
-        <span>API</span>
-        <span>&nbsp;│&nbsp;</span>
-        <a href="../CHANGELOG.md" title="Changelog"><b>CHANGELOG</b></a>
-    </sup>
-</div>
-<br>
+# bvm-lang &mdash; API Reference
 
-> **Status: stable (`v1.0.0`).** The public surface documented here is **frozen** under Semantic Versioning: no breaking change until a `2.0.0`. See [`STABILITY.md`](./STABILITY.md) for the exact frozen surface and the compatibility promise.
+> Complete reference for every public item in `bvm-lang`, with examples.
+> **Status: 2.0.0-alpha.1, a pre-release.** The surface may still change before
+> `2.0.0` (see [Stability](#stability) and [`STABILITY.md`](./STABILITY.md)).
+> Instruction semantics are those of LSB (`_lexersketch/specs/LSB.md`) and OPS
+> (`_lexersketch/specs/OPS.md`); this file documents the Rust API around them.
 
-`bvm-lang` is a register-based bytecode virtual machine. You assemble a program as a [`Chunk`](#chunk) of [`Op`](#op) instructions over a constant pool, then execute it with a [`Vm`](#vm), which returns a [`Value`](#value). Every register holds one `Value` &mdash; the eight-byte NaN-boxed type from [`value-lang`](https://docs.rs/value-lang). Bytecode is treated as untrusted input: a malformed program yields a typed [`VmError`](#vmerror), never a panic, and the crate forbids `unsafe`.
+<sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
-<br>
+## Table of contents
 
-## Table of Contents
+- [Overview](#overview)
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Concepts](#concepts)
+  - [Registers and values](#registers-and-values)
+  - [What loading checks](#what-loading-checks)
+  - [Errors, traps, and codes](#errors-traps-and-codes)
+  - [Fuel and the other budgets](#fuel-and-the-other-budgets)
+  - [Hooks](#hooks)
+  - [Maps as PHP arrays](#maps-as-php-arrays)
+  - [Memory and collection](#memory-and-collection)
+  - [Instruction coverage](#instruction-coverage)
+- [`Program`](#program)
+  - [`Program::load`](#programload)
+  - [`Program::decode`](#programdecode)
+  - [`Program::module`](#programmodule)
+  - [`Program::export`](#programexport)
+  - [`Program::location`](#programlocation)
+- [`Vm`](#vm)
+  - [`Vm::new`](#vmnew)
+  - [`Vm::with_limits`](#vmwith_limits)
+  - [`Vm::run`](#vmrun)
+  - [`Vm::run_with`](#vmrun_with)
+  - [`Vm::run_export`](#vmrun_export)
+  - [Inspecting values](#inspecting-values)
+  - [Heap and fuel statistics](#heap-and-fuel-statistics)
+- [`Limits`](#limits)
+- [`Value`](#value)
+- [`Obj`](#obj)
+- [`Host`](#host)
+- [`HostCtx`](#hostctx)
+- [`HostError`](#hosterror)
+- [`VmError`](#vmerror)
+- [`LoadError`](#loaderror)
+- [`LoadErrorKind`](#loaderrorkind)
+- [`Location`](#location)
+- [Constants](#constants)
+- [Feature flags](#feature-flags)
+- [Stability](#stability)
 
-- **[Installation](#installation)**
-- **[Quick Start](#quick-start)**
-- **[Execution Model](#execution-model)**
-- **[Public API](#public-api)**
-  - [`Value`, `Unpacked`, `Symbol`](#value)
-  - [`Op`](#op)
-  - [Type aliases: `Reg`, `Const`, `Addr`](#type-aliases)
-  - [`Chunk`](#chunk)
-  - [`Vm`](#vm)
-  - [`VmError`](#vmerror)
-- **[Instruction Reference](#instruction-reference)**
-- **[Semantics](#semantics)**
-- **[Worked Examples](#worked-examples)**
-- **[Feature Flags](#feature-flags)**
-- **[Example Pointers](#example-pointers)**
+## Overview
 
-<br>
-<hr>
+`bvm-lang` executes LSB modules. [`Program::load`](#programload) turns a
+`bytecode_lang::Module` into a checked, import-bound [`Program`](#program); a
+[`Vm`](#vm) runs its functions under [`Limits`](#limits) and returns
+[`Value`](#value)s or a [`VmError`](#vmerror). Host functions, registered in a
+[`Host`](#host), serve the module's imports and, through imports, its hooks.
 
 ## Installation
 
-Add the crate to your `Cargo.toml`:
-
 ```toml
 [dependencies]
-bvm-lang = "0.2"
+bvm-lang = "=2.0.0-alpha.1"
+bytecode-lang = "0.2"
 ```
 
-Or from the terminal:
-
-```bash
-cargo add bvm-lang
-```
-
-The default build depends only on `value-lang` (and its interner). To persist compiled bytecode, enable `serde`:
-
-```toml
-[dependencies]
-bvm-lang = { version = "0.2", features = ["serde"] }
-```
-
-The crate is `no_std`-compatible (it needs `alloc`); disable default features to drop `std`.
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Quick Start
-
-Compile and run `(2 + 3) * 4`:
+## Quick start
 
 ```rust
-use bvm_lang::{Chunk, Op, Vm};
+use bvm_lang::{Host, Program, Value, Vm};
+use bytecode_lang::{ExportItem, Inst, IntOp, IntTy, ModuleBuilder, ValType};
 
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 2 });
-chunk.emit(Op::LoadInt { dst: 1, val: 3 });
-chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 }); // r0 = 2 + 3
-chunk.emit(Op::LoadInt { dst: 1, val: 4 });
-chunk.emit(Op::Mul { dst: 0, lhs: 0, rhs: 1 }); // r0 = 5 * 4
-chunk.emit(Op::Return { src: 0 });
+let mut m = ModuleBuilder::new();
+let mut f = m.function("add", &[ValType::I64, ValType::I64], &[ValType::I64]);
+let r = f.reg(ValType::I64);
+f.emit(Inst::IAdd { dst: r, lhs: f.param(0), rhs: f.param(1), op: IntOp::new(IntTy::I64) });
+f.ret(r);
+let add = m.add_function(f).unwrap();
+m.export("add", ExportItem::Func(add));
 
-let mut vm = Vm::new();
-let result = vm.run(&chunk).expect("well-formed program");
-assert_eq!(result.as_int(), Some(20));
+let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&program);
+assert_eq!(vm.run_export("add", &[Value::Int(40), Value::Int(2)]), Ok(Value::Int(42)));
 ```
 
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Execution Model
-
-`bvm-lang` is a **register machine**. Unlike a stack machine, which pushes and pops an implicit operand stack, every instruction names the registers it reads and writes. A three-address `Add { dst, lhs, rhs }` computes `dst = lhs + rhs` in one instruction, where a stack machine would issue push/push/add/store. Fewer instructions means fewer trips through the dispatch loop.
-
-- **Registers** are the VM's working storage, indexed from zero. A chunk's register file is sized automatically to the highest index any of its instructions names, so you never declare it.
-- **The constant pool** holds `Value`s too large or too varied to encode inline (arbitrary floats, interned symbols). Instructions read them by index with `LoadConst`.
-- **The program counter** walks the code array. Branches set it to an absolute address; every other instruction falls through to the next.
-- **Termination** is explicit: `Return` yields a register's value, `Halt` yields `nil`. Running off the end of the code is a fault, not an implicit return.
-
-A `Vm` owns the register file and reuses it across runs, so executing many chunks (or the same chunk many times) does not reallocate. A `Chunk` is immutable execution input and holds no VM state, so one chunk can be run on several threads by separate `Vm`s.
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Public API
-
-<h3 id="value"><code>Value</code>, <code>Unpacked</code>, <code>Symbol</code></h3>
-
-The runtime value type is re-exported from [`value-lang`](https://docs.rs/value-lang). A [`Value`] is an eight-byte, `Copy` NaN-boxed handle that represents one of five kinds: `nil`, a boolean, a 32-bit integer, a 64-bit float, or an interned [`Symbol`]. Every register holds one.
-
-Construct values with the associated functions, and read them back with the `as_*` accessors (which return `Option`) or by matching on [`Unpacked`]:
-
-```rust
-use bvm_lang::{Unpacked, Value};
-
-let a = Value::int(7);
-let b = Value::float(2.5);
-let c = Value::bool(true);
-let d = Value::nil();
-
-assert_eq!(a.as_int(), Some(7));
-assert_eq!(b.as_float(), Some(2.5));
-
-// Match on every kind at once.
-assert_eq!(b.unpack(), Unpacked::Float(2.5));
-```
-
-| Constructor | Kind |
-| --- | --- |
-| `Value::nil()` | the unit value |
-| `Value::bool(b)` | a boolean |
-| `Value::int(i32)` | a 32-bit signed integer |
-| `Value::float(f64)` | a double-precision float |
-| `Value::sym(Symbol)` | an interned symbol handle |
-
-See the [`value-lang` documentation](https://docs.rs/value-lang) for the full accessor and predicate set. `bvm-lang` produces and consumes these values but does not add methods to them.
-
-<br>
-
-<h3 id="op"><code>Op</code></h3>
-
-A single decoded instruction. `Op` is `Copy` and occupies 8 bytes; a program is a slice of them. The variants group into data movement, arithmetic, comparison, logic, control flow, and termination. Fields are register indices ([`Reg`](#type-aliases)), a constant index ([`Const`](#type-aliases)), a branch target ([`Addr`](#type-aliases)), or an inline immediate.
-
-Construct instructions directly with struct-variant syntax and hand them to [`Chunk::emit`](#chunk):
-
-```rust
-use bvm_lang::{Chunk, Op};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 10 });
-chunk.emit(Op::LoadInt { dst: 1, val: 4 });
-chunk.emit(Op::Sub { dst: 0, lhs: 0, rhs: 1 }); // r0 = 10 - 4
-chunk.emit(Op::Return { src: 0 });
-```
-
-The full variant list and per-instruction semantics are in the [Instruction Reference](#instruction-reference) below. `Op` is `#[non_exhaustive]`: future minor versions may add instructions, so a `match` over it needs a wildcard arm.
-
-<br>
-
-<h3 id="type-aliases">Type aliases: <code>Reg</code>, <code>Const</code>, <code>Addr</code></h3>
-
-Three aliases name the roles operands play. They document intent at call sites; all three are plain integers.
-
-| Alias | Underlying | Role |
-| --- | --- | --- |
-| `Reg` | `u16` | a register index (up to 65 536 registers per chunk) |
-| `Const` | `u16` | a constant-pool index, used by `LoadConst` |
-| `Addr` | `u32` | an absolute instruction address, used as a branch target |
-
-```rust
-use bvm_lang::{Addr, Const, Reg};
-
-let dst: Reg = 0;
-let index: Const = 3;
-let target: Addr = 12;
-```
-
-<br>
-
-<h3 id="chunk"><code>Chunk</code></h3>
-
-An assembled program: its instructions, its constant pool, and the size of the register file they operate on. A `Chunk` is what you hand to [`Vm::run`](#vm). It derives `Clone`, `Debug`, `Default`, and `PartialEq` (and `Serialize`/`Deserialize` under the `serde` feature).
-
-The register-file size is tracked for you: every emitted instruction widens the file to cover the highest register it names, so a chunk built through this API can never address a register outside its own file.
-
-#### Constructors
-
-**`Chunk::new() -> Chunk`** &mdash; an empty chunk: no instructions, no constants, a zero-width register file.
-
-```rust
-use bvm_lang::Chunk;
-
-let chunk = Chunk::new();
-assert!(chunk.is_empty());
-assert_eq!(chunk.registers(), 0);
-```
-
-#### Building
-
-**`emit(&mut self, op: Op) -> Addr`** &mdash; append `op` and return its address (its index in the code array). The address is an [`Addr`](#type-aliases), so it feeds straight into a `Jump`/`patch` target with no cast. That address is what a branch targets and what [`patch`](#patch) rewrites.
-
-```rust
-use bvm_lang::{Chunk, Op};
-
-let mut chunk = Chunk::new();
-let addr = chunk.emit(Op::LoadInt { dst: 0, val: 41 });
-assert_eq!(addr, 0);
-assert_eq!(chunk.registers(), 1); // naming r0 sized the file to one slot
-```
-
-**`constant(&mut self, value: Value) -> Option<u16>`** &mdash; add `value` to the constant pool and return its index for [`LoadConst`](#instruction-reference). Constants are not deduplicated. Returns `None` only if the pool is already at its 65 536-entry maximum.
-
-```rust
-use bvm_lang::{Chunk, Op, Value};
-
-let mut chunk = Chunk::new();
-let k = chunk.constant(Value::float(3.5)).expect("pool has room");
-chunk.emit(Op::LoadConst { dst: 0, index: k });
-```
-
-**`patch(&mut self, addr: Addr, op: Op) -> bool`** &mdash; overwrite the instruction at `addr`, typically to fill in a forward branch whose target was unknown when it was first emitted. Returns `true` if `addr` was in range. The register file is re-derived after a patch.
-
-The forward-branch pattern &mdash; emit a placeholder, remember its address, patch it once the landing is known:
-
-```rust
-use bvm_lang::{Chunk, Op};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadBool { dst: 0, val: false });
-let branch = chunk.emit(Op::JumpIfFalse { cond: 0, target: 0 }); // target unknown
-chunk.emit(Op::LoadInt { dst: 1, val: 1 }); // skipped when r0 is false
-let landing = chunk.emit(Op::Return { src: 1 }); // emit returns the landing address
-assert!(chunk.patch(branch, Op::JumpIfFalse { cond: 0, target: landing }));
-```
-
-#### Inspection
-
-| Method | Returns | Meaning |
-| --- | --- | --- |
-| `code(&self)` | `&[Op]` | the instructions, in address order |
-| `constants(&self)` | `&[Value]` | the constant pool |
-| `registers(&self)` | `u16` | register-file size (highest index named + 1) |
-| `len(&self)` | `usize` | number of instructions |
-| `is_empty(&self)` | `bool` | whether there are no instructions |
-
-<br>
-
-<h3 id="vm"><code>Vm</code></h3>
-
-The interpreter. A `Vm` owns a register file that is reset and reused on every run, so a long-lived instance executing many chunks reaches an allocation-free steady state.
-
-#### Constructors
-
-**`Vm::new() -> Vm`** &mdash; a VM with an empty register file. The file grows to fit the first chunk and is reused thereafter.
-
-**`Vm::with_capacity(registers: u16) -> Vm`** &mdash; a VM whose register file is pre-allocated for at least `registers` slots, avoiding a growth reallocation on the first run of a chunk that size.
-
-```rust
-use bvm_lang::Vm;
-
-let mut vm = Vm::new();
-let mut primed = Vm::with_capacity(64);
-```
-
-#### Execution
-
-**`run(&mut self, chunk: &Chunk) -> Result<Value, VmError>`** &mdash; execute `chunk` from its first instruction and return the value it yields. A `Return` yields its register's value; a `Halt` yields `nil`. The register file is reset to `nil` before execution, so a run never observes residue from a previous one.
-
-```rust
-use bvm_lang::{Chunk, Op, Vm};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 6 });
-chunk.emit(Op::LoadInt { dst: 1, val: 7 });
-chunk.emit(Op::Mul { dst: 0, lhs: 0, rhs: 1 });
-chunk.emit(Op::Return { src: 0 });
-
-let mut vm = Vm::new();
-assert_eq!(vm.run(&chunk).unwrap().as_int(), Some(42));
-```
-
-Faults are returned, not panicked:
-
-```rust
-use bvm_lang::{Chunk, Op, Vm, VmError};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 1 });
-chunk.emit(Op::LoadInt { dst: 1, val: 0 });
-chunk.emit(Op::Div { dst: 0, lhs: 0, rhs: 1 });
-chunk.emit(Op::Return { src: 0 });
-
-let mut vm = Vm::new();
-assert_eq!(vm.run(&chunk), Err(VmError::DivideByZero));
-```
-
-One VM, many chunks &mdash; the register file is reused across calls:
-
-```rust
-use bvm_lang::{Chunk, Op, Vm};
-
-let mut vm = Vm::new();
-for n in 1..=3 {
-    let mut chunk = Chunk::new();
-    chunk.emit(Op::LoadInt { dst: 0, val: n });
-    chunk.emit(Op::Return { src: 0 });
-    assert_eq!(vm.run(&chunk).unwrap().as_int(), Some(n));
-}
-```
-
-<br>
-
-<h3 id="vmerror"><code>VmError</code></h3>
-
-Every way a run can fail. `VmError` derives `Debug`, `Clone`, `PartialEq`, `Eq`, implements `Display`, and implements `core::error::Error`. It is `#[non_exhaustive]`.
-
-Errors split into two groups. **Runtime faults** come from executing a well-formed instruction against operands that break its contract. **Structural faults** mean the bytecode itself is malformed &mdash; a correct compiler never emits them, but corrupt or hostile input can, and the VM reports rather than trusts them.
-
-| Variant | Group | Raised when |
-| --- | --- | --- |
-| `TypeMismatch { op: &'static str }` | runtime | an operand has the wrong kind (e.g. adding a bool, branching on a non-bool). `op` names the operation. |
-| `DivideByZero` | runtime | integer `Div`/`Rem` with a zero divisor. |
-| `IntegerOverflow` | runtime | a checked integer operation overflowed `i32`. |
-| `BadRegister(u16)` | structural | a register index addressed a slot outside the file. |
-| `BadConstant(u16)` | structural | a `LoadConst` referenced a missing pool slot. |
-| `BadJump(u32)` | structural | a branch target was outside the code. |
-| `NoTerminator` | structural | control reached the end of the code without `Return`/`Halt`. |
-
-Handling faults explicitly:
-
-```rust
-use bvm_lang::{Chunk, Op, Vm, VmError};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadBool { dst: 0, val: true });
-chunk.emit(Op::LoadInt { dst: 1, val: 1 });
-chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 });
-chunk.emit(Op::Return { src: 0 });
-
-match Vm::new().run(&chunk) {
-    Ok(value) => println!("result: {value:?}"),
-    Err(VmError::TypeMismatch { op }) => println!("`{op}` got a bad operand"),
-    Err(other) => println!("failed: {other}"),
-}
-```
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Instruction Reference
-
-All operands are register indices unless noted. `dst` is written; `lhs`/`rhs`/`src`/`cond` are read.
-
-### Data movement
-
-| Instruction | Effect |
-| --- | --- |
-| `Move { dst, src }` | `dst = src` |
-| `LoadConst { dst, index }` | `dst = constants[index]` |
-| `LoadNil { dst }` | `dst = nil` |
-| `LoadBool { dst, val }` | `dst = val` (inline `bool`) |
-| `LoadInt { dst, val }` | `dst = val` (inline `i32`) |
-
-### Arithmetic (numeric operands)
-
-| Instruction | Effect | Faults |
-| --- | --- | --- |
-| `Add { dst, lhs, rhs }` | `dst = lhs + rhs` | `IntegerOverflow`, `TypeMismatch` |
-| `Sub { dst, lhs, rhs }` | `dst = lhs - rhs` | `IntegerOverflow`, `TypeMismatch` |
-| `Mul { dst, lhs, rhs }` | `dst = lhs * rhs` | `IntegerOverflow`, `TypeMismatch` |
-| `Div { dst, lhs, rhs }` | `dst = lhs / rhs` | `DivideByZero`, `IntegerOverflow`, `TypeMismatch` |
-| `Rem { dst, lhs, rhs }` | `dst = lhs % rhs` | `DivideByZero`, `IntegerOverflow`, `TypeMismatch` |
-| `Neg { dst, src }` | `dst = -src` | `IntegerOverflow`, `TypeMismatch` |
-
-### Comparison (numeric operands, boolean result)
-
-| Instruction | Effect |
-| --- | --- |
-| `Eq { dst, lhs, rhs }` | `dst = (lhs == rhs)` |
-| `Ne { dst, lhs, rhs }` | `dst = (lhs != rhs)` |
-| `Lt { dst, lhs, rhs }` | `dst = (lhs < rhs)` |
-| `Le { dst, lhs, rhs }` | `dst = (lhs <= rhs)` |
-| `Gt { dst, lhs, rhs }` | `dst = (lhs > rhs)` |
-| `Ge { dst, lhs, rhs }` | `dst = (lhs >= rhs)` |
-
-`Eq`/`Ne` accept any operands (numbers compare by value; other kinds compare within their kind). The four orderings require numeric operands and fault with `TypeMismatch` otherwise.
-
-### Logic
-
-| Instruction | Effect | Faults |
-| --- | --- | --- |
-| `Not { dst, src }` | `dst = !src` (`src` must be a bool) | `TypeMismatch` |
-
-### Control flow (targets are absolute addresses)
-
-| Instruction | Effect |
-| --- | --- |
-| `Jump { target }` | `pc = target` |
-| `JumpIfTrue { cond, target }` | `pc = target` if `cond` is `true`, else fall through |
-| `JumpIfFalse { cond, target }` | `pc = target` if `cond` is `false`, else fall through |
-
-`cond` must be a boolean; otherwise `TypeMismatch`. A target outside the code is `BadJump`.
-
-### Termination
-
-| Instruction | Effect |
-| --- | --- |
-| `Return { src }` | stop, yielding the value in `src` |
-| `Halt` | stop, yielding `nil` |
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Semantics
-
-**Numeric tower.** Arithmetic and ordering treat integers and floats as one tower. Two integers produce an integer; if either operand is a float, the result is a float. Integer results are **overflow-checked** &mdash; a fault is reported rather than a silent wrap.
-
-```rust
-use bvm_lang::{Chunk, Op, Vm, VmError};
-
-// i32::MAX + 1 does not wrap; it faults.
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: i32::MAX });
-chunk.emit(Op::LoadInt { dst: 1, val: 1 });
-chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 });
-chunk.emit(Op::Return { src: 0 });
-assert_eq!(Vm::new().run(&chunk), Err(VmError::IntegerOverflow));
-```
-
-**Division by zero.** Integer `Div`/`Rem` by zero is a `DivideByZero` fault. Float division by zero follows IEEE-754 and yields an infinity or NaN, not a fault.
-
-**Mixed operands promote.** An integer combined with a float widens to float:
-
-```rust
-use bvm_lang::{Chunk, Op, Value, Vm};
-
-// 1 + 0.5 = 1.5
-let mut chunk = Chunk::new();
-let half = chunk.constant(Value::float(0.5)).unwrap();
-chunk.emit(Op::LoadInt { dst: 0, val: 1 });
-chunk.emit(Op::LoadConst { dst: 1, index: half });
-chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 });
-chunk.emit(Op::Return { src: 0 });
-assert_eq!(Vm::new().run(&chunk).unwrap().as_float(), Some(1.5));
-```
-
-**Equality.** `Eq` compares numbers by value across int and float (`1` equals `1.0`), and compares other kinds within their kind (`nil` to `nil`, bool to bool, symbol to symbol) &mdash; never equal across kinds. Float equality is IEEE-754, so `NaN` equals nothing, including itself.
-
-**Conditions are booleans.** `Not`, `JumpIfTrue`, and `JumpIfFalse` require a boolean operand and fault with `TypeMismatch` on anything else. There is no implicit truthiness.
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Worked Examples
-
-### A counted loop
-
-Sum `1..=5` with a back-edge and a back-patched exit branch (result: `15`):
-
-```rust
-use bvm_lang::{Chunk, Op, Vm};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 0 }); // sum
-chunk.emit(Op::LoadInt { dst: 1, val: 1 }); // i
-chunk.emit(Op::LoadInt { dst: 2, val: 5 }); // limit
-chunk.emit(Op::LoadInt { dst: 3, val: 1 }); // step
-let top = chunk.emit(Op::Le { dst: 4, lhs: 1, rhs: 2 });
-let exit_branch = chunk.emit(Op::JumpIfFalse { cond: 4, target: 0 });
-chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 }); // sum += i
-chunk.emit(Op::Add { dst: 1, lhs: 1, rhs: 3 }); // i += 1
-chunk.emit(Op::Jump { target: top });           // back-edge (top is already an Addr)
-let exit = chunk.emit(Op::Return { src: 0 });
-chunk.patch(exit_branch, Op::JumpIfFalse { cond: 4, target: exit });
-
-assert_eq!(Vm::new().run(&chunk).unwrap().as_int(), Some(15));
-```
-
-### A branch on a comparison
-
-`if 3 == 4 then 10 else 20` (result: `20`):
-
-```rust
-use bvm_lang::{Chunk, Op, Vm};
-
-let mut chunk = Chunk::new();
-chunk.emit(Op::LoadInt { dst: 0, val: 3 });
-chunk.emit(Op::LoadInt { dst: 1, val: 4 });
-chunk.emit(Op::Eq { dst: 2, lhs: 0, rhs: 1 });      // r2 = (3 == 4) = false
-chunk.emit(Op::JumpIfFalse { cond: 2, target: 6 }); // false -> else
-chunk.emit(Op::LoadInt { dst: 0, val: 10 });
-chunk.emit(Op::Return { src: 0 });
-chunk.emit(Op::LoadInt { dst: 0, val: 20 });        // address 6
-chunk.emit(Op::Return { src: 0 });
-
-assert_eq!(Vm::new().run(&chunk).unwrap().as_int(), Some(20));
-```
-
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
-
-## Feature Flags
-
-| Feature | Default | Effect |
-| --- | --- | --- |
-| `std` | yes | links `std`; forwards `std` to `value-lang`. Disable for `no_std` (the crate still needs `alloc`). |
-| `serde` | no | derives `Serialize`/`Deserialize` for `Op` and `Chunk`, so compiled bytecode can be persisted and reloaded. |
-
-With `serde`, a chunk round-trips through any serde format:
+## Concepts
+
+### Registers and values
+
+Every register is a 64-bit word; its declared LSB type gives it meaning.
+Integers are stored sign- or zero-extended and read back narrowed to their
+type; `f32` registers hold the float's bits; `bool` holds 0 or 1; `char` a
+scalar value. `str`, `ref t`, and `dyn` registers share one encoding (LSB
+§2.1), in which the zero word is `nil`:
+
+| `dyn` kind | Encoding |
+|---|---|
+| `nil`, `bool`, `char` | immediates |
+| `int` | inline when in [-2^48, 2^48), otherwise a boxed heap object; always 64-bit to the program |
+| `float` | the `f64` bits offset by 2^49; NaN canonicalised (OPS §4) |
+| heap objects | a 32-bit slot index and a 16-bit generation |
+
+At the API boundary a register becomes a [`Value`](#value): signed integers
+and `dyn` ints as `Value::Int`, unsigned integers as `Value::UInt`, `f64` and
+`dyn` floats as `Value::Float`, `f32` as `Value::F32`, heap objects as
+`Value::Obj`. Arguments convert the other way and must fit their parameter's
+type (`VmError::ArgumentType` otherwise).
+
+Conversions between `dyn` and typed registers (`to_dyn`, `from_dyn`, and every
+place LSB applies their rules: `dcall` arguments and results, `set_prop` on
+fields, dynamic indexing of typed collections) follow LSB §5.7. One reading
+is worth stating: `from_dyn` into `str` accepts `nil` as well as strings,
+because `nil` is a value of type `str` (LSB §2.1) and `to_dyn` of a `nil`
+string must convert back.
+
+### What loading checks
+
+LSB's verifier arrives with bytecode-lang 0.5. Until then (and for modules
+that skip it), [`Program::load`](#programload) proves in one linear pass
+every fact the interpreter indexes by, so the dispatch loop never meets an
+out-of-range index:
+
+- every register operand, including every register of every call window
+  (`call`, `dcall`, `make_closure`, `str_concat_n`, `str_slice`, ...), is
+  inside the function's frame;
+- every constant, function, import, global, jump-table, name, type, capture,
+  and string index is in range; every branch, table, and handler target is an
+  instruction;
+- the last instruction cannot fall through; direct calls pass their callee's
+  parameter count and never target a function with captures;
+- `new_struct`/`new_array`/`new_map`/`new_cell` name types of that kind;
+  `overflow = promote` appears only on instructions writing a `dyn` register;
+  `from_dyn` never targets `ref`; bit casts use 32- or 64-bit integers;
+- handlers are non-empty, in range, with `dyn` catch registers, and no tail
+  call lies inside one;
+- struct parents are structs whose fields prefix the child's, chains are
+  acyclic and at most [`MAX_INHERITANCE_DEPTH`](#constants) deep; aggregate
+  constants refer only to earlier ones and nest at most
+  [`MAX_CONST_DEPTH`](#constants) deep;
+- hook callees and the start function have the signatures LSB requires;
+  every import has a registered host function.
+
+It does **not** check the verifier's type rules. A module that, say, adds two
+`str` registers with `iadd` loads and runs; it computes a meaningless word,
+and heap instructions given such a word raise `TypeError` or
+`NullReference`. Memory safety never depends on types: every heap access
+checks the object's kind and liveness.
+
+### Errors, traps, and codes
+
+A failing instruction **raises** at its own pc without writing its
+destination (LSB §4.3). The VM searches that function's handlers in order;
+the first covering the pc receives the error value (a `dyn` of kind `error`,
+or the thrown value) and execution continues at its target. Otherwise the
+frame is popped and the search continues at the caller's call instruction.
+An error leaving the entry frame ends the run with
+[`VmError::Raised`](#vmerror) (runtime errors: kind, function, and pc of the
+raising instruction) or [`VmError::Thrown`](#vmerror) (any other thrown
+value).
+
+**Traps** abort without visiting handlers: `OutOfFuel` (E0107),
+`OutOfMemory` (E0106), `Unreachable` (E0109), and any OPS error under policy
+`trap` (same code as the error). Codes are those of
+`bytecode_lang::ErrorKind`; `err_code` reads them from caught error values.
+
+### Fuel and the other budgets
+
+One unit of fuel is charged at every `safepoint`, every call-family
+instruction (`call`, `call_indirect`, `call_import`, `tail_call`,
+`tail_call_indirect`, `dcall`, and every hook invocation), every taken branch
+to a target at or before the branching instruction (`jmp`, `jmp_if`,
+`jmp_if_not`, `switch`), and every handler entry. Between two charges a run
+executes at most one function's length of instructions, so fuel bounds total
+work even for modules a verifier would reject for lacking safepoints.
+
+[`Limits`](#limits) also bounds heap bytes (the `OutOfMemory` trap; large
+buffers are checked before they are requested), call depth (hook frames
+included), and register-stack slots (both raise the catchable
+`StackOverflow`, E0105, at the call).
+
+### Hooks
+
+The dynamic instructions take a built-in fast path (numbers, strings,
+collections, structs) and otherwise call the module's hook for that
+operation (LSB §5.8), bound to a module function or an import. A function
+hook runs as a call (a frame, fuel, depth); an import hook runs the host
+function. Results are converted as LSB states: `eq`, `lt`, `le`, `truthy`, and
+`has_prop` must return a `dyn` bool (`TypeError` otherwise; `dne` negates),
+`len` a `dyn` int, `iter` an array, map, or iterator. With no hook bound, each
+instruction has its LSB fallback: `TypeError` for arithmetic, identity for
+`deq`, the built-in rule for truthiness, `IndexOutOfBounds`/`KeyNotFound` for
+indexing misses, `UndefinedProperty` for properties, `false` for `has_prop`.
+
+### Maps as PHP arrays
+
+A map keeps insertion order. Setting an existing key updates it in place; a
+new key goes last. `map_push` inserts under the next integer key, one more
+than the largest integer key ever inserted (PHP 8.3: after only `-5`, the
+next is `-4`); deletions never lower it, and exhausting `i64` (or the key
+type) raises `ArithOverflow`. Iteration follows the live map: deleted
+entries are skipped and appended ones visited; iterating a `dup` gives PHP's
+value semantics, at O(1) cost until either copy is written. Keys compare per
+LSB §2.4: integers, bools, and chars by value, strings bytewise, other objects
+by identity, floats by bits with `-0.0` folded into `+0.0` and one NaN, and
+for `dyn` keys the kind is part of the key (`1` and `1.0` differ).
+
+While a map's keys are exactly `0, 1, 2, ...` with nothing deleted it is
+*packed*: no hash index exists and lookups are a bounds check.
+
+### Memory and collection
+
+Objects live in the VM's heap until unreachable. Collection is a mark and
+sweep over the exact roots (reference-typed registers of every frame,
+running closures, globals, and the constant and name caches). It runs only
+at safepoints (`safepoint`, calls, and allocating instructions, LSB §5.9) and
+only once as many bytes have been allocated as survived the previous
+collection, so its total cost stays proportional to allocation. A
+[`Value::Obj`](#obj) returned by a run stays valid until the next run on the
+same VM; a handle to a collected object reads as `nil` (slots are
+generation-checked and retired before a generation could wrap, so a stale
+handle never aliases a new object).
+
+### Instruction coverage
+
+| LSB group | Opcodes | 2.0.0-alpha.1 |
+|---|---|---|
+| Moves, constants, globals (§5.1) | `0x00`-`0x0A` | implemented |
+| Integer arithmetic and comparison (§5.2) | `0x10`-`0x26` | implemented, every policy |
+| Float arithmetic and comparison (§5.3) | `0x30`-`0x47` | implemented |
+| Booleans, chars, identity (§5.4) | `0x50`-`0x5A` | implemented |
+| Conversions (§5.5) | `0x60`-`0x6E` | implemented |
+| Dynamic arithmetic and comparison (§5.6) | `0x70`-`0x85`, `0x94` | implemented, `promote` included |
+| Dynamic values, properties, calls (§5.7) | `0x86`-`0x93` | implemented |
+| Control flow, calls, exceptions (§5.9) | `0xA0`-`0xAE` | implemented |
+| Closures and cells (§5.10) | `0xB0`-`0xB4` | implemented |
+| Typed heap objects (§5.10) | `0xC0`-`0xD4` | implemented |
+| Strings (§5.11) | `0xE0`-`0xE6` | implemented |
+| Coroutines (§5.13) | `0xF0`-`0xFC` | **unsupported**: loads, ends the run with `VmError::Unsupported` (alpha.2) |
+| Hooks (§5.8) | codes 0-27 | all but `spawn` (27, coroutines) |
+
+## `Program`
 
 ```rust,ignore
-let json = serde_json::to_string(&chunk)?;
-let restored: bvm_lang::Chunk = serde_json::from_str(&json)?;
+pub struct Program { /* private */ }
 ```
 
-The serialized form uses serde's default externally-tagged encoding, so the `Op` variant names and field names (`dst`, `src`, `lhs`, `rhs`, `index`, `val`, `target`, `cond`) are part of the format. That representation is stable within the `1.x` series for the instructions available at serialization time; a newer instruction added in a later `1.x` will not deserialize on an older version. See [`STABILITY.md`](./STABILITY.md).
+A loaded module: checked, bound to its host functions, and ready to run.
+Immutable; `Send` and `Sync`, so one program can serve VMs on many threads.
 
-<hr>
-<br>
-<a href="#top">&uarr; <b>TOP</b></a>
-<br>
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::ModuleBuilder;
 
-## Example Pointers
+let mut m = ModuleBuilder::new();
+let mut f = m.function("f", &[], &[]);
+f.ret_void();
+let id = m.add_function(f).unwrap();
+let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+std::thread::scope(|s| {
+    for _ in 0..4 {
+        let program = &program;
+        s.spawn(move || assert!(Vm::new(program).run(id, &[]).is_ok()));
+    }
+});
+```
 
-Runnable programs in [`examples/`](../examples):
+### `Program::load`
 
-- `expression.rs` &mdash; assemble and evaluate `(2 + 3) * 4 - 10 / 2`. Run: `cargo run --example expression`.
-- `fibonacci.rs` &mdash; iterative Fibonacci with a loop and a back-patched exit branch. Run: `cargo run --example fibonacci`.
-- `errors.rs` &mdash; how each `VmError` surfaces (divide-by-zero, overflow, type mismatch, missing terminator). Run: `cargo run --example errors`.
+```rust,ignore
+pub fn load(module: Module, host: &Host) -> Result<Program, LoadError>
+```
 
-<br>
-<hr>
+Checks `module` (see [What loading checks](#what-loading-checks)) and binds
+each import to the function `host` registers under the import's module and
+name. Linear in the module's size.
 
-<sub>Copyright &copy; 2026 <strong>James Gober</strong>. Licensed under <code>Apache-2.0 OR MIT</code>.</sub>
+**Errors.** A [`LoadError`](#loaderror) naming the first problem, with the
+function and pc where it applies.
+
+```rust
+use bvm_lang::{Host, LoadErrorKind, Program};
+use bytecode_lang::{Inst, ModuleBuilder};
+
+let mut m = ModuleBuilder::new();
+let mut f = m.function("f", &[], &[]);
+f.emit(Inst::Nop {}); // falls off the end
+m.add_function(f).unwrap();
+let err = Program::load(m.finish().unwrap(), &Host::new()).unwrap_err();
+assert_eq!(err.kind(), &LoadErrorKind::FallsThrough);
+assert_eq!(err.to_string(), "f0 @0: last instruction falls through");
+```
+
+### `Program::decode`
+
+```rust,ignore
+pub fn decode(bytes: &[u8], host: &Host) -> Result<Program, LoadError>
+```
+
+Decodes LSB bytes with bytecode-lang's default budgets, then loads.
+
+**Errors.** [`LoadErrorKind::Decode`](#loaderrorkind) for malformed bytes;
+otherwise as [`load`](#programload).
+
+```rust
+use bvm_lang::{Host, LoadErrorKind, Program};
+use bytecode_lang::ModuleBuilder;
+
+let bytes = bytecode_lang::encode(&ModuleBuilder::new().finish().unwrap());
+assert!(Program::decode(&bytes, &Host::new()).is_ok());
+let err = Program::decode(&bytes[..10], &Host::new()).unwrap_err();
+assert!(matches!(err.kind(), LoadErrorKind::Decode(_)));
+```
+
+### `Program::module`
+
+```rust,ignore
+pub fn module(&self) -> &Module
+```
+
+The module the program was loaded from.
+
+```rust
+use bvm_lang::{Host, Program};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+assert!(p.module().functions().is_empty());
+```
+
+### `Program::export`
+
+```rust,ignore
+pub fn export(&self, name: &str) -> Option<FuncId>
+```
+
+The function exported under `name` (globals and types exported under that
+name are not functions and give `None`).
+
+```rust
+use bvm_lang::{Host, Program};
+use bytecode_lang::{ExportItem, ModuleBuilder};
+
+let mut m = ModuleBuilder::new();
+let mut f = m.function("main", &[], &[]);
+f.ret_void();
+let id = m.add_function(f).unwrap();
+m.export("main", ExportItem::Func(id));
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+assert_eq!(p.export("main"), Some(id));
+assert_eq!(p.export("other"), None);
+```
+
+### `Program::location`
+
+```rust,ignore
+pub fn location(&self, func: FuncId, pc: u32) -> Option<Location<'_>>
+```
+
+The source location of an instruction, from the module's line table: the row
+with the greatest pc at or below `pc`. Pairs with
+[`VmError::location`](#vmerror).
+
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::{Inst, ModuleBuilder};
+
+let mut m = ModuleBuilder::new();
+let file = m.string("app.mox");
+let mut f = m.function("main", &[], &[]);
+f.set_location(file, 12, 5);
+f.emit(Inst::Unreachable {});
+let id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let err = Vm::new(&p).run(id, &[]).unwrap_err();
+let (func, pc) = err.location().unwrap();
+assert_eq!(p.location(func, pc).unwrap().to_string(), "app.mox:12:5");
+```
+
+## `Vm`
+
+```rust,ignore
+pub struct Vm<'p> { /* private */ }
+```
+
+An instance of a [`Program`](#program): its heap, globals, default limits, and
+pooled register stack. The first run initialises the globals from their
+initialisers and runs the module's start function (if either fails, the next
+run tries again); later runs see the globals and heap objects earlier runs
+left. A `Vm` is `Send`.
+
+### `Vm::new`
+
+```rust,ignore
+pub fn new(program: &'p Program) -> Vm<'p>
+```
+
+An instance with [`Limits::new`](#limits).
+
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let vm = Vm::new(&p);
+assert_eq!(vm.limits(), bvm_lang::Limits::new());
+```
+
+### `Vm::with_limits`
+
+```rust,ignore
+pub fn with_limits(program: &'p Program, limits: Limits) -> Vm<'p>
+pub fn limits(&self) -> Limits
+pub fn set_limits(&mut self, limits: Limits)
+pub fn program(&self) -> &'p Program
+```
+
+An instance whose runs use `limits` by default; `limits`/`set_limits` read and
+replace them; `program` returns the program.
+
+```rust
+use bvm_lang::{Host, Limits, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::with_limits(&p, Limits::new().with_fuel(10_000));
+assert_eq!(vm.limits().fuel(), 10_000);
+vm.set_limits(Limits::new());
+assert_eq!(vm.limits().fuel(), u64::MAX);
+```
+
+### `Vm::run`
+
+```rust,ignore
+pub fn run(&mut self, func: FuncId, args: &[Value]) -> Result<Value, VmError>
+```
+
+Calls `func` with `args` under the VM's limits. A void function returns
+`Value::Nil`.
+
+**Errors.** [`VmError`](#vmerror): `NoSuchFunction`, `NeedsClosure` (the
+function has captures), `ArgumentCount`, `ArgumentType`, `GlobalInit`, or the
+run's own outcome (`Raised`, `Thrown`, `Trap`, `Unsupported`).
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm, VmError};
+use bytecode_lang::{Inst, ModuleBuilder, ValType};
+
+let mut m = ModuleBuilder::new();
+let mut f = m.function("not", &[ValType::Bool], &[ValType::Bool]);
+let r = f.reg(ValType::Bool);
+f.emit(Inst::BNot { dst: r, src: f.param(0) });
+f.ret(r);
+let not = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&p);
+assert_eq!(vm.run(not, &[Value::Bool(true)]), Ok(Value::Bool(false)));
+assert_eq!(vm.run(not, &[Value::Int(1)]), Err(VmError::ArgumentType { index: 0 }));
+assert_eq!(vm.run(not, &[]), Err(VmError::ArgumentCount { expected: 1, found: 0 }));
+```
+
+### `Vm::run_with`
+
+```rust,ignore
+pub fn run_with(&mut self, func: FuncId, args: &[Value], limits: Limits) -> Result<Value, VmError>
+```
+
+As [`run`](#vmrun) under `limits` for this run only. Fuel starts at the
+budget each run; the memory budget applies to the whole heap (including what
+earlier runs left).
+
+```rust
+use bvm_lang::{Host, Limits, Program, Vm, VmError};
+use bytecode_lang::{ErrorKind, Inst, ModuleBuilder};
+
+let mut m = ModuleBuilder::new();
+let mut f = m.function("f", &[], &[]);
+let me = f.id();
+let w = f.reg(bytecode_lang::ValType::Dyn);
+f.emit(Inst::Call { dst: w, func: me, argc: 0 }); // unbounded recursion
+f.ret_void();
+let id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let err = Vm::new(&p).run_with(id, &[], Limits::new().with_depth(100)).unwrap_err();
+assert_eq!(err, VmError::Raised { kind: ErrorKind::StackOverflow, func: id, pc: 0 });
+```
+
+### `Vm::run_export`
+
+```rust,ignore
+pub fn run_export(&mut self, name: &str, args: &[Value]) -> Result<Value, VmError>
+```
+
+Runs the function exported under `name`; `VmError::NoSuchExport` if none.
+See [Quick start](#quick-start).
+
+### Inspecting values
+
+```rust,ignore
+pub fn kind(&self, v: Value) -> Kind
+pub fn str_bytes(&self, v: Value) -> Option<&[u8]>
+pub fn elements(&self, v: Value) -> Option<Vec<Value>>
+pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>>
+pub fn field(&self, v: Value, index: usize) -> Option<Value>
+pub fn error_code(&self, v: Value) -> Option<u32>
+pub fn global(&self, id: GlobalId) -> Option<Value>
+pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, VmError>
+```
+
+Read what runs return: a value's dynamic kind, a string's bytes, an array's
+elements, a map's entries in insertion order, a struct's field, a runtime
+error value's code, a global's current value; `new_str` allocates a string to
+pass to a run (the `OutOfMemory` trap if the budget is spent).
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm};
+use bytecode_lang::{Const, Inst, Kind, ModuleBuilder, ValType};
+
+let mut m = ModuleBuilder::new();
+let k = m.constant(Const::Bytes(b"k".to_vec()));
+let v = m.constant(Const::Int(5));
+let map = m.constant(Const::Map(vec![(k, v)]));
+let mut f = m.function("f", &[], &[ValType::Dyn]);
+let r = f.reg(ValType::Dyn);
+f.emit(Inst::DLoadConst { dst: r, k: map });
+f.ret(r);
+let id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&p);
+let out = vm.run(id, &[]).unwrap();
+assert_eq!(vm.kind(out), Kind::Map);
+let entries = vm.entries(out).unwrap();
+assert_eq!(vm.str_bytes(entries[0].0), Some(&b"k"[..]));
+assert_eq!(entries[0].1, Value::Int(5));
+```
+
+### Heap and fuel statistics
+
+```rust,ignore
+pub fn fuel_used(&self) -> u64
+pub fn heap_bytes(&self) -> usize
+pub fn heap_objects(&self) -> usize
+pub fn collections(&self) -> u64
+pub fn collect_garbage(&mut self)
+```
+
+Fuel the last run consumed; bytes charged to the memory budget; live objects
+(exact after a collection); collections so far; and an explicit collection
+keeping only what globals and caches reach.
+
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&p);
+let s = vm.new_str(b"temporary").unwrap();
+assert_eq!(vm.heap_objects(), 1);
+vm.collect_garbage();
+assert_eq!((vm.heap_objects(), vm.collections()), (0, 1));
+assert_eq!(vm.kind(s), bytecode_lang::Kind::Nil); // the stale handle reads as nil
+```
+
+## `Limits`
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits { /* private */ }
+impl Limits {
+    pub const fn new() -> Limits;
+    pub const fn with_fuel(self, fuel: u64) -> Limits;
+    pub const fn with_memory(self, bytes: usize) -> Limits;
+    pub const fn with_depth(self, frames: usize) -> Limits;   // at least 1
+    pub const fn with_stack(self, slots: usize) -> Limits;
+    pub const fn fuel(&self) -> u64;
+    pub const fn memory(&self) -> usize;
+    pub const fn depth(&self) -> usize;
+    pub const fn stack(&self) -> usize;
+}
+```
+
+The budgets of a run (see [Fuel and the other budgets](#fuel-and-the-other-budgets)).
+Defaults (`new`, `Default`): unlimited fuel, 1 GiB of heap, 10,000 frames,
+4 Mi register slots (32 MiB). Set fuel and memory for untrusted code; the
+memory budget is only as hard as the host can honour, so keep it below the
+memory actually available.
+
+```rust
+use bvm_lang::Limits;
+
+let l = Limits::default().with_fuel(1_000).with_memory(64 << 20).with_depth(256).with_stack(1 << 20);
+assert_eq!((l.fuel(), l.memory(), l.depth(), l.stack()), (1_000, 64 << 20, 256, 1 << 20));
+```
+
+## `Value`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum Value { Nil, Bool(bool), Int(i64), UInt(u64), F32(f32), Float(f64), Char(char), Obj(Obj) }
+```
+
+A register's contents at the API boundary (see
+[Registers and values](#registers-and-values)). `as_int` (also unsigned values
+that fit), `as_float` (also `F32`), `as_bool`, and `is_nil` read it;
+`Display` prints scalars and `<obj>`; `From` converts `bool`, `i64`, `u64`,
+`f64`, and `char`.
+
+```rust
+use bvm_lang::Value;
+
+assert_eq!(Value::from(3i64).as_int(), Some(3));
+assert_eq!(Value::UInt(9).as_int(), Some(9));
+assert_eq!(Value::F32(0.5).as_float(), Some(0.5));
+assert_eq!(Value::Bool(true).to_string(), "true");
+assert!(Value::default().is_nil());
+```
+
+## `Obj`
+
+```rust,ignore
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Obj(/* private */);
+```
+
+A handle to a heap object of one [`Vm`](#vm); equality is identity. Valid
+until the next run on that VM, or until collected (then it reads as `nil`).
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&p);
+let (a, b) = (vm.new_str(b"x").unwrap(), vm.new_str(b"x").unwrap());
+assert!(matches!((a, b), (Value::Obj(x), Value::Obj(y)) if x != y));
+```
+
+## `Host`
+
+```rust,ignore
+#[derive(Clone, Default)]
+pub struct Host { /* private */ }
+impl Host {
+    pub fn new() -> Host;
+    pub fn register<F>(&mut self, module: &str, name: &str, f: F) -> &mut Host
+    where F: Fn(&mut HostCtx<'_>, &[Value]) -> Result<Value, HostError> + Send + Sync + 'static;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+```
+
+Host functions by import module and name. A host function receives its
+arguments converted from the import's declared parameter types; its result is
+converted to the declared result type (`TypeError` at the call if it does not
+fit; ignored for a void import). It runs to completion without re-entering the
+VM, so no collection happens during it.
+
+```rust
+use bvm_lang::{Host, HostError, Program, Value, Vm};
+use bytecode_lang::{ErrorKind, Inst, ModuleBuilder, ValType};
+
+let mut host = Host::new();
+host.register("math", "isqrt", |_, args| match args {
+    [Value::Int(n)] if *n >= 0 => Ok(Value::Int(n.isqrt())),
+    _ => Err(HostError::Raise(ErrorKind::TypeError)),
+});
+let mut m = ModuleBuilder::new();
+let sig = m.func_type(&[ValType::I64], &[ValType::I64]);
+let isqrt = m.import("math", "isqrt", sig);
+let mut f = m.function("f", &[ValType::I64], &[ValType::I64]);
+let w = f.regs(&[ValType::I64, ValType::I64]);
+f.mov(bytecode_lang::Reg(w.0 + 1), f.param(0));
+f.emit(Inst::CallImport { dst: w, import: isqrt, argc: 1 });
+f.ret(w);
+let id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &host).unwrap();
+assert_eq!(Vm::new(&p).run(id, &[Value::Int(99)]), Ok(Value::Int(9)));
+```
+
+## `HostCtx`
+
+```rust,ignore
+pub struct HostCtx<'a> { /* private */ }
+impl HostCtx<'_> {
+    pub fn str_bytes(&self, v: Value) -> Option<&[u8]>;
+    pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, HostError>;
+    pub fn kind(&self, v: Value) -> Kind;
+    pub fn error_code(&self, v: Value) -> Option<u32>;
+}
+```
+
+What a host function can do with the VM while it runs. `new_str` fails with
+`HostError::Raise(ErrorKind::OutOfMemory)` (a trap) when the budget is spent.
+
+```rust
+use bvm_lang::{Host, Value};
+
+let mut host = Host::new();
+host.register("str", "upper", |ctx, args| {
+    let s = args.first().and_then(|v| ctx.str_bytes(*v)).unwrap_or(b"").to_ascii_uppercase();
+    ctx.new_str(&s)
+});
+```
+
+## `HostError`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum HostError { Raise(ErrorKind), Throw(Value) }
+```
+
+`Raise` raises a runtime error of that kind at the calling instruction
+(catchable unless the kind is `OutOfMemory`, `OutOfFuel`, or `Unreachable`,
+which trap); `Throw` throws a value, as `throw` would.
+
+```rust
+use bvm_lang::{HostError, Value};
+use bytecode_lang::ErrorKind;
+
+assert_eq!(HostError::Raise(ErrorKind::DivByZero).to_string(), "host raised E0002 DivByZero");
+assert_eq!(HostError::Throw(Value::Nil).to_string(), "host threw nil");
+```
+
+## `VmError`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum VmError {
+    Raised { kind: ErrorKind, func: FuncId, pc: u32 },
+    Thrown { value: Value, func: FuncId, pc: u32 },
+    Trap { kind: ErrorKind, func: FuncId, pc: u32 },
+    Unsupported { opcode: Opcode, func: FuncId, pc: u32 },
+    GlobalInit { global: GlobalId, kind: ErrorKind },
+    NoSuchFunction(FuncId),
+    NoSuchExport,
+    NeedsClosure(FuncId),
+    ArgumentCount { expected: usize, found: usize },
+    ArgumentType { index: usize },
+}
+impl VmError {
+    pub fn kind(&self) -> Option<ErrorKind>;
+    pub fn code(&self) -> Option<u32>;
+    pub fn location(&self) -> Option<(FuncId, u32)>;
+}
+```
+
+How a run ended without a result. `Raised` is an uncaught runtime error (its
+location is where it was raised, even if a handler caught and rethrew it);
+`Thrown` an uncaught non-error value; `Trap` a trap; `Unsupported` a coroutine
+instruction (alpha.2); `GlobalInit` a global initialiser that does not fit
+its global; the rest are entry problems. `kind`, `code`, and `location` read
+the common parts.
+
+```rust
+use bvm_lang::{Host, Program, Value, Vm, VmError};
+use bytecode_lang::{Inst, ModuleBuilder, ValType};
+
+let mut m = ModuleBuilder::new();
+let mut f = m.function("f", &[ValType::Dyn], &[]);
+f.emit(Inst::Throw { src: f.param(0) });
+let id = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+let err = Vm::new(&p).run(id, &[Value::Int(7)]).unwrap_err();
+assert_eq!(err, VmError::Thrown { value: Value::Int(7), func: id, pc: 0 });
+assert_eq!((err.kind(), err.location()), (None, Some((id, 0))));
+```
+
+## `LoadError`
+
+```rust,ignore
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadError { /* private */ }
+impl LoadError {
+    pub fn kind(&self) -> &LoadErrorKind;
+    pub fn func(&self) -> Option<FuncId>;
+    pub fn pc(&self) -> Option<u32>;
+}
+```
+
+Why [`Program::load`](#programload) refused a module, and where. `Display`
+prints `f<id> @<pc>: <reason>`.
+
+## `LoadErrorKind`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum LoadErrorKind {
+    Decode(DecodeError),
+    UnresolvedImport { module: String, name: String },
+    OutOfRange { what: &'static str, index: u32 },
+    BadSignature, ParamMismatch, EmptyCode, FallsThrough,
+    ArityMismatch { expected: u32, found: u32 },
+    CalleeHasCaptures, PromoteNotDynamic,
+    WrongTypeKind { expected: &'static str },
+    BadModifier, InvalidHandler, CatchNotDyn, TailCallInTry,
+    BadParent, InheritanceTooDeep, BadConstant,
+    BadHook(Hook), BadStart,
+}
+```
+
+Each variant is one rule of [What loading checks](#what-loading-checks);
+`OutOfRange::what` is one of `"register"`, `"constant"`, `"function"`,
+`"import"`, `"global"`, `"table"`, `"name"`, `"type ref"`, `"capture"`,
+`"branch target"`, `"table target"`, `"type"`, `"string"`.
+
+```rust
+use bvm_lang::{Host, LoadErrorKind, Program};
+use bytecode_lang::{Callee, Hook, ModuleBuilder, ValType};
+
+let mut m = ModuleBuilder::new();
+let mut h = m.function("h", &[ValType::Dyn], &[ValType::Dyn]);
+h.ret(h.param(0));
+let id = m.add_function(h).unwrap();
+m.hook(Hook::Eq, Callee::Func(id)); // `eq` takes two operands
+let err = Program::load(m.finish().unwrap(), &Host::new()).unwrap_err();
+assert_eq!(err.kind(), &LoadErrorKind::BadHook(Hook::Eq));
+```
+
+## `Location`
+
+```rust,ignore
+pub struct Location<'a> { pub file: &'a str, pub line: u32, pub column: u32 }
+```
+
+A line-table position; `Display` prints `file:line:column`. See
+[`Program::location`](#programlocation).
+
+## Constants
+
+```rust,ignore
+pub const MAX_INHERITANCE_DEPTH: usize = 256;
+pub const MAX_CONST_DEPTH: u32 = 64;
+```
+
+The deepest struct inheritance chain and aggregate-constant nesting a module
+may declare.
+
+```rust
+assert_eq!(bvm_lang::MAX_INHERITANCE_DEPTH, 256);
+assert_eq!(bvm_lang::MAX_CONST_DEPTH, 64);
+```
+
+## Feature flags
+
+| Feature | Default | Effect |
+|---|---|---|
+| `std` | yes | Float `sqrt`/`fma`/rounding from the standard library (hardware where available), and a random per-VM hashing key. Without it the crate is `no_std` + `alloc`, computes the same float results in software (property-tested equal), and uses a fixed key. |
+
+## Stability
+
+2.0.0-alpha.1 is a pre-release: names and signatures may change before 2.0.0,
+each change recorded in the CHANGELOG. Instruction semantics follow LSB and
+OPS and change only with them. See [`STABILITY.md`](./STABILITY.md).

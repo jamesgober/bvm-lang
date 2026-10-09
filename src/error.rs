@@ -1,123 +1,201 @@
-//! Execution failures raised by the interpreter loop.
-//!
-//! Bytecode handed to [`Vm::run`](crate::Vm::run) is treated as untrusted: a
-//! malformed program (an out-of-range register, a jump past the end of the code,
-//! a constant index that does not exist) is reported as a [`VmError`] rather than
-//! panicking. Runtime faults from otherwise well-formed code — a type mismatch, a
-//! division by zero, integer overflow — surface the same way. Every variant
-//! carries enough context to point at the specific fault.
+//! The errors a run can end with.
 
 use core::fmt;
 
-/// An error raised while executing a [`Chunk`](crate::Chunk).
+use bytecode_lang::{ErrorKind, FuncId, GlobalId, Opcode};
+
+use crate::value::Value;
+
+/// Why a run ended without a result.
 ///
-/// Errors fall into two groups. *Structural* faults (`BadRegister`,
-/// `BadConstant`, `BadJump`, `NoTerminator`) mean the bytecode itself is
-/// malformed and would never be produced by a correct compiler; they are
-/// reported instead of trusted so that hand-written or corrupted programs cannot
-/// drive the VM into a panic. *Runtime* faults (`TypeMismatch`, `DivideByZero`,
-/// `IntegerOverflow`) come from executing well-formed instructions against
-/// operands that do not satisfy their contract.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Errors that unwind (LSB §4.3) reach the host only when no handler caught
+/// them: [`Raised`](VmError::Raised) for a runtime error (with the OPS/LSB
+/// [`ErrorKind`] and the function and pc that raised it) and
+/// [`Thrown`](VmError::Thrown) for a `throw` of any other value. Traps
+/// ([`Trap`](VmError::Trap)) abort at once and carry the instruction that
+/// trapped. Every runtime variant names the function and pc (ISSUES M62).
+///
+/// # Examples
+///
+/// ```
+/// use bvm_lang::{Host, Program, Value, Vm, VmError};
+/// use bytecode_lang::{ErrorKind, Inst, IntOp, IntTy, ModuleBuilder, ValType};
+///
+/// let mut m = ModuleBuilder::new();
+/// let mut f = m.function("div", &[ValType::I64, ValType::I64], &[ValType::I64]);
+/// let q = f.reg(ValType::I64);
+/// f.emit(Inst::IDiv { dst: q, lhs: f.param(0), rhs: f.param(1), op: IntOp::new(IntTy::I64) });
+/// f.ret(q);
+/// let div = m.add_function(f).unwrap();
+/// let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+///
+/// let err = Vm::new(&program).run(div, &[Value::Int(1), Value::Int(0)]).unwrap_err();
+/// assert_eq!(err, VmError::Raised { kind: ErrorKind::DivByZero, func: div, pc: 0 });
+/// assert_eq!(err.code(), Some(2));
+/// assert_eq!(err.to_string(), "uncaught E0002 DivByZero at f0 @0");
+/// ```
+#[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum VmError {
-    /// An operation received an operand of the wrong kind — for example, adding a
-    /// boolean to an integer, or branching on a value that is not a boolean.
-    ///
-    /// The field names the operation that rejected its operand (`"add"`,
-    /// `"jump-if-true"`, …) so a caller can report which instruction faulted.
-    TypeMismatch {
-        /// The operation that rejected its operand(s).
-        op: &'static str,
+    /// A runtime error no handler caught.
+    Raised {
+        /// The OPS/LSB error kind.
+        kind: ErrorKind,
+        /// The function that raised it.
+        func: FuncId,
+        /// The instruction that raised it.
+        pc: u32,
     },
+    /// A `throw` (or host-thrown value) that is not a runtime error value
+    /// reached the host uncaught.
+    Thrown {
+        /// The thrown value.
+        value: Value,
+        /// The function where it was thrown.
+        func: FuncId,
+        /// The throwing instruction.
+        pc: u32,
+    },
+    /// A trap: `OutOfFuel`, `OutOfMemory`, `Unreachable`, or an OPS error
+    /// under policy `trap`. Handlers never see traps.
+    Trap {
+        /// The trap's kind (its code is the error code).
+        kind: ErrorKind,
+        /// The function that trapped.
+        func: FuncId,
+        /// The instruction that trapped.
+        pc: u32,
+    },
+    /// An instruction this release does not execute: the coroutine group
+    /// (`0xF0`..=`0xFC`) arrives in 2.0.0-alpha.2.
+    Unsupported {
+        /// The instruction's opcode.
+        opcode: Opcode,
+        /// The function containing it.
+        func: FuncId,
+        /// Its pc.
+        pc: u32,
+    },
+    /// A global's initialiser could not be materialised into the global's
+    /// type (or exhausted memory).
+    GlobalInit {
+        /// The global.
+        global: GlobalId,
+        /// The error or trap kind.
+        kind: ErrorKind,
+    },
+    /// The entry function does not exist.
+    NoSuchFunction(FuncId),
+    /// No function is exported under the name.
+    NoSuchExport,
+    /// The entry function has captures, so it can only run as a closure.
+    NeedsClosure(FuncId),
+    /// The number of arguments does not match the entry function.
+    ArgumentCount {
+        /// The function's parameter count.
+        expected: usize,
+        /// The number of arguments given.
+        found: usize,
+    },
+    /// An argument does not convert to its parameter's type.
+    ArgumentType {
+        /// The argument's position.
+        index: usize,
+    },
+}
 
-    /// Integer division or remainder with a zero divisor.
+impl VmError {
+    /// The error kind, for the variants that have one.
     ///
-    /// Only integer operands raise this. Floating-point division by zero follows
-    /// IEEE-754 and yields an infinity or NaN rather than an error.
-    DivideByZero,
-
-    /// A checked integer operation overflowed its 32-bit range.
+    /// # Examples
     ///
-    /// Raised by addition, subtraction, multiplication, negation, and the
-    /// `i32::MIN / -1` division/remainder edge case. Integer arithmetic never
-    /// wraps silently.
-    IntegerOverflow,
-
-    /// A register index addressed a slot outside the chunk's register file.
+    /// ```
+    /// use bvm_lang::VmError;
+    /// use bytecode_lang::{ErrorKind, FuncId};
     ///
-    /// Indicates malformed bytecode: a correct compiler only emits register
-    /// indices below [`Chunk::registers`](crate::Chunk::registers).
-    BadRegister(u16),
+    /// let e = VmError::Trap { kind: ErrorKind::OutOfFuel, func: FuncId(0), pc: 3 };
+    /// assert_eq!(e.kind(), Some(ErrorKind::OutOfFuel));
+    /// assert_eq!(VmError::NoSuchExport.kind(), None);
+    /// ```
+    #[must_use]
+    pub fn kind(&self) -> Option<ErrorKind> {
+        match self {
+            VmError::Raised { kind, .. }
+            | VmError::Trap { kind, .. }
+            | VmError::GlobalInit { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
 
-    /// A `LoadConst` referenced a constant-pool slot that does not exist.
-    BadConstant(u16),
-
-    /// Control flow reached an instruction index outside the code array — either
-    /// a branch target past the end, or a `pc` that walked off the end.
-    BadJump(u32),
-
-    /// Execution reached the end of the code without a `Return` or `Halt`.
+    /// The numeric error code (`107` for E0107 `OutOfFuel`), for the
+    /// variants that have a kind.
     ///
-    /// Every well-formed program terminates explicitly; falling off the end is
-    /// treated as a structural fault rather than an implicit return.
-    NoTerminator,
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::VmError;
+    /// use bytecode_lang::{ErrorKind, FuncId};
+    ///
+    /// let e = VmError::Trap { kind: ErrorKind::OutOfFuel, func: FuncId(0), pc: 3 };
+    /// assert_eq!(e.code(), Some(107));
+    /// ```
+    #[must_use]
+    pub fn code(&self) -> Option<u32> {
+        self.kind().map(ErrorKind::code)
+    }
+
+    /// The function and pc where the run stopped, for runtime variants.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::VmError;
+    /// use bytecode_lang::{ErrorKind, FuncId};
+    ///
+    /// let e = VmError::Trap { kind: ErrorKind::Unreachable, func: FuncId(2), pc: 9 };
+    /// assert_eq!(e.location(), Some((FuncId(2), 9)));
+    /// ```
+    #[must_use]
+    pub fn location(&self) -> Option<(FuncId, u32)> {
+        match self {
+            VmError::Raised { func, pc, .. }
+            | VmError::Thrown { func, pc, .. }
+            | VmError::Trap { func, pc, .. }
+            | VmError::Unsupported { func, pc, .. } => Some((*func, *pc)),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for VmError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TypeMismatch { op } => {
-                write!(
-                    f,
-                    "type mismatch: `{op}` received an operand of the wrong kind"
-                )
+            VmError::Raised { kind, func, pc } => write!(f, "uncaught {kind} at {func} @{pc}"),
+            VmError::Thrown { value, func, pc } => {
+                write!(f, "uncaught throw of {value} at {func} @{pc}")
             }
-            Self::DivideByZero => f.write_str("integer division or remainder by zero"),
-            Self::IntegerOverflow => f.write_str("integer arithmetic overflowed the 32-bit range"),
-            Self::BadRegister(r) => write!(f, "register index {r} is outside the register file"),
-            Self::BadConstant(c) => write!(f, "constant index {c} does not exist"),
-            Self::BadJump(t) => write!(f, "branch target {t} is outside the code"),
-            Self::NoTerminator => {
-                f.write_str("execution reached the end of the code without a return or halt")
+            VmError::Trap { kind, func, pc } => write!(f, "trap {kind} at {func} @{pc}"),
+            VmError::Unsupported { opcode, func, pc } => write!(
+                f,
+                "{} is not supported in this release (coroutines arrive in 2.0.0-alpha.2) at {func} @{pc}",
+                opcode.mnemonic()
+            ),
+            VmError::GlobalInit { global, kind } => {
+                write!(f, "cannot initialise {global}: {kind}")
+            }
+            VmError::NoSuchFunction(id) => write!(f, "no function {id}"),
+            VmError::NoSuchExport => f.write_str("no function exported under that name"),
+            VmError::NeedsClosure(id) => {
+                write!(f, "{id} has captures and can only run as a closure")
+            }
+            VmError::ArgumentCount { expected, found } => {
+                write!(f, "expected {expected} arguments, got {found}")
+            }
+            VmError::ArgumentType { index } => {
+                write!(f, "argument {index} does not convert to its parameter type")
             }
         }
     }
 }
 
 impl core::error::Error for VmError {}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use super::*;
-    use alloc::string::ToString;
-
-    #[test]
-    fn test_display_type_mismatch_names_op() {
-        let msg = VmError::TypeMismatch { op: "add" }.to_string();
-        assert!(msg.contains("add"), "message should name the op: {msg}");
-    }
-
-    #[test]
-    fn test_display_all_variants_nonempty() {
-        let variants = [
-            VmError::TypeMismatch { op: "neg" },
-            VmError::DivideByZero,
-            VmError::IntegerOverflow,
-            VmError::BadRegister(7),
-            VmError::BadConstant(3),
-            VmError::BadJump(99),
-            VmError::NoTerminator,
-        ];
-        for v in variants {
-            assert!(!v.to_string().is_empty());
-        }
-    }
-
-    #[test]
-    fn test_error_is_std_error() {
-        fn assert_error<E: core::error::Error>(_: &E) {}
-        assert_error(&VmError::DivideByZero);
-    }
-}

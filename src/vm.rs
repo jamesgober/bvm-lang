@@ -1,431 +1,732 @@
-//! The interpreter: a register file and the dispatch loop that drives it.
-//!
-//! [`Vm`] holds the one piece of mutable execution state — the register file —
-//! and reuses it across runs so a long-lived VM executing many chunks does not
-//! reallocate. [`Vm::run`] walks a [`Chunk`](crate::Chunk)'s code with a program
-//! counter, dispatching each instruction through a single `match`. On a modern
-//! compiler that `match` lowers to a jump table, so per-instruction overhead is a
-//! table lookup plus the operation itself.
-//!
-//! The loop is written to be safe against malformed bytecode. Every register,
-//! constant, and branch access is checked, so a corrupt or hand-crafted chunk
-//! yields a [`VmError`] instead of a panic or undefined behaviour — the crate
-//! forbids `unsafe`, and this loop is where that guarantee is enforced.
+//! The public VM: an instance of a [`Program`] with its own heap, globals,
+//! and limits.
 
-use crate::{Chunk, Op, VmError, eval};
 use alloc::vec::Vec;
-use value_lang::Value;
 
-/// A bytecode interpreter.
+use bytecode_lang::{FuncId, GlobalId, Kind};
+
+use crate::conv;
+use crate::error::VmError;
+use crate::exec;
+use crate::fault::Fault;
+use crate::heap::Object;
+use crate::host;
+use crate::machine::Machine;
+use crate::program::Program;
+use crate::value::{Obj, Value};
+
+/// The budgets a run executes under.
 ///
-/// A `Vm` owns a register file that is cleared and resized to fit at the start of
-/// each [`run`](Vm::run). Reusing one `Vm` across many runs amortises that
-/// allocation to zero in steady state. A `Vm` holds no reference to any chunk, so
-/// one instance can execute different chunks in sequence, and different instances
-/// can execute the same chunk on different threads.
+/// Every budget is enforced deterministically, so an untrusted module cannot
+/// run forever, exhaust memory, or overflow the native stack:
+///
+/// - **fuel**: units charged at every `safepoint`, call-family instruction
+///   (calls, tail calls, host calls, hook invocations), taken backward
+///   branch, and handler entry. Exhausting it is the `OutOfFuel` trap
+///   (E0107). Execution between two charges is bounded by the length of one
+///   function, so fuel bounds total work.
+/// - **memory**: bytes of heap objects (strings, arrays, maps, structs,
+///   closures, cells, iterators, error values, boxed ints). Exceeding it is
+///   the `OutOfMemory` trap (E0106). Accounting is approximate (headers and
+///   shared copy-on-write storage are estimated), never unbounded.
+/// - **depth**: frames on the call stack, hook frames included. Exceeding it
+///   raises `StackOverflow` (E0105, catchable).
+/// - **stack**: register slots across all frames (8 bytes each). Exceeding
+///   it also raises `StackOverflow`.
 ///
 /// # Examples
 ///
 /// ```
-/// use bvm_lang::{Chunk, Op, Value, Vm};
+/// use bvm_lang::Limits;
 ///
-/// // Compute 2 + 3 and return it.
-/// let mut chunk = Chunk::new();
-/// chunk.emit(Op::LoadInt { dst: 0, val: 2 });
-/// chunk.emit(Op::LoadInt { dst: 1, val: 3 });
-/// chunk.emit(Op::Add { dst: 0, lhs: 0, rhs: 1 });
-/// chunk.emit(Op::Return { src: 0 });
-///
-/// let mut vm = Vm::new();
-/// assert_eq!(vm.run(&chunk).unwrap().as_int(), Some(5));
+/// let tight = Limits::new().with_fuel(10_000).with_memory(1 << 20).with_depth(64);
+/// assert_eq!(tight.fuel(), 10_000);
+/// assert_eq!(Limits::default().fuel(), u64::MAX);
 /// ```
-#[derive(Debug, Default)]
-pub struct Vm {
-    registers: Vec<Value>,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    fuel: u64,
+    memory: usize,
+    depth: usize,
+    stack: usize,
 }
 
-impl Vm {
-    /// Create a VM with an empty register file.
-    ///
-    /// The file grows to fit the first chunk executed and is reused thereafter.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+impl Default for Limits {
+    fn default() -> Limits {
+        Limits::new()
     }
+}
 
-    /// Create a VM whose register file is pre-allocated for at least `registers`
-    /// slots, avoiding a growth reallocation on the first run of a chunk that
-    /// size.
+impl Limits {
+    /// The defaults: unlimited fuel, 1 GiB of heap, 10,000 frames, and 4 Mi
+    /// register slots (32 MiB). Set fuel and memory explicitly for untrusted
+    /// code.
     ///
     /// # Examples
     ///
     /// ```
-    /// use bvm_lang::Vm;
+    /// use bvm_lang::Limits;
     ///
-    /// // A VM primed for chunks using up to 32 registers.
-    /// let mut vm = Vm::with_capacity(32);
+    /// assert_eq!(Limits::new().depth(), 10_000);
     /// ```
     #[must_use]
-    pub fn with_capacity(registers: u16) -> Self {
-        Self {
-            registers: Vec::with_capacity(registers as usize),
+    pub const fn new() -> Limits {
+        Limits {
+            fuel: u64::MAX,
+            memory: 1 << 30,
+            depth: 10_000,
+            stack: 4 << 20,
         }
     }
 
-    /// Execute `chunk` from its first instruction and return the value it yields.
+    /// Sets the fuel budget of each run.
     ///
-    /// A [`Return`](Op::Return) yields the value in its register; a
-    /// [`Halt`](Op::Halt), or a chunk with no reachable terminator that instead
-    /// stops via `Halt`, yields `nil`. The register file is reset to `nil` and
-    /// sized to the chunk before execution begins, so a run never observes
-    /// residue from a previous one.
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().with_fuel(5).fuel(), 5);
+    /// ```
+    #[must_use]
+    pub const fn with_fuel(self, fuel: u64) -> Limits {
+        Limits { fuel, ..self }
+    }
+
+    /// Sets the heap budget in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().with_memory(4096).memory(), 4096);
+    /// ```
+    #[must_use]
+    pub const fn with_memory(self, bytes: usize) -> Limits {
+        Limits {
+            memory: bytes,
+            ..self
+        }
+    }
+
+    /// Sets the maximum call depth (at least 1, the entry frame).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().with_depth(0).depth(), 1);
+    /// ```
+    #[must_use]
+    pub const fn with_depth(self, frames: usize) -> Limits {
+        Limits {
+            depth: if frames == 0 { 1 } else { frames },
+            ..self
+        }
+    }
+
+    /// Sets the maximum number of register slots across all frames.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().with_stack(1024).stack(), 1024);
+    /// ```
+    #[must_use]
+    pub const fn with_stack(self, slots: usize) -> Limits {
+        Limits {
+            stack: slots,
+            ..self
+        }
+    }
+
+    /// The fuel budget.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().fuel(), u64::MAX);
+    /// ```
+    #[must_use]
+    pub const fn fuel(&self) -> u64 {
+        self.fuel
+    }
+
+    /// The heap budget in bytes.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().memory(), 1 << 30);
+    /// ```
+    #[must_use]
+    pub const fn memory(&self) -> usize {
+        self.memory
+    }
+
+    /// The maximum call depth.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().depth(), 10_000);
+    /// ```
+    #[must_use]
+    pub const fn depth(&self) -> usize {
+        self.depth
+    }
+
+    /// The maximum register slots.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// assert_eq!(bvm_lang::Limits::new().stack(), 4 << 20);
+    /// ```
+    #[must_use]
+    pub const fn stack(&self) -> usize {
+        self.stack
+    }
+}
+
+/// An instance of a [`Program`]: its heap, globals, and limits.
+///
+/// The first run initialises the globals and runs the module's start function
+/// (LSB §3); later runs reuse the instance, so globals and heap objects
+/// persist between runs. Register stacks and work lists are pooled, so steady
+/// state execution does not allocate outside the program's own objects.
+///
+/// [`Value::Obj`] handles a run returns stay valid until the next run on the
+/// same VM (collection happens only while bytecode runs).
+///
+/// # Examples
+///
+/// ```
+/// use bvm_lang::{Host, Program, Value, Vm};
+/// use bytecode_lang::{Inst, IntOp, IntTy, ModuleBuilder, ValType};
+///
+/// // fn square(x: i64) -> i64 { x * x }
+/// let mut m = ModuleBuilder::new();
+/// let mut f = m.function("square", &[ValType::I64], &[ValType::I64]);
+/// let r = f.reg(ValType::I64);
+/// f.emit(Inst::IMul { dst: r, lhs: f.param(0), rhs: f.param(0), op: IntOp::new(IntTy::I64) });
+/// f.ret(r);
+/// let square = m.add_function(f).unwrap();
+///
+/// let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+/// let mut vm = Vm::new(&program);
+/// assert_eq!(vm.run(square, &[Value::Int(12)]), Ok(Value::Int(144)));
+/// ```
+#[derive(Debug)]
+pub struct Vm<'p> {
+    prog: &'p Program,
+    m: Machine,
+    limits: Limits,
+    ready: bool,
+    fuel_used: u64,
+}
+
+impl<'p> Vm<'p> {
+    /// An instance of `program` with the default [`Limits`].
+    ///
+    /// # Examples
+    ///
+    /// See [`Vm`].
+    #[must_use]
+    pub fn new(program: &'p Program) -> Vm<'p> {
+        Vm::with_limits(program, Limits::new())
+    }
+
+    /// An instance of `program` with `limits` for every run.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Limits, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let vm = Vm::with_limits(&p, Limits::new().with_fuel(1_000));
+    /// assert_eq!(vm.limits().fuel(), 1_000);
+    /// ```
+    #[must_use]
+    pub fn with_limits(program: &'p Program, limits: Limits) -> Vm<'p> {
+        Vm {
+            prog: program,
+            m: Machine::new(program, limits.memory),
+            limits,
+            ready: false,
+            fuel_used: 0,
+        }
+    }
+
+    /// The limits runs use by default.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_limits`](Vm::with_limits).
+    #[must_use]
+    pub fn limits(&self) -> Limits {
+        self.limits
+    }
+
+    /// Replaces the default limits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Limits, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.set_limits(Limits::new().with_depth(16));
+    /// assert_eq!(vm.limits().depth(), 16);
+    /// ```
+    pub fn set_limits(&mut self, limits: Limits) {
+        self.limits = limits;
+    }
+
+    /// The program this VM runs.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// assert!(core::ptr::eq(Vm::new(&p).program(), &p));
+    /// ```
+    #[must_use]
+    pub fn program(&self) -> &'p Program {
+        self.prog
+    }
+
+    /// Runs `func` with `args` under the VM's limits and returns its result
+    /// (`Value::Nil` for a void function).
     ///
     /// # Errors
     ///
-    /// Returns a [`VmError`] on a runtime fault (type mismatch, division by zero,
-    /// integer overflow) or a structural fault in the bytecode (an out-of-range
-    /// register, constant, or branch target, or running off the end of the code
-    /// without terminating). See [`VmError`] for the full set.
+    /// A [`VmError`]: an uncaught error or throw, a trap, an unsupported
+    /// instruction, or an entry problem (unknown function, wrong arguments).
     ///
     /// # Examples
     ///
-    /// A division by zero surfaces as an error rather than a panic:
+    /// See [`Vm`].
+    pub fn run(&mut self, func: FuncId, args: &[Value]) -> Result<Value, VmError> {
+        self.run_with(func, args, self.limits)
+    }
+
+    /// Runs the function exported under `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::NoSuchExport`], or as [`run`](Vm::run).
+    ///
+    /// # Examples
+    ///
+    /// See [`Program`].
+    pub fn run_export(&mut self, name: &str, args: &[Value]) -> Result<Value, VmError> {
+        let func = self.prog.export(name).ok_or(VmError::NoSuchExport)?;
+        self.run(func, args)
+    }
+
+    /// Runs `func` under `limits` for this run only (fuel restarts at the
+    /// budget; the memory budget applies to the whole heap).
+    ///
+    /// # Errors
+    ///
+    /// As [`run`](Vm::run).
+    ///
+    /// # Examples
+    ///
+    /// An infinite loop stops when its fuel is spent:
     ///
     /// ```
-    /// use bvm_lang::{Chunk, Op, VmError, Vm};
+    /// use bvm_lang::{Host, Limits, Program, Vm, VmError};
+    /// use bytecode_lang::{ErrorKind, Inst, ModuleBuilder, Target};
     ///
-    /// let mut chunk = Chunk::new();
-    /// chunk.emit(Op::LoadInt { dst: 0, val: 1 });
-    /// chunk.emit(Op::LoadInt { dst: 1, val: 0 });
-    /// chunk.emit(Op::Div { dst: 0, lhs: 0, rhs: 1 });
-    /// chunk.emit(Op::Return { src: 0 });
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("spin", &[], &[]);
+    /// f.emit(Inst::Jmp { target: Target(0) });
+    /// let spin = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
     ///
-    /// let mut vm = Vm::new();
-    /// assert_eq!(vm.run(&chunk), Err(VmError::DivideByZero));
+    /// let err = Vm::new(&p).run_with(spin, &[], Limits::new().with_fuel(1_000)).unwrap_err();
+    /// assert_eq!(err, VmError::Trap { kind: ErrorKind::OutOfFuel, func: spin, pc: 0 });
     /// ```
-    #[must_use = "the run's result value is the point of executing the chunk"]
-    pub fn run(&mut self, chunk: &Chunk) -> Result<Value, VmError> {
-        self.registers.clear();
-        self.registers
-            .resize(chunk.registers() as usize, Value::nil());
-
-        let code = chunk.code();
-        let constants = chunk.constants();
-        let end = code.len();
-        let mut pc: usize = 0;
-
-        loop {
-            // Fetch. A `pc` at or past the end means control fell through the
-            // last instruction without a terminator; branches validate their own
-            // targets before landing here, so this only ever signals that fault.
-            let op = *code.get(pc).ok_or(VmError::NoTerminator)?;
-
-            match op {
-                Op::Return { src } => return self.get(src),
-                Op::Halt => return Ok(Value::nil()),
-
-                Op::Jump { target } => {
-                    pc = jump_target(target, end)?;
-                    continue;
-                }
-                Op::JumpIfTrue { cond, target } => {
-                    if eval::cond(self.get(cond)?, "jump-if-true")? {
-                        pc = jump_target(target, end)?;
-                        continue;
-                    }
-                }
-                Op::JumpIfFalse { cond, target } => {
-                    if !eval::cond(self.get(cond)?, "jump-if-false")? {
-                        pc = jump_target(target, end)?;
-                        continue;
-                    }
-                }
-
-                Op::Move { dst, src } => {
-                    let v = self.get(src)?;
-                    self.set(dst, v)?;
-                }
-                Op::LoadConst { dst, index } => {
-                    let v = *constants
-                        .get(index as usize)
-                        .ok_or(VmError::BadConstant(index))?;
-                    self.set(dst, v)?;
-                }
-                Op::LoadNil { dst } => self.set(dst, Value::nil())?,
-                Op::LoadBool { dst, val } => self.set(dst, Value::bool(val))?,
-                Op::LoadInt { dst, val } => self.set(dst, Value::int(val))?,
-
-                Op::Add { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::add)?,
-                Op::Sub { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::sub)?,
-                Op::Mul { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::mul)?,
-                Op::Div { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::div)?,
-                Op::Rem { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::rem)?,
-                Op::Neg { dst, src } => {
-                    let v = eval::neg(self.get(src)?)?;
-                    self.set(dst, v)?;
-                }
-
-                Op::Eq { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::eq_op)?,
-                Op::Ne { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::ne_op)?,
-                Op::Lt { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::lt)?,
-                Op::Le { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::le)?,
-                Op::Gt { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::gt)?,
-                Op::Ge { dst, lhs, rhs } => self.binop(dst, lhs, rhs, eval::ge)?,
-
-                Op::Not { dst, src } => {
-                    let v = eval::not(self.get(src)?)?;
-                    self.set(dst, v)?;
-                }
-            }
-
-            pc += 1;
-        }
-    }
-
-    /// Read register `r`, or fault if it is outside the register file.
-    #[inline]
-    fn get(&self, r: u16) -> Result<Value, VmError> {
-        self.registers
-            .get(r as usize)
-            .copied()
-            .ok_or(VmError::BadRegister(r))
-    }
-
-    /// Write `value` into register `r`, or fault if it is outside the file.
-    #[inline]
-    fn set(&mut self, r: u16, value: Value) -> Result<(), VmError> {
-        let slot = self
-            .registers
-            .get_mut(r as usize)
-            .ok_or(VmError::BadRegister(r))?;
-        *slot = value;
-        Ok(())
-    }
-
-    /// Evaluate a three-address binary instruction: read both operands, apply
-    /// `f`, store into `dst`. Shared by every arithmetic and comparison opcode.
-    #[inline]
-    fn binop(
+    pub fn run_with(
         &mut self,
-        dst: u16,
-        lhs: u16,
-        rhs: u16,
-        f: fn(Value, Value) -> Result<Value, VmError>,
-    ) -> Result<(), VmError> {
-        let a = self.get(lhs)?;
-        let b = self.get(rhs)?;
-        let v = f(a, b)?;
-        self.set(dst, v)
+        func: FuncId,
+        args: &[Value],
+        limits: Limits,
+    ) -> Result<Value, VmError> {
+        self.m.heap.limit = limits.memory;
+        self.m.max_depth = limits.depth;
+        self.m.max_stack = limits.stack;
+        let mut fuel = limits.fuel;
+        let result = self.run_inner(func, args, &mut fuel);
+        self.fuel_used = limits.fuel - fuel;
+        result
+    }
+
+    fn run_inner(
+        &mut self,
+        func: FuncId,
+        args: &[Value],
+        fuel: &mut u64,
+    ) -> Result<Value, VmError> {
+        let prog = self.prog;
+        if !self.ready {
+            self.m
+                .init_globals(prog)
+                .map_err(|(g, f)| VmError::GlobalInit {
+                    global: GlobalId(g),
+                    kind: fault_kind(f),
+                })?;
+            if let Some(start) = prog.module.start() {
+                let _ = exec::execute(&mut self.m, prog, start.0, &[], fuel)?;
+            }
+            self.ready = true;
+        }
+        let info = prog.func(func.0).ok_or(VmError::NoSuchFunction(func))?;
+        if !info.captures.is_empty() {
+            return Err(VmError::NeedsClosure(func));
+        }
+        if args.len() != info.nparams {
+            return Err(VmError::ArgumentCount {
+                expected: info.nparams,
+                found: args.len(),
+            });
+        }
+        let mut words = Vec::with_capacity(args.len());
+        for (index, (&v, &ty)) in args.iter().zip(info.regs.iter()).enumerate() {
+            let w = conv::slot_of(&mut self.m.heap, prog, ty, v)
+                .map_err(|_| VmError::ArgumentType { index })?;
+            words.push(w);
+        }
+        let out = exec::execute(&mut self.m, prog, func.0, &words, fuel)?;
+        Ok(match (out, info.result) {
+            (Some(w), Some(ty)) => conv::value_of(&self.m.heap, ty, w),
+            _ => Value::Nil,
+        })
+    }
+
+    /// Fuel the last run consumed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::{Inst, ModuleBuilder};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let mut f = m.function("f", &[], &[]);
+    /// f.emit(Inst::Safepoint {});
+    /// f.emit(Inst::Safepoint {});
+    /// f.ret_void();
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.fuel_used(), 2);
+    /// ```
+    #[must_use]
+    pub fn fuel_used(&self) -> u64 {
+        self.fuel_used
+    }
+
+    /// Bytes of heap currently charged against the memory budget.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let before = vm.heap_bytes();
+    /// vm.new_str(&[0; 100]).unwrap();
+    /// assert!(vm.heap_bytes() >= before + 100);
+    /// ```
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.m.heap.used()
+    }
+
+    /// Live heap objects (exact after a collection).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.new_str(b"x").unwrap();
+    /// assert_eq!(vm.heap_objects(), 1);
+    /// vm.collect_garbage();
+    /// assert_eq!(vm.heap_objects(), 0); // nothing referenced it
+    /// ```
+    #[must_use]
+    pub fn heap_objects(&self) -> usize {
+        self.m.heap.len()
+    }
+
+    /// Collections run so far.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.collect_garbage();
+    /// assert_eq!(vm.collections(), 1);
+    /// ```
+    #[must_use]
+    pub fn collections(&self) -> u64 {
+        self.m.heap.stats.collections
+    }
+
+    /// Collects now, keeping what globals and constant caches reach. Values
+    /// from earlier runs that nothing else references are freed (their
+    /// handles then read as `nil`).
+    ///
+    /// # Examples
+    ///
+    /// See [`heap_objects`](Vm::heap_objects).
+    pub fn collect_garbage(&mut self) {
+        let stack = core::mem::take(&mut self.m.stack);
+        self.m.collect(&stack, self.prog);
+        self.m.stack = stack;
+    }
+
+    /// The current value of a global.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Const, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let k = m.constant(Const::Int(7));
+    /// let g = m.global("seven", ValType::I64, false, Some(k));
+    /// let mut f = m.function("f", &[], &[]);
+    /// f.ret_void();
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// vm.run(id, &[]).unwrap(); // the first run initialises globals
+    /// assert_eq!(vm.global(g), Some(Value::Int(7)));
+    /// ```
+    #[must_use]
+    pub fn global(&self, id: GlobalId) -> Option<Value> {
+        let ty = *self.prog.global_types.get(id.index())?;
+        let w = *self.m.globals.get(id.index())?;
+        Some(conv::value_of(&self.m.heap, ty, w))
+    }
+
+    /// The dynamic kind of a value (LSB §2.2).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Kind, ModuleBuilder};
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let s = vm.new_str(b"abc").unwrap();
+    /// assert_eq!(vm.kind(s), Kind::Str);
+    /// assert_eq!(vm.kind(Value::Float(1.0)), Kind::Float);
+    /// ```
+    #[must_use]
+    pub fn kind(&self, v: Value) -> Kind {
+        host::value_kind(&self.m.heap, v)
+    }
+
+    /// The bytes of a string value.
+    ///
+    /// # Examples
+    ///
+    /// See [`kind`](Vm::kind).
+    #[must_use]
+    pub fn str_bytes(&self, v: Value) -> Option<&[u8]> {
+        match v {
+            Value::Obj(Obj(w)) => self.m.heap.str(w),
+            _ => None,
+        }
+    }
+
+    /// Allocates a string (to pass to a run).
+    ///
+    /// # Errors
+    ///
+    /// The `OutOfMemory` trap as [`VmError::Trap`] when the budget is spent.
+    ///
+    /// # Examples
+    ///
+    /// See [`kind`](Vm::kind).
+    pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, VmError> {
+        self.m.heap.limit = self.limits.memory;
+        self.m
+            .heap
+            .alloc_str(bytes)
+            .map(|w| Value::Obj(Obj(w)))
+            .map_err(|f| VmError::Trap {
+                kind: fault_kind(f),
+                func: FuncId(u32::MAX),
+                pc: 0,
+            })
+    }
+
+    /// The elements of an array value, as values.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Const, Inst, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let one = m.constant(Const::Int(1));
+    /// let two = m.constant(Const::Int(2));
+    /// let arr = m.constant(Const::Array(vec![one, two]));
+    /// let mut f = m.function("f", &[], &[ValType::Dyn]);
+    /// let r = f.reg(ValType::Dyn);
+    /// f.emit(Inst::DLoadConst { dst: r, k: arr });
+    /// f.ret(r);
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let v = vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.elements(v), Some(vec![Value::Int(1), Value::Int(2)]));
+    /// ```
+    #[must_use]
+    pub fn elements(&self, v: Value) -> Option<Vec<Value>> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        match self.m.heap.get(w)? {
+            Object::Array(a) => Some(
+                a.items
+                    .iter()
+                    .map(|&x| conv::value_of(&self.m.heap, a.elem, x))
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// The entries of a map value, in insertion order.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Const, Inst, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let k = m.constant(Const::Int(10));
+    /// let v = m.constant(Const::Bool(true));
+    /// let map = m.constant(Const::Map(vec![(k, v)]));
+    /// let mut f = m.function("f", &[], &[ValType::Dyn]);
+    /// let r = f.reg(ValType::Dyn);
+    /// f.emit(Inst::DLoadConst { dst: r, k: map });
+    /// f.ret(r);
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let out = vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.entries(out), Some(vec![(Value::Int(10), Value::Bool(true))]));
+    /// ```
+    #[must_use]
+    pub fn entries(&self, v: Value) -> Option<Vec<(Value, Value)>> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        match self.m.heap.get(w)? {
+            Object::Map(m) => Some(
+                m.store
+                    .entries()
+                    .iter()
+                    .filter(|e| e.live)
+                    .map(|e| {
+                        (
+                            conv::value_of(&self.m.heap, m.key, e.key),
+                            conv::value_of(&self.m.heap, m.value, e.value),
+                        )
+                    })
+                    .collect(),
+            ),
+            _ => None,
+        }
+    }
+
+    /// Field `index` of a struct value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::{Field, FieldIdx, Inst, ModuleBuilder, StructDef, TypeDef, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let name = m.string("x");
+    /// let point = m.add_type(TypeDef::Struct(StructDef {
+    ///     name,
+    ///     fields: vec![Field { name, ty: ValType::I64 }],
+    ///     ..Default::default()
+    /// }));
+    /// let mut f = m.function("f", &[], &[ValType::Ref(point)]);
+    /// let (obj, val) = (f.reg(ValType::Ref(point)), f.reg(ValType::I64));
+    /// let ty = f.type_ref(point);
+    /// f.emit(Inst::NewStruct { dst: obj, ty });
+    /// f.emit(Inst::LoadInt { dst: val, val: 5, ty: bytecode_lang::IntTy::I64 });
+    /// f.emit(Inst::SetField { obj, field: FieldIdx(0), src: val });
+    /// f.ret(obj);
+    /// let id = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// let out = vm.run(id, &[]).unwrap();
+    /// assert_eq!(vm.field(out, 0), Some(Value::Int(5)));
+    /// ```
+    #[must_use]
+    pub fn field(&self, v: Value, index: usize) -> Option<Value> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        match self.m.heap.get(w)? {
+            Object::Struct(s) => {
+                let ty = *self.prog.struct_info(s.ty)?.fields.get(index)?;
+                Some(conv::value_of(&self.m.heap, ty, *s.fields.get(index)?))
+            }
+            _ => None,
+        }
+    }
+
+    /// The error code of a runtime error value (`1` for E0001).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Value, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// assert_eq!(Vm::new(&p).error_code(Value::Int(1)), None);
+    /// ```
+    #[must_use]
+    pub fn error_code(&self, v: Value) -> Option<u32> {
+        let Value::Obj(Obj(w)) = v else { return None };
+        match self.m.heap.get(w)? {
+            Object::Error(e) => Some(e.kind.code()),
+            _ => None,
+        }
     }
 }
 
-/// Validate a branch target against the code length.
-///
-/// A target equal to or past the end can never be a real instruction, so it is a
-/// structural fault rather than a silent halt.
-#[inline]
-fn jump_target(target: u32, end: usize) -> Result<usize, VmError> {
-    let t = target as usize;
-    if t >= end {
-        Err(VmError::BadJump(target))
-    } else {
-        Ok(t)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
-    use super::*;
-
-    /// Build, run, and unwrap a small chunk in one shot.
-    fn run(ops: &[Op], constants: &[Value]) -> Result<Value, VmError> {
-        let mut chunk = Chunk::new();
-        for &v in constants {
-            let _ = chunk.constant(v);
-        }
-        for &op in ops {
-            let _ = chunk.emit(op);
-        }
-        Vm::new().run(&chunk)
-    }
-
-    #[test]
-    fn test_return_yields_register_value() {
-        let out = run(
-            &[Op::LoadInt { dst: 0, val: 42 }, Op::Return { src: 0 }],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(out.as_int(), Some(42));
-    }
-
-    #[test]
-    fn test_halt_yields_nil() {
-        let out = run(&[Op::Halt], &[]).unwrap();
-        assert!(out.is_nil());
-    }
-
-    #[test]
-    fn test_load_const_reads_pool() {
-        let out = run(
-            &[Op::LoadConst { dst: 0, index: 0 }, Op::Return { src: 0 }],
-            &[Value::float(2.5)],
-        )
-        .unwrap();
-        assert_eq!(out.as_float(), Some(2.5));
-    }
-
-    #[test]
-    fn test_arithmetic_chain() {
-        // (4 * 5) - 2 = 18
-        let out = run(
-            &[
-                Op::LoadInt { dst: 0, val: 4 },
-                Op::LoadInt { dst: 1, val: 5 },
-                Op::Mul {
-                    dst: 0,
-                    lhs: 0,
-                    rhs: 1,
-                },
-                Op::LoadInt { dst: 1, val: 2 },
-                Op::Sub {
-                    dst: 0,
-                    lhs: 0,
-                    rhs: 1,
-                },
-                Op::Return { src: 0 },
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(out.as_int(), Some(18));
-    }
-
-    #[test]
-    fn test_conditional_branch_taken() {
-        // if 1 < 2 { return 10 } else { return 20 }
-        let out = run(
-            &[
-                Op::LoadInt { dst: 0, val: 1 },
-                Op::LoadInt { dst: 1, val: 2 },
-                Op::Lt {
-                    dst: 2,
-                    lhs: 0,
-                    rhs: 1,
-                },
-                Op::JumpIfFalse { cond: 2, target: 6 },
-                Op::LoadInt { dst: 0, val: 10 },
-                Op::Return { src: 0 },
-                Op::LoadInt { dst: 0, val: 20 },
-                Op::Return { src: 0 },
-            ],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(out.as_int(), Some(10));
-    }
-
-    #[test]
-    fn test_loop_sums_with_back_edge() {
-        // sum = 0; i = 1; while i <= 5 { sum += i; i += 1 } return sum  => 15
-        let mut chunk = Chunk::new();
-        // r0 = sum, r1 = i, r2 = limit, r3 = one, r4 = cond
-        let _ = chunk.emit(Op::LoadInt { dst: 0, val: 0 });
-        let _ = chunk.emit(Op::LoadInt { dst: 1, val: 1 });
-        let _ = chunk.emit(Op::LoadInt { dst: 2, val: 5 });
-        let _ = chunk.emit(Op::LoadInt { dst: 3, val: 1 });
-        let cond_at = chunk.emit(Op::Le {
-            dst: 4,
-            lhs: 1,
-            rhs: 2,
-        });
-        let exit_branch = chunk.emit(Op::JumpIfFalse { cond: 4, target: 0 });
-        let _ = chunk.emit(Op::Add {
-            dst: 0,
-            lhs: 0,
-            rhs: 1,
-        });
-        let _ = chunk.emit(Op::Add {
-            dst: 1,
-            lhs: 1,
-            rhs: 3,
-        });
-        let _ = chunk.emit(Op::Jump { target: cond_at });
-        let exit = chunk.emit(Op::Return { src: 0 });
-        assert!(chunk.patch(
-            exit_branch,
-            Op::JumpIfFalse {
-                cond: 4,
-                target: exit,
-            },
-        ));
-
-        assert_eq!(Vm::new().run(&chunk).unwrap().as_int(), Some(15));
-    }
-
-    #[test]
-    fn test_no_terminator_errors() {
-        assert_eq!(
-            run(&[Op::LoadInt { dst: 0, val: 1 }], &[]),
-            Err(VmError::NoTerminator)
-        );
-    }
-
-    #[test]
-    fn test_empty_chunk_errors() {
-        assert_eq!(Vm::new().run(&Chunk::new()), Err(VmError::NoTerminator));
-    }
-
-    #[test]
-    fn test_bad_constant_index_errors() {
-        assert_eq!(
-            run(
-                &[Op::LoadConst { dst: 0, index: 3 }, Op::Return { src: 0 }],
-                &[]
-            ),
-            Err(VmError::BadConstant(3))
-        );
-    }
-
-    #[test]
-    fn test_out_of_range_jump_errors() {
-        assert_eq!(
-            run(&[Op::Jump { target: 99 }], &[]),
-            Err(VmError::BadJump(99))
-        );
-    }
-
-    #[test]
-    fn test_branch_on_non_bool_type_mismatch() {
-        assert_eq!(
-            run(
-                &[
-                    Op::LoadInt { dst: 0, val: 1 },
-                    Op::JumpIfTrue { cond: 0, target: 0 },
-                    Op::Halt,
-                ],
-                &[],
-            ),
-            Err(VmError::TypeMismatch { op: "jump-if-true" })
-        );
-    }
-
-    #[test]
-    fn test_vm_reuse_resets_registers() {
-        let mut vm = Vm::new();
-        let first = {
-            let mut c = Chunk::new();
-            let _ = c.emit(Op::LoadInt { dst: 0, val: 7 });
-            let _ = c.emit(Op::Return { src: 0 });
-            vm.run(&c).unwrap()
-        };
-        assert_eq!(first.as_int(), Some(7));
-        // A second chunk that returns an untouched register must see `nil`,
-        // proving the file was reset rather than carrying `7` forward.
-        let mut c = Chunk::new();
-        let _ = c.emit(Op::LoadInt { dst: 5, val: 1 });
-        let _ = c.emit(Op::Return { src: 0 });
-        assert!(vm.run(&c).unwrap().is_nil());
+/// The error kind of a fault outside a run.
+fn fault_kind(f: Fault) -> bytecode_lang::ErrorKind {
+    match f {
+        Fault::Raise(k) | Fault::Trap(k) => k,
+        Fault::Throw(_) | Fault::Unsupported(_) => bytecode_lang::ErrorKind::TypeError,
     }
 }

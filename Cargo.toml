@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "bvm-lang"
-version = "1.0.0"
+version = "2.0.0-alpha.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Bytecode VM and interpreter loop."
+description = "The LSB bytecode VM: executes bytecode-lang modules with typed and dynamic values, PHP-style ordered maps, exceptions, a tracing GC, fuel, and memory budgets."
 
 # Keywords (5 max)
 keywords = ["language", "runtime", "vm", "bytecode"]
@@ -45,19 +45,18 @@ path = "src/lib.rs"
 # #################################
 [features]
 default = ["std"]
-std = ["value-lang/std"]
-# Serialization support for bytecode (`Op`, `Chunk`) and `Value`.
-serde = ["dep:serde", "value-lang/serde"]
+# Hardware float math (sqrt, fma, rounding) from `std`, and a per-VM random
+# hash seed. Without it the crate is `no_std` + `alloc` and uses its own
+# correctly rounded software float routines and a fixed seed.
+std = ["bytecode-lang/std"]
 
 
 # DEPENDENCIES
 # #################################
 [dependencies]
-# Runtime operand type. `Value` is the eight-byte NaN-boxed value every
-# instruction reads and writes; the VM speaks the same value as the rest of the
-# language-construction family. Pinned to the published 1.x.
-value-lang = { version = "1", default-features = false }
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# LSB: the instruction set, module model, and budgeted decoder the VM executes.
+# bvm-lang 2.0 runs exactly this format; it has no instruction set of its own.
+bytecode-lang = { version = "0.2", default-features = false }
 
 
 # DEV DEPENDENCIES
@@ -65,11 +64,6 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 criterion  = { version = "0.5", features = ["html_reports"] }
 proptest   = "1"
-# Concrete format for the `serde` round-trip tests (bytecode persistence).
-serde_json = "1"
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
 
 
 # BENCHMARKS
