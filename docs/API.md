@@ -1,8 +1,9 @@
 # bvm-lang &mdash; API Reference
 
 > Complete reference for every public item in `bvm-lang`, with examples.
-> **Status: 2.0.0-alpha.3, a pre-release** executing LSB format 2
-> (bytecode-lang 0.3). The surface may still change before
+> **Status: 2.0.0-alpha.4, a pre-release** executing LSB format 2
+> (bytecode-lang 0.3) under two memory profiles, tracing and reference
+> counting. The surface may still change before
 > `2.0.0` (see [Stability](#stability) and [`STABILITY.md`](./STABILITY.md)).
 > Instruction semantics are those of LSB (`_lexersketch/specs/LSB.md`) and OPS
 > (`_lexersketch/specs/OPS.md`); this file documents the Rust API around them.
@@ -28,6 +29,8 @@
   - [Coroutines](#coroutines)
   - [Tasks and the built-in scheduler](#tasks-and-the-built-in-scheduler)
   - [Memory and collection](#memory-and-collection)
+  - [Memory profiles](#memory-profiles)
+  - [Destructors](#destructors)
   - [Instruction coverage](#instruction-coverage)
 - [`Program`](#program)
   - [`Program::load`](#programload)
@@ -38,6 +41,8 @@
 - [`Vm`](#vm)
   - [`Vm::new`](#vmnew)
   - [`Vm::with_limits`](#vmwith_limits)
+  - [`Vm::with_memory`](#vmwith_memory)
+  - [`Vm::set_destructor`](#vmset_destructor)
   - [`Vm::run`](#vmrun)
   - [`Vm::run_with`](#vmrun_with)
   - [`Vm::run_export`](#vmrun_export)
@@ -46,6 +51,8 @@
   - [Inspecting values](#inspecting-values)
   - [Heap and fuel statistics](#heap-and-fuel-statistics)
 - [`Limits`](#limits)
+- [`Memory`](#memory)
+- [`MemoryStats`](#memorystats)
 - [`Value`](#value)
 - [`Obj`](#obj)
 - [`Host`](#host)
@@ -71,8 +78,8 @@
 
 ```toml
 [dependencies]
-bvm-lang = "=2.0.0-alpha.2"
-bytecode-lang = "0.2"
+bvm-lang = "=2.0.0-alpha.4"
+bytecode-lang = "0.3"
 ```
 
 ## Quick start
@@ -212,6 +219,22 @@ invocation is the charge). Between two charges a
 run executes at most one function's length of instructions, so fuel bounds
 total work even for modules a verifier would reject for lacking safepoints.
 
+Two charges go beyond LSB §5.14 (both recorded for LSB in the ROADMAP):
+
+- **Large dynamic calls** (ISSUES P33). A `dcall_shape` whose flattened
+  call has `n` items is charged `n / 64` units more, right after flattening
+  and before binding (so a spread of a million items cannot be bound for
+  one unit, and binding errors after a large flattening are charged these
+  units); the `OutOfFuel` trap there has no effect. Calls of fewer than 64
+  items, every call whose arguments are a window among them, cost exactly
+  what LSB says.
+- **The RC cycle collector** charges one unit per 64 objects it visits (at
+  least one per automatic collection), so a program cannot make collection
+  work unbounded; a budget it spends traps at the next charge point. This
+  happens only under [`Memory::Rc`](#memory), when its possible-roots buffer
+  fills, so where it lands depends on allocation, like the tracing
+  collector's timing.
+
 [`Limits`](#limits) also bounds heap bytes (the `OutOfMemory` trap; large
 buffers are checked before they are requested; suspended coroutines' stacks
 count), call depth (hook frames and running coroutines' frames included),
@@ -283,8 +306,15 @@ case. The VM binds exactly as `ParamList::bind` states it:
    parameter has a default, so the callee computes the others' defaults.
 
 A callee without a list takes exactly its parameters, positionally. All-
-positional calls take a binder that allocates nothing (property-tested
-against `ParamList::bind`); calls with named items use `ParamList::bind`.
+positional calls take a binder that allocates nothing; calls with named items
+take a binder that finds each named parameter through a hashed name index
+built at load time for lists of more than eight named parameters (a scan
+for smaller ones) and checks names repeated in a rest collection with an
+ordered set, so binding `n` items is O(n log n) whatever the list (ISSUES
+P33). Both are property-tested against `ParamList::bind`, slot for slot and
+presence bit for presence bit. A rest parameter that receives nothing gets
+an empty collection sharing one empty storage, which it copies on its first
+write.
 `coro_new_indirect` and `spawn` with a `dyn` callee bind the same way.
 `dparam_ref`/`dparam_ref_named` answer, before an argument is evaluated,
 whether the callee takes it by reference (false for non-callables, callees
@@ -313,6 +343,17 @@ follow the bits, never reference counts or collection timing, so they are
 deterministic; which object `dsep_*` returns when nothing was shared is not
 specified by LSB, and value-semantics code never asks.
 
+Both [memory profiles](#memory-profiles) make these decisions with the
+bits. LSB §5.16 would let a reference-counted runtime separate exactly when
+a count is above one instead; that gives the same contents for code that
+keeps the value discipline, but not for code that stores a container without
+`dup` (the differential tests generate such code and found a case), and it
+would count a dead temporary register as a second holder and copy on every
+pass of a loop. With the bits, the profiles separate alike on every program.
+Counts decide only whether a copy is *physical* (another container still
+holds the storage), which is where [`Memory::Rc`](#memory) unbinds
+references (next section).
+
 ### References
 
 A reference (kind `reference`, LSB §5.17) is a box holding one `dyn` value,
@@ -333,6 +374,22 @@ a value to store stores its value. A copy of a container shares its
 reference slots (PHP's behaviour while the reference is held elsewhere);
 `dup` of a reference itself is a `TypeError`. References, like cells, are
 traced, so reference cycles are collected.
+
+**Unbinding on copy** (LSB §5.17 "the one divergence"; ISSUES P34). PHP
+also drops a reference when an array is copied and nothing else holds it
+(its refcount is 1): after `foreach ($a as &$v) {} unset($v);`, `$b = $a;
+$b[0] = 7;` leaves `$a[0]` alone. The tracing profile cannot see counts, so
+it keeps LSB's rule: the copy shares every reference slot until `dunref_*`
+unbinds it. Under [`Memory::Rc`](#memory) every copy of contents (the
+copy-on-write copy a write makes, and `dup` of a struct, PHP's `clone`)
+replaces each reference slot whose reference only the copied contents hold
+by a plain slot of the reference's value (separated as by `dup` when an
+array or map), exactly PHP's `zend_array_dup` rule, and a write through a
+reference slot of shared contents makes the copy first (PHP's
+`SEPARATE_ARRAY`). A reference still bound elsewhere (`$v` above, not
+unset) stays shared, in both profiles. This covers PHP's semantics even
+when a code generator never emits `dunref_*` (bcgen-lang 0.3 does not).
+[`MemoryStats::unbound`](#memorystats) counts the unbindings.
 
 ### `pow` and the shared `ls_pow`
 
@@ -442,11 +499,107 @@ awaits is freed when next found unreachable. Created, returned, and failed
 coroutines run no code and are freed. Collection timing is this VM's own, so
 when a close runs is not something other tiers reproduce.
 
+All of this is the tracing profile, the default. The reference-counting
+profile frees objects at their last reference instead; see the next
+section.
+
+### Memory profiles
+
+A VM runs under one of two memory profiles, chosen when it is made
+([`Vm::with_memory`](#vmwith_memory), [`Memory`](#memory)): the language's
+`[runtime] memory` key (DECISIONS D22). LSB format 2 has no module flag for
+it, so the runner chooses (`"gc"` is [`Memory::Tracing`](#memory), `"rc"` is
+[`Memory::Rc`](#memory)).
+
+| | `Memory::Tracing` (default) | `Memory::Rc` |
+|---|---|---|
+| Freeing | mark and sweep, after enough allocation | at the last reference, before the next instruction |
+| Garbage cycles | traced | trial deletion (Bacon and Rajan's synchronous collector, as PHP's) when 10,000 possible roots are buffered, fuel-charged |
+| Dropped suspended coroutine closed | at the next fuel charge point after the collection that finds it | at the last reference, before the next instruction |
+| [Destructors](#destructors) | after the collection that finds the object | at the last reference, before the next instruction (PHP's timing) |
+| Copying contents holding a reference only they hold | the copy shares the reference (LSB) | the copy holds the value (PHP) |
+| `dsep_*` and copy-on-write decisions | the `cow`/`aliased` bits | the same bits (counts decide only whether a copy is physical) |
+
+Everything else is identical: results, errors and their locations, globals,
+fuel (outside the RC cycle collector's charges), and limits. The
+differential tests run the same random programs under both and compare them
+with the reference interpreters wherever none of the rows above applied.
+
+**How RC counts.** Every holder of a reference word counts once: a
+reference-typed register of a live or suspended frame, a frame's closure, a
+reference-typed slot of an object (array and map storage counts its words
+once however many containers share it), a global, a constant cache, a
+running or queued coroutine, the scheduler, and a value handed to the host
+(a run's result, an uncaught error, `new_str`'s string: held until the next
+run or [`collect_garbage`](#heap-and-fuel-statistics)). A count reaching zero
+frees nothing at once: the object waits on a list the VM settles before the
+next instruction, so no word an instruction holds can go stale while it
+runs, and freeing is iterative whatever the depth of what dies (a
+million-node chain is freed in one go without recursion). Objects die in
+PHP's order: a function's variables in declaration order when it returns, an
+array's elements first to last, an object before what it holds. Counts are
+kept in place over the existing generation-checked slots; there is no raw
+pointer and no `unsafe`. A count that would pass `u32::MAX` sticks there
+(the object is never freed again) and the run ends with the `OutOfMemory`
+trap at the next instruction boundary.
+
+**Cycles.** A garbage cycle keeps its counts above zero, so every object
+whose count drops to a value above zero is buffered as a possible root. When
+10,000 are buffered (at an allocating instruction), or when the budget is
+tight, the collector marks gray what they reach, subtracting internal
+references, restores what is still held from outside, and frees the rest.
+Shared array and map storage is a node of its own, so cycles through `dup`ed
+containers are found. A collection that frees fewer than 100 objects raises
+the threshold by 10,000 (up to 1,000,000), as PHP does, so a program whose
+buffered roots are all live cannot make every collection wasted. Every phase
+uses work lists (a million-node ring is collected without recursion). Objects
+in a garbage cycle that need code (a destructor, a suspended coroutine to
+close) are kept, with what they reach, until that code has run; the next
+collection frees them if they are still garbage.
+[`collect_garbage`](#heap-and-fuel-statistics) runs a full collection.
+
+**Memory accounting.** Freeing refunds an object's bytes at once (storage
+when its last holder goes), so a loop that makes and drops objects stays
+inside a small budget without collections. A `dup` is charged its share of
+storage it does not own, so between recounts the estimate can only be high,
+never low; recounts are rationed like tracing collections (after as much was
+charged as was held at the last one).
+
+### Destructors
+
+[`Vm::set_destructor`](#vmset_destructor) names the destructor method of
+struct types (PHP's `__destruct`): every struct type whose methods, its own
+or inherited, include one of that name has it called with the instance as
+its one argument when the instance dies. LSB format 2 has no destructor
+flag; the method is named by the language's convention.
+
+- Under [`Memory::Rc`](#memory): at the last reference, before the next
+  instruction, as PHP calls `__destruct` (reassignment, `unset`, scope exit,
+  an array element overwritten, the array holding it destroyed); for an
+  object in a garbage cycle, when the cycle collector finds it. Objects that
+  die together are destructed one after another, each followed by what its
+  freeing releases (never nested inside each other); what a destructor
+  itself drops is destructed inside it, as in PHP.
+- Under [`Memory::Tracing`](#memory): the collection that finds the object
+  unreachable keeps it and queues it after the dropped coroutines; it runs
+  at the next fuel charge point of a run, or on
+  [`run_finalizers`](#vmrun_finalizers).
+
+In both, a destructor runs at most once per object; its result is
+discarded; an error escaping it is discarded (as a drop-close's is; PHP
+would raise it where the object died, see the release notes); a trap ends
+the run; it is charged fuel like any code; one the depth or register limits
+cannot hold is skipped (the object is freed all the same). An object a
+destructor stores somewhere lives on and is not destructed again. Objects
+still reachable when the VM is dropped are not destructed: PHP's shutdown
+pass is the host's call (let go, [`collect_garbage`](#heap-and-fuel-statistics),
+[`run_finalizers`](#vmrun_finalizers)).
+
 ### Instruction coverage
 
 All 200 instructions of LSB format 2 execute.
 
-| LSB group | Opcodes | 2.0.0-alpha.3 |
+| LSB group | Opcodes | 2.0.0-alpha.4 |
 |---|---|---|
 | Moves, constants, globals (§5.1) | `0x00`-`0x0A` | implemented; `load_import` of any import, parameter list included |
 | Integer arithmetic and comparison (§5.2) | `0x10`-`0x27` | implemented, every policy, `shift = saturate`, `ipow` |
@@ -606,11 +759,11 @@ assert_eq!(p.location(func, pc).unwrap().to_string(), "app.mox:12:5");
 pub struct Vm<'p> { /* private */ }
 ```
 
-An instance of a [`Program`](#program): its heap, globals, default limits, and
-pooled register stack. The first run initialises the globals from their
-initialisers and runs the module's start function (if either fails, the next
-run tries again); later runs see the globals and heap objects earlier runs
-left. A `Vm` is `Send`.
+An instance of a [`Program`](#program): its heap, globals, default limits,
+memory profile, and pooled register stack. The first run initialises the
+globals from their initialisers and runs the module's start function (if
+either fails, the next run tries again); later runs see the globals and heap
+objects earlier runs left. A `Vm` is `Send`.
 
 ### `Vm::new`
 
@@ -650,6 +803,112 @@ let mut vm = Vm::with_limits(&p, Limits::new().with_fuel(10_000));
 assert_eq!(vm.limits().fuel(), 10_000);
 vm.set_limits(Limits::new());
 assert_eq!(vm.limits().fuel(), u64::MAX);
+```
+
+### `Vm::with_memory`
+
+```rust,ignore
+pub fn with_memory(program: &'p Program, memory: Memory) -> Vm<'p>
+pub fn memory(&self) -> Memory
+```
+
+An instance under a [memory profile](#memory-profiles), with
+[`Limits::new`](#limits) (change them with `set_limits`); `memory` reads
+the profile, which is fixed for the VM's life. `Vm::new` and
+`Vm::with_limits` use [`Memory::Tracing`](#memory).
+
+```rust
+use bvm_lang::{Host, Memory, Program, Vm};
+use bytecode_lang::{Const, Inst, ModuleBuilder, ValType};
+
+// t = s . s; t = nil -- under RC the concatenation dies at once.
+let mut m = ModuleBuilder::new();
+let k = m.constant(Const::Bytes(b"temporary".to_vec()));
+let mut f = m.function("f", &[], &[]);
+let (s, t) = (f.reg(ValType::Dyn), f.reg(ValType::Dyn));
+f.emit(Inst::DLoadConst { dst: s, k });
+f.emit(Inst::DConcat { dst: t, lhs: s, rhs: s });
+f.emit(Inst::LoadNil { dst: t });
+f.ret_void();
+let f = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+
+let mut rc = Vm::with_memory(&p, Memory::Rc);
+rc.run(f, &[]).unwrap();
+assert_eq!(rc.heap_objects(), 1); // the constant's string (its cache holds it)
+let mut gc = Vm::new(&p);
+gc.run(f, &[]).unwrap();
+assert_eq!(gc.heap_objects(), 2); // the concatenation waits for a collection
+```
+
+### `Vm::set_destructor`
+
+```rust,ignore
+pub fn set_destructor(&mut self, name: &str) -> Result<usize, VmError>
+```
+
+Names the destructor method of struct types (see
+[Destructors](#destructors)) and returns how many struct types got one
+(their own method of that name, or an inherited one). A name no method has
+(the empty name, say) clears every destructor.
+
+**Errors.** [`VmError::BadDestructor`](#vmerror) when a method the name finds
+cannot take the instance as its one argument: it has a different number of
+parameters, its parameter is neither `dyn` nor a `ref` to the struct or an
+ancestor, or it has captures. Nothing changes then.
+
+```rust
+use bvm_lang::{Host, Memory, Program, Value, Vm};
+use bytecode_lang::{Inst, IntOp, IntTy, Method, ModuleBuilder, StructDef, TypeDef, ValType};
+
+let mut m = ModuleBuilder::new();
+let (name, dtor) = (m.string("Res"), m.string("__destruct"));
+let res = m.reserve_type();
+let log = m.global("log", ValType::I64, true, None);
+// __destruct($this) { log = log * 10 + 1 }
+let mut d = m.function("Res::__destruct", &[ValType::Dyn], &[]);
+let (v, ten, one) = (d.reg(ValType::I64), d.reg(ValType::I64), d.reg(ValType::I64));
+let op = IntOp::new(IntTy::I64);
+d.emit(Inst::GetGlobal { dst: v, global: log });
+d.emit(Inst::LoadInt { dst: ten, val: 10, ty: IntTy::I64 });
+d.emit(Inst::LoadInt { dst: one, val: 1, ty: IntTy::I64 });
+d.emit(Inst::IMul { dst: v, lhs: v, rhs: ten, op });
+d.emit(Inst::IAdd { dst: v, lhs: v, rhs: one, op });
+d.emit(Inst::SetGlobal { global: log, src: v });
+d.ret_void();
+let d = m.add_function(d).unwrap();
+m.define_type(res, TypeDef::Struct(StructDef {
+    name,
+    methods: vec![Method { name: dtor, func: d }],
+    ..Default::default()
+}));
+// main() { $o = new Res; $o = null; log = log * 10 + 9; return log }
+let mut f = m.function("main", &[], &[ValType::I64]);
+let (o, r, nine, ten) = (f.reg(ValType::Dyn), f.reg(ValType::I64), f.reg(ValType::I64), f.reg(ValType::I64));
+let ty = f.type_ref(res);
+f.emit(Inst::NewStruct { dst: o, ty });
+f.emit(Inst::LoadNil { dst: o });
+f.emit(Inst::GetGlobal { dst: r, global: log });
+f.emit(Inst::LoadInt { dst: ten, val: 10, ty: IntTy::I64 });
+f.emit(Inst::LoadInt { dst: nine, val: 9, ty: IntTy::I64 });
+f.emit(Inst::IMul { dst: r, lhs: r, rhs: ten, op });
+f.emit(Inst::IAdd { dst: r, lhs: r, rhs: nine, op });
+f.emit(Inst::SetGlobal { global: log, src: r });
+f.ret(r);
+let main = m.add_function(f).unwrap();
+let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+
+// PHP's order: the destructor at `$o = null`, then 9.
+let mut rc = Vm::with_memory(&p, Memory::Rc);
+assert_eq!(rc.set_destructor("__destruct"), Ok(1));
+assert_eq!(rc.run(main, &[]), Ok(Value::Int(19)));
+// Tracing: only after a collection finds the object.
+let mut gc = Vm::new(&p);
+gc.set_destructor("__destruct").unwrap();
+assert_eq!(gc.run(main, &[]), Ok(Value::Int(9)));
+gc.collect_garbage();
+assert_eq!(gc.run_finalizers(), Ok(1));
+assert_eq!(gc.global(log), Some(Value::Int(91)));
 ```
 
 ### `Vm::run`
@@ -768,11 +1027,16 @@ pub fn run_finalizers(&mut self) -> Result<usize, VmError>
 pub fn pending_finalizers(&self) -> usize
 ```
 
-Closes now, under the VM's limits, the dropped suspended coroutines that
-collections have queued (see [Memory and collection](#memory-and-collection)),
-and returns how many it closed; `pending_finalizers` counts the queue. Call
-[`collect_garbage`](#heap-and-fuel-statistics) first to queue everything
-dropped (at program exit, say).
+Runs now, under the VM's limits, the finalizations queued for later: the
+dropped suspended coroutines tracing collections found (see
+[Memory and collection](#memory-and-collection)), the objects whose
+[destructor](#destructors) is due, and under [`Memory::Rc`](#memory) what
+died outside a run (or when a run ended abnormally) and the finalizable
+garbage a cycle collection found. Returns how many it started (the
+finalizations they cause included); `pending_finalizers` counts the queue.
+Call [`collect_garbage`](#heap-and-fuel-statistics) first to queue everything
+dropped (at program exit, say). Under RC the queue is also drained at the
+next run's first instruction.
 
 **Errors.** A trap inside a closing `finally` (`OutOfFuel`, `OutOfMemory`,
 `Unreachable`) stops it; the rest stay queued. Errors the `finally` blocks
@@ -872,10 +1136,14 @@ pub fn collect_garbage(&mut self)
 ```
 
 Fuel the last run (or `run_async`, or `run_finalizers`) consumed; bytes
-charged to the memory budget; live objects (exact after a collection);
-collections so far; and an explicit collection keeping only what globals and
-caches reach (suspended coroutines it finds dropped are queued to be closed,
-not freed).
+charged to the memory budget; live objects (exact after a collection, and
+always exact under [`Memory::Rc`](#memory)); collections so far (cycle
+collections under RC); and an explicit collection keeping only what globals
+and caches reach (suspended coroutines it finds dropped are queued to be
+closed, objects with a destructor queued for it, not freed). Under RC,
+`collect_garbage` lets go of the values earlier runs handed out and runs the
+cycle collector over every possible root; everything else was freed at its
+last reference already.
 
 ```rust
 use bvm_lang::{Host, Program, Vm};
@@ -889,6 +1157,12 @@ vm.collect_garbage();
 assert_eq!((vm.heap_objects(), vm.collections()), (0, 1));
 assert_eq!(vm.kind(s), bytecode_lang::Kind::Nil); // the stale handle reads as nil
 ```
+
+```rust,ignore
+pub fn memory_stats(&self) -> MemoryStats
+```
+
+What the memory manager has done: see [`MemoryStats`](#memorystats).
 
 ## `Limits`
 
@@ -919,6 +1193,67 @@ use bvm_lang::Limits;
 
 let l = Limits::default().with_fuel(1_000).with_memory(64 << 20).with_depth(256).with_stack(1 << 20);
 assert_eq!((l.fuel(), l.memory(), l.depth(), l.stack()), (1_000, 64 << 20, 256, 1 << 20));
+```
+
+## `Memory`
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Memory {
+    #[default]
+    Tracing,
+    Rc,
+}
+```
+
+A VM's [memory profile](#memory-profiles): `Tracing` (the default, a
+mark-and-sweep collector; `[runtime] memory = "gc"`, Mercury and others) or
+`Rc` (reference counting plus a cycle collector, PHP's model; `[runtime]
+memory = "rc"`, Mox).
+
+```rust
+use bvm_lang::{Host, Memory, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+assert_eq!(Memory::default(), Memory::Tracing);
+assert_eq!(Vm::with_memory(&p, Memory::Rc).memory(), Memory::Rc);
+```
+
+## `MemoryStats`
+
+```rust,ignore
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MemoryStats {
+    pub collections: u64,
+    pub freed: u64,
+    pub cycle_freed: u64,
+    pub finalized: u64,
+    pub unbound: u64,
+    pub live: usize,
+    pub bytes: usize,
+}
+```
+
+Counters from [`Vm::memory_stats`](#heap-and-fuel-statistics): collections
+(tracing collections, or cycle collections under RC), objects freed by every
+means, those of them the cycle collector freed, finalizations started
+(destructors run and dropped coroutines closed), references unbound by a
+copy (RC), live objects, and bytes charged to the budget.
+
+```rust
+use bvm_lang::{Host, Memory, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::with_memory(&p, Memory::Rc);
+vm.new_str(b"held for the host").unwrap();
+assert_eq!(vm.memory_stats().live, 1);
+vm.collect_garbage(); // lets go of it
+let stats = vm.memory_stats();
+assert_eq!((stats.live, stats.freed, stats.collections), (0, 1, 1));
 ```
 
 ## `Value`
@@ -1131,6 +1466,7 @@ pub enum VmError {
     NeedsClosure(FuncId),
     ArgumentCount { expected: usize, found: usize },
     ArgumentType { index: usize },
+    BadDestructor(FuncId),
 }
 impl VmError {
     pub fn kind(&self) -> Option<ErrorKind>;
@@ -1146,7 +1482,8 @@ rethrew it);
 `Thrown` an uncaught non-error value (its location is where the unwind that
 ended the run began); `Trap` a trap; `Deadlock` a [`run_async`](#vmrun_async)
 whose tasks all wait; `GlobalInit` a global initialiser that does not fit its
-global; the rest are entry problems. `kind`, `code`, and `location` read the
+global; `BadDestructor` a method [`set_destructor`](#vmset_destructor) cannot
+use; the rest are entry problems. `kind`, `code`, and `location` read the
 common parts.
 
 ```rust
@@ -1247,6 +1584,6 @@ assert_eq!(bvm_lang::MAX_CONST_DEPTH, 64);
 
 ## Stability
 
-2.0.0-alpha.3 is a pre-release: names and signatures may change before 2.0.0,
+2.0.0-alpha.4 is a pre-release: names and signatures may change before 2.0.0,
 each change recorded in the CHANGELOG. Instruction semantics follow LSB and
 OPS and change only with them. See [`STABILITY.md`](./STABILITY.md).

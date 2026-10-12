@@ -5,7 +5,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::type_complexity)]
 
-use bvm_lang::{Host, Limits, Program, Value, Vm};
+use bvm_lang::{Host, Limits, Memory, Program, Value, Vm};
 use bytecode_lang::{
     Callee, Const, Field, FieldKind, FuncId, Hook, Inst, IntOp, IntTy, Method, ModuleBuilder,
     Opcode, StructDef, Target, TypeDef, ValType,
@@ -180,9 +180,23 @@ fn random_module(funcs: &[(Vec<usize>, Vec<RawInst>)]) -> Option<bytecode_lang::
     m.finish().ok()
 }
 
-/// Runs every parameterless function of a loaded program.
+/// Runs every function of a loaded program, under each memory profile,
+/// with the module's first string named as the destructor method (so random
+/// struct methods become destructors when they fit), then collects and runs
+/// what was queued. In debug builds the RC runs also recount every count and
+/// check that nothing unreachable survives a collection.
 fn exercise(p: &Program) {
-    let mut vm = Vm::with_limits(p, limits());
+    for memory in [Memory::Tracing, Memory::Rc] {
+        exercise_in(p, memory);
+    }
+}
+
+fn exercise_in(p: &Program, memory: Memory) {
+    let mut vm = Vm::with_memory(p, memory);
+    vm.set_limits(limits());
+    if let Some(name) = p.module().strings().next() {
+        let _ = vm.set_destructor(name);
+    }
     for (i, f) in p.module().functions().iter().enumerate() {
         let id = FuncId(u32::try_from(i).unwrap_or(0));
         let nparams = match p.module().type_def(f.sig()) {
@@ -213,6 +227,8 @@ fn exercise(p: &Program) {
             );
         }
     }
+    vm.collect_garbage();
+    let _ = vm.run_finalizers();
     vm.collect_garbage();
 }
 

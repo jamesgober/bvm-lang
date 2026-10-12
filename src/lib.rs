@@ -151,6 +151,7 @@ mod bind;
 mod coll;
 mod conv;
 mod coro;
+mod cycle;
 mod dynops;
 mod dynv;
 mod error;
@@ -165,6 +166,7 @@ mod machine;
 mod map;
 mod pow;
 mod program;
+mod rc;
 mod refs;
 mod value;
 mod vm;
@@ -175,7 +177,7 @@ pub use program::{
     LoadError, LoadErrorKind, Location, MAX_CONST_DEPTH, MAX_INHERITANCE_DEPTH, Program,
 };
 pub use value::{Obj, Value};
-pub use vm::{Limits, Vm};
+pub use vm::{Limits, Memory, MemoryStats, Vm};
 
 /// Compiles and runs the `rust` code blocks in `README.md` and `docs/API.md`
 /// as part of `cargo test`, so the published examples cannot drift from the

@@ -65,6 +65,95 @@ pub(crate) struct FuncInfo {
     /// handler (in list order) covering it, or `u32::MAX`. Smaller handler
     /// lists are scanned instead.
     pub(crate) catch_table: Option<Box<[u32]>>,
+    /// For a parameter list with many named parameters: the hashed name
+    /// index the binder looks named arguments up in ([`NameIndex`]).
+    pub(crate) param_index: Option<NameIndex>,
+}
+
+/// Parameter lists with more parameters that take names than this get a
+/// hashed name index; smaller ones are scanned (as fast at that size).
+pub(crate) const NAME_SCAN: usize = 8;
+
+/// The parameters of a list that take a name (normal and named-only), by
+/// the hash of their name, sorted: a named argument is found by hashing its
+/// bytes and a binary search, then a byte comparison, so binding `n` named
+/// items to a 255-parameter list costs O(n log 255), not O(n * 255)
+/// (ISSUES P33).
+#[derive(Debug)]
+pub(crate) struct NameIndex {
+    entries: Box<[(u64, u16)]>,
+}
+
+impl NameIndex {
+    /// The index of a list with more than [`NAME_SCAN`] named parameters.
+    fn of(module: &Module, list: &bytecode_lang::ParamList) -> Option<NameIndex> {
+        let named = list.params.iter().filter(|p| takes_names(p.kind)).count();
+        (named > NAME_SCAN).then(|| NameIndex::build(module, list))
+    }
+
+    /// The index of any list.
+    pub(crate) fn build(module: &Module, list: &bytecode_lang::ParamList) -> NameIndex {
+        let mut entries: Vec<(u64, u16)> = list
+            .params
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| takes_names(p.kind))
+            .filter_map(|(i, p)| {
+                let name = module.string(p.name?)?;
+                Some((name_hash(name.as_bytes()), u16::try_from(i).ok()?))
+            })
+            .collect();
+        // By hash, then by position: among equal names the first wins, as
+        // a scan in order finds it.
+        entries.sort_unstable();
+        NameIndex {
+            entries: entries.into_boxed_slice(),
+        }
+    }
+
+    /// The first parameter (in list order) named `name`, whose names are
+    /// strings of `module`.
+    pub(crate) fn find(
+        &self,
+        module: &Module,
+        list: &bytecode_lang::ParamList,
+        name: &[u8],
+    ) -> Option<usize> {
+        let h = name_hash(name);
+        let start = self.entries.partition_point(|&(x, _)| x < h);
+        self.entries
+            .get(start..)?
+            .iter()
+            .take_while(|&&(x, _)| x == h)
+            .map(|&(_, i)| usize::from(i))
+            .find(|&i| {
+                list.params
+                    .get(i)
+                    .and_then(|p| p.name)
+                    .and_then(|s| module.string(s))
+                    .is_some_and(|s| s.as_bytes() == name)
+            })
+    }
+}
+
+/// Whether a parameter kind is bound by name.
+pub(crate) fn takes_names(kind: bytecode_lang::ParamKind) -> bool {
+    matches!(
+        kind,
+        bytecode_lang::ParamKind::Normal | bytecode_lang::ParamKind::NamedOnly
+    )
+}
+
+/// FNV-1a over a name's bytes: names come from the module itself, so a
+/// keyed hash buys nothing (a module crafting collisions among its own at
+/// most 255 parameter names only makes its own lookups a scan of them).
+fn name_hash(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Handler lists longer than this get a per-pc lookup table, so raising
@@ -134,6 +223,8 @@ pub(crate) struct ImportInfo {
     pub(crate) result: Option<ValType>,
     pub(crate) sig: u32,
     pub(crate) func: HostFn,
+    /// As [`FuncInfo::param_index`].
+    pub(crate) param_index: Option<NameIndex>,
 }
 
 /// A loaded module: checked, bound to its host functions, and ready to run.
@@ -964,6 +1055,10 @@ impl<'m> Loader<'m> {
                     .copied()
                     .unwrap_or(imp.sig.0),
                 func,
+                param_index: imp
+                    .params
+                    .as_ref()
+                    .and_then(|list| NameIndex::of(self.m, list)),
             });
         }
         Ok(out)
@@ -1035,6 +1130,7 @@ impl<'m> Loader<'m> {
             type_refs,
             catch_table: (f.handlers().len() > CATCH_TABLE_MIN)
                 .then(|| catch_table(f.code().len(), f.handlers())),
+            param_index: f.params().and_then(|list| NameIndex::of(self.m, list)),
         })
     }
 

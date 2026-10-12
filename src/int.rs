@@ -514,7 +514,9 @@ pub(crate) fn from_value(ty: IntTy, v: i128) -> Option<u64> {
 
 /// `int_cast` (OPS §5): exact if it fits, else per the overflow policy, where
 /// `wrap` truncates to the target width and re-extends.
-#[inline]
+// Inlined into the dispatch loop (one copy per memory profile), as it was
+// when the loop had one caller.
+#[inline(always)]
 pub(crate) fn int_cast(conv: IntConv, bits: u64) -> Result<u64, Fault> {
     let v = value(conv.from(), bits);
     match from_value(conv.to(), v) {

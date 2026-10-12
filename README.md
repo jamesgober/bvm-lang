@@ -18,7 +18,7 @@
 
 <div align="left">
     <p>
-        <strong>bvm-lang</strong> is the virtual machine that runs <b>LSB</b>, the LexerSketch bytecode defined by <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>. Hand it a module &mdash; built in memory or decoded from bytes &mdash; and it checks it, binds its imports to your host functions, and runs it: typed code with unboxed integers and floats, dynamic code with PHP-style ordered hash-map arrays and language hooks, dynamic calls with named arguments, variadics, defaults, and by-reference parameters, PHP references and copy-on-write value semantics, closures, structs with inheritance, exceptions with <code>finally</code>, stackful coroutines for generators, fibers, and async tasks, and a tracing garbage collector.
+        <strong>bvm-lang</strong> is the virtual machine that runs <b>LSB</b>, the LexerSketch bytecode defined by <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>. Hand it a module &mdash; built in memory or decoded from bytes &mdash; and it checks it, binds its imports to your host functions, and runs it: typed code with unboxed integers and floats, dynamic code with PHP-style ordered hash-map arrays and language hooks, dynamic calls with named arguments, variadics, defaults, and by-reference parameters, PHP references and copy-on-write value semantics, closures, structs with inheritance, exceptions with <code>finally</code>, stackful coroutines for generators, fibers, and async tasks, and two memory profiles: a tracing garbage collector, or PHP's model, reference counting with a cycle collector, where destructors and generator closes run at the last reference.
     </p>
     <p>
         It is a <em>register machine</em> executing decoded eight-byte instructions in one dispatch loop, and it is built to run code you do not trust: every index the interpreter uses is checked once at load time, every run has a fuel budget, a memory budget, and call-depth and stack limits, and every failure is a value carrying its error code, function, and instruction. Integer arithmetic follows the shared OPS specification bit for bit under every overflow, division-by-zero, shift, and float-conversion policy, including PHP's <code>promote</code>.
@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, one dependency from the family: <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>.
     </p>
     <blockquote>
-        <strong>2.0.0-alpha.3 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB, and alpha.3 executes all 200 instructions of LSB format 2 (<code>bytecode-lang</code> 0.3); format 1 files are refused and must be regenerated. The API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what the alphas promise and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
+        <strong>2.0.0-alpha.4 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB, and the alphas execute all 200 instructions of LSB format 2 (<code>bytecode-lang</code> 0.3); format 1 files are refused and must be regenerated. alpha.4 adds the reference-counting memory profile (decision D22). The API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what the alphas promise and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
     </blockquote>
 </div>
 
@@ -39,7 +39,8 @@
 ## The model
 
 - A **[`Program`](./docs/API.md#program)** is a loaded module. [`Program::load`](./docs/API.md#programload) takes a `bytecode_lang::Module` (or [`Program::decode`](./docs/API.md#programdecode) its bytes), checks every fact the interpreter relies on, and binds each import to a function registered in a **[`Host`](./docs/API.md#host)**. It is immutable and shareable across threads.
-- A **[`Vm`](./docs/API.md#vm)** is an instance of a program: a garbage-collected heap, the globals, and the **[`Limits`](./docs/API.md#limits)** its runs execute under. [`Vm::run`](./docs/API.md#vmrun) calls a function with **[`Value`](./docs/API.md#value)** arguments and returns its result.
+- A **[`Vm`](./docs/API.md#vm)** is an instance of a program: a heap, the globals, and the **[`Limits`](./docs/API.md#limits)** its runs execute under. [`Vm::run`](./docs/API.md#vmrun) calls a function with **[`Value`](./docs/API.md#value)** arguments and returns its result.
+- Its **[memory profile](./docs/API.md#memory-profiles)** is chosen when it is made: [`Vm::new`](./docs/API.md#vmnew) traces (the default), [`Vm::with_memory(&program, Memory::Rc)`](./docs/API.md#vmwith_memory) counts references as PHP does, and [`Vm::set_destructor`](./docs/API.md#vmset_destructor) names the destructor method (`__destruct`) under either.
 - A **[`VmError`](./docs/API.md#vmerror)** is how a run ends without one: an uncaught error with its OPS/LSB code and location, an uncaught throw, or a trap. A **[`LoadError`](./docs/API.md#loaderror)** says why a module was refused.
 - **[`Vm::run_async`](./docs/API.md#vmrun_async)** runs a function as the main task of a small deterministic scheduler (registered with [`Host::register_scheduler`](./docs/API.md#hostregister_scheduler)) that drives the tasks `spawn` makes.
 
@@ -50,11 +51,16 @@ What it guarantees, and how each guarantee is checked:
 | Guarantee | How it is held |
 |---|---|
 | Every LSB instruction is implemented to LSB's semantics. | At least one conformance test per instruction in `tests/inst_*.rs`, `tests/coroutines.rs`, `tests/format2.rs`, and `tests/php_semantics.rs` (each test names the instructions it covers). |
-| Dynamic calls bind exactly as LSB §5.15 and `ParamList::bind` state: spreads, named arguments, rest collections, `ignore_extra`, the presence mask, by-reference parameters, `ArgumentError`, fuel after binding. | `tests/php_semantics.rs` and `tests/format2.rs` (named, variadic, by-reference, host functions as values, every `ArgumentError` case uncharged, the `call_shape`/`call` hooks, the fuel point, `dparam_ref` for every parameter kind); the all-positional binder is property-tested against `ParamList::bind` (4,000 random lists × argument counts); the whole-module differential reference binds with its own implementation of §5.15. |
+| Dynamic calls bind exactly as LSB §5.15 and `ParamList::bind` state: spreads, named arguments, rest collections, `ignore_extra`, the presence mask, by-reference parameters, `ArgumentError`, fuel after binding. | `tests/php_semantics.rs` and `tests/format2.rs` (named, variadic, by-reference, host functions as values, every `ArgumentError` case uncharged, the `call_shape`/`call` hooks, the fuel point, `dparam_ref` for every parameter kind); both binders are property-tested against `ParamList::bind` (4,000 random lists × calls each, the named one with and without its hashed index; mutation-checked); the whole-module differential reference binds with its own implementation of §5.15. |
+| Binding is fuel-proportional (ISSUES P33): named arguments are found through a hashed index, large calls pay per item. | `tests/binding.rs`: the exact fuel of calls of 0 to 6,400 items and the `OutOfFuel` point one unit short; a hostile named spread of 200,000 keys into a 200-parameter list binds (in ~0.4 s for the whole debug test) and pays `n / 64` units; empty rest collections stay independent. |
+| Under `Memory::Rc`, objects die at their last reference, in PHP's order, and destructors and generator closes run there. | `tests/memory_rc.rs`: PHP's output for reassignment, `unset`, scope exit (locals in declaration order), an array element overwritten, an array's elements first to last, an object before what it holds, resurrection, errors and traps in destructors, the depth limit, inherited and invalid destructors; a dropped generator's `finally` before the next statement, in both directions of the profile switch. |
+| Under `Memory::Rc`, copying an array drops a reference nothing else holds, as PHP does (LSB §5.17's divergence closed at run time). | `tests/memory_rc.rs`: `$r = &$a[0]; unset($r); $b = $a; $b[0] = 9` keeps `$a[0]`; `foreach ($a as &$v)` then a copy gives PHP's `[1, 2, 9]`; maps and `clone` likewise; with the reference still held, both profiles share it. |
+| Garbage cycles are collected under `Memory::Rc`, by work lists, and the work is charged as fuel. | `tests/memory_rc.rs`: cycles destructed at the collection point and by the automatic collector inside a run; a cycle through `dup`-shared storage; a 1,000,000-node ring collected and a 1,000,000-node chain freed without recursion; the collector's fuel visible in `fuel_used` and an `OutOfFuel` it causes; a 2 MiB budget held by a loop making 100,000 strings and 1,000 copies. A count driven past its maximum traps (unit test). |
+| Both profiles compute the same results. | `tests/differential.rs` runs 6,000 random programs per run under `Memory::Rc` against the reference interpreters (outcome, fuel, globals) and requires both profiles to keep exactly as many objects once collected; a guard requires 95% of programs to be compared (the rest ran a drop-close or unbound a reference, which LSB lets profiles do differently). In debug builds every RC run recounts every count from its holders when it ends, and every RC collection checks that it kept nothing unreachable (both checks mutation-tested). `tests/untrusted.rs` fuzzes both profiles with random destructors. |
 | References and copy-on-write follow LSB §5.16/§5.17: transparent reference slots, copies sharing references, separation of exactly the aliased elements. | `tests/php_semantics.rs` runs PHP programs (`foreach` by reference, `&$a[k]`, `$a[k] = &$x`, nested writes after a copy, constants) with PHP 8.3's results; the whole-module differential property `prop_php_programs_match_the_reference` runs random container, reference, and separation code against an independent model of the two copy-on-write bits; mutation-checked. |
 | Float `pow` is the family's shared `ls_pow`, bit for bit. | `tests/pow_vectors.rs` runs the 122 vectors of `_lexersketch/specs/ops-vectors/pow.md` through `fpow` and `dpow`; the differential references carry their own transcription of the spec's pseudocode. |
 | Coroutines follow LSB §5.13: stackful suspension through nested calls and hook frames, keys and return values, `resume_throw`, `coro_close` with pending `finally` blocks (including `CloseIgnored` and an `await` during the close), iteration, `CannotSuspend`, `InvalidCoroState`, `NoScheduler`. | `tests/coroutines.rs`: one or more tests per rule, `finally` across a suspension included, and the exact fuel each coroutine instruction costs. |
-| A dropped suspended coroutine is closed (LSB §5.13 rule 13): queued by the collection that finds it, closed oldest first at the next fuel charge point or by `Vm::run_finalizers`. | `tests/coroutine_gc.rs`: closes run once, in creation order, inside a run and from the host; refusals and errors are discarded; created and finished coroutines run nothing; self-referencing coroutines are freed; 100,000 dropped coroutines stay inside a 2 MiB budget; suspended stacks count against the budget. |
+| A dropped suspended coroutine is closed (LSB §5.13 rule 13): under tracing queued by the collection that finds it, closed oldest first at the next fuel charge point or by `Vm::run_finalizers`; under `Memory::Rc` at its last reference. | `tests/coroutine_gc.rs`: closes run once, in creation order, inside a run and from the host; refusals and errors are discarded; created and finished coroutines run no code; self-referencing coroutines are freed; 100,000 dropped coroutines stay inside a 2 MiB budget; suspended stacks count against the budget. `tests/memory_rc.rs` for the RC timing. |
 | `spawn`/`await` work through the built-in scheduler, deterministically. | `tests/scheduler.rs`: FIFO interleaving, results and errors through `await`, deadlock detection, one fuel budget per `run_async`. |
 | Integer and float operations match OPS bit for bit under every policy. | `tests/ops_table.rs` runs every operation at every integer type under every policy combination over the edge values {0, ±1, ±2, ±7, MIN, MAX, MIN+1, MAX-1, ...} and every float operation over IEEE edge values (signed zeros, subnormals, ±MAX, ±inf, NaN, halves), against a reference written in `i128` and `f64` in the test itself. |
 | Random programs agree with an independent interpreter. | `tests/differential.rs`: thousands of random straight-line and branching programs (loops included) against `tests/common/reference.rs`, and 3,000 random six-function modules (calls of every kind, closures, arrays, maps, structs, strings, try/catch, try/finally with `return` in `finally` overriding, generators, `resume`/`resume_throw`/`coro_close`, keys, iteration) against a separate whole-module reference in `tests/common/full.rs` that keeps a frame stack per coroutine; results, error kinds and locations, globals, and fuel used must match under random fuel and depth limits. Mutation-checked: 10 of 11 deliberate coroutine/exception/closure bugs fail it (the 11th, an automatic-key rule bug, is caught by `tests/coroutines.rs`). |
@@ -70,7 +76,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-bvm-lang = "=2.0.0-alpha.3"
+bvm-lang = "=2.0.0-alpha.4"
 bytecode-lang = "0.3"
 ```
 
@@ -78,7 +84,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-bvm-lang = { version = "=2.0.0-alpha.3", default-features = false }
+bvm-lang = { version = "=2.0.0-alpha.4", default-features = false }
 ```
 
 <hr>
@@ -246,6 +252,62 @@ array only when another container may share it; the
 [`php_calls`](./examples/php_calls.rs) example shows it with by-reference
 arguments decided at run time (`dparam_ref`).
 
+### PHP's memory model: destructors at the last reference
+
+`Memory::Rc` counts references, so an object dies where PHP destroys it and
+its destructor runs before the next instruction:
+
+```rust
+use bvm_lang::{Host, Memory, Program, Value, Vm};
+use bytecode_lang::{Inst, IntOp, IntTy, Method, ModuleBuilder, StructDef, TypeDef, ValType};
+
+let mut m = ModuleBuilder::new();
+let (name, dtor) = (m.string("Res"), m.string("__destruct"));
+let res = m.reserve_type();
+let log = m.global("log", ValType::I64, true, None);
+// function __destruct() { $log = $log * 10 + 1; }
+let mut d = m.function("Res::__destruct", &[ValType::Dyn], &[]);
+let (v, k) = (d.reg(ValType::I64), d.reg(ValType::I64));
+let op = IntOp::new(IntTy::I64);
+d.emit(Inst::GetGlobal { dst: v, global: log });
+d.emit(Inst::LoadInt { dst: k, val: 10, ty: IntTy::I64 });
+d.emit(Inst::IMul { dst: v, lhs: v, rhs: k, op });
+d.emit(Inst::LoadInt { dst: k, val: 1, ty: IntTy::I64 });
+d.emit(Inst::IAdd { dst: v, lhs: v, rhs: k, op });
+d.emit(Inst::SetGlobal { global: log, src: v });
+d.ret_void();
+let d = m.add_function(d).unwrap();
+m.define_type(res, TypeDef::Struct(StructDef {
+    name,
+    methods: vec![Method { name: dtor, func: d }],
+    ..Default::default()
+}));
+// $o = new Res; $o = null; $log = $log * 10 + 9; return $log;
+let mut f = m.function("main", &[], &[ValType::I64]);
+let (o, r, k) = (f.reg(ValType::Dyn), f.reg(ValType::I64), f.reg(ValType::I64));
+let ty = f.type_ref(res);
+f.emit(Inst::NewStruct { dst: o, ty });
+f.emit(Inst::LoadNil { dst: o });
+f.emit(Inst::GetGlobal { dst: r, global: log });
+f.emit(Inst::LoadInt { dst: k, val: 10, ty: IntTy::I64 });
+f.emit(Inst::IMul { dst: r, lhs: r, rhs: k, op });
+f.emit(Inst::LoadInt { dst: k, val: 9, ty: IntTy::I64 });
+f.emit(Inst::IAdd { dst: r, lhs: r, rhs: k, op });
+f.emit(Inst::SetGlobal { global: log, src: r });
+f.ret(r);
+let main = m.add_function(f).unwrap();
+let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+
+let mut vm = Vm::with_memory(&program, Memory::Rc);
+vm.set_destructor("__destruct").unwrap();
+assert_eq!(vm.run(main, &[]), Ok(Value::Int(19))); // destructed at `$o = null`, then 9
+```
+
+Under the default tracing profile the same program returns `9`: the object
+is destructed only once a collection finds it. Copying an array also drops
+a PHP reference nothing else holds under `Memory::Rc`; the
+[`memory_profiles`](./examples/memory_profiles.rs) example shows both.
+
 ### Untrusted code
 
 Budgets turn a hostile program into an error value with a location:
@@ -279,6 +341,7 @@ Runnable programs in [`examples/`](./examples):
 | [`php_arrays`](./examples/php_arrays.rs) | Mox/PHP-style code: an ordered array, `$a[] = v`, `foreach`, and PHP's loose `==` supplied by the host as a hook. |
 | [`coroutines`](./examples/coroutines.rs) | A PHP generator with keys consumed by `foreach`, and two async tasks taking turns under `run_async`. |
 | [`php_calls`](./examples/php_calls.rs) | LSB format 2 as PHP uses it: a function value with a parameter list (by-reference, default, variadic), named arguments, `dparam_ref`, and nested writes with `dsep_index`. |
+| [`memory_profiles`](./examples/memory_profiles.rs) | One PHP program under both memory profiles: `__destruct` at the last reference and a copy that drops a reference (`Memory::Rc`), against tracing's timing and LSB's sharing. |
 | [`untrusted`](./examples/untrusted.rs) | Fuel, memory, and error locations from the line table for hostile code. |
 
 <hr>
@@ -310,12 +373,29 @@ Measured with the benchmarks in [`benches/`](./benches), Windows x86_64, Rust st
 | `coroutine/generator_iter_100k` | `foreach` over a 100k-element generator (one resume and one yield per element) | ~7.1-7.5 ms | ~71-75 ns/element |
 | `coroutine/create_finish_100k` | 100k coroutines created, resumed to a yield, resumed to their return | ~20.8-22.7 ms | ~208-227 ns/coroutine, collection included |
 | `async/ping_pong_2x50k` | two tasks taking turns through the built-in scheduler, 100k `await`s | ~4.5-4.8 ms | ~45-48 ns/await, scheduler included |
+| `call/dcall_spread_named_200k` | one `f(...$named)` of 200,000 string keys into 200 named parameters and a named rest (P33's hostile case) | ~126-136 ms | ~0.63-0.68 µs/key, the host building the 200k-key map included |
 
 **Separation.** The nested-append loop runs ~40x faster with `dsep_index` than with the `dup`-per-write lowering format 1 required (bcgen-lang measured ~28x on its own loop), because after the first pass the inner arrays are no longer marked as possibly shared and are appended to in place.
 
 **Against 1.0.** The 1.0 `loop_sum/100000` benchmark runs the same five-instruction loop shape; run back to back with the 2.0.0-alpha.1 benchmarks on the same machine it measured ~0.78-0.83 ms when quiet and ~1.15-1.2 ms under load, against ~0.75-0.90 ms and ~1.15-1.47 ms for alpha.1's `typed_loop5`. Dispatch is therefore on par with 1.0's (within run-to-run noise for typed code, up to ~15% slower for dynamic code), while each instruction now carries its own OPS policy and fuel is charged on back edges. Ranges are the spread of several runs on a machine shared with other builds; the numbers are indicative, not a guarantee.
 
 **Against 2.0.0-alpha.1 and alpha.2.** Criterion's intervals on this machine move by tens of percent between runs, so the call path was compared with a small harness running `fib(25)` 50 times per process (minimum of each, processes alternated, six rounds): alpha.1 ~4.11-4.34 ms, alpha.2 ~4.38-4.42 ms (the 3-10% regression alpha.2 reported), alpha.3 ~3.81-4.04 ms. The regression was isolated to the return path: alpha.2's `finish` matched every continuation (the coroutine body's included) before writing a typed call's result; testing the common continuation (`call`'s write) first removes it and makes alpha.3 ~7% faster than alpha.1 on this benchmark. The same harness found `map_set` ~15% slower after its reference-slot check was first added as a separate lookup; doing the check inside the one lookup brought `map/int_keys_100k_set_get` back to within ~2-3% of alpha.2 (5.68-5.93 ms against 5.54-5.74 ms). The string benchmark measured at parity.
+
+**The two memory profiles.** `profile/<workload>/{tracing,rc}` runs the same programs under both profiles (one criterion run, same machine and caveats as the table):
+
+| Workload | `Memory::Tracing` | `Memory::Rc` | RC / tracing |
+|---|---:|---:|---:|
+| `fib25` (typed calls, no heap) | ~4.0-4.1 ms | ~6.5-6.9 ms | ~1.6x |
+| `dyn_loop5_100k` (dynamic integers, no heap) | ~0.63-0.74 ms | ~0.74-0.78 ms | ~1.1x |
+| `nested_append_100k` | ~6.7-7.0 ms | ~7.9-8.8 ms | ~1.2x |
+| `alloc_1m_live_10k` (1M short-lived arrays) | ~87-102 ms | ~121-136 ms | ~1.35x |
+| `generator_iter_100k` | ~4.9-5.0 ms | ~9.1-10.1 ms | ~2x |
+| `destructors_100k` (100k objects with a destructor, dropped one at a time) | ~6.4-6.5 ms | ~12.9-13.5 ms | ~2x |
+| `cycles_100k` (100k self-referencing objects, then a collection) | ~3.9-4.2 ms | ~13.0-13.6 ms | ~3.4x |
+
+Counting costs time on every store of a reference word and on every call and return (frame registers are adopted and released); typed code that never touches the heap pays it through the frame bookkeeping (`fib25`). What RC buys is timing, not speed: objects die, destructors run, and generators close at the last reference. The tracing profile is the default for that reason.
+
+**Against 2.0.0-alpha.3 (tracing).** The same alternating harness (minimum per process, alpha.3 and alpha.4 processes alternated, four rounds): `fib(25)` 3.93 → 3.60 ms (~8% faster), `dyn_loop5` 0.550 → 0.550 ms, generator 4.27 → 4.22 ms, nested append 7.42 → 7.45 ms, `create_finish` 15.14 → 15.30 ms (~1%), `alloc_1m_live_10k` 75.1 → 73.0 ms, `map/int_keys` 5.34 → 5.55 ms (~4% slower), and `foreach_by_ref` 9.01 → 9.69 ms (~5-8% slower across rounds, the noisiest of the set). The last two are the remaining cost of the profile split in the tracing build (the counted container paths sit behind one `rc` test in the shared store helpers).
 
 ```bash
 cargo bench --bench bench
@@ -330,11 +410,13 @@ cargo bench --bench bench
 - **Load-time checks, run-time speed.** LSB's verifier is not written yet (bytecode-lang 0.5), and its decoder checks structure only. The loader therefore proves, once, every index the interpreter uses; the dispatch loop then indexes registers, globals, tables, and type lists without fallible lookups. It does not check the verifier's type discipline: a word of the wrong type decodes to *some* value, and heap accesses check object kinds, so an ill-typed module computes garbage or raises `TypeError` but cannot escape the VM.
 - **Fuel without a verifier.** LSB §5.14 charges fuel at safepoints, calls, hook invocations, taken backward branches, handler entries, and coroutine instructions, so no loop can avoid it, verified or not, and every tier reports `OutOfFuel` at the same pc.
 - **Coroutines copy on suspension.** A running coroutine's frames sit on the one flat frame stack above its resumer's; a `yield` moves them (registers included) into the coroutine object and a `resume` moves them back. The dispatch loop is unchanged (a register read is still one indexed load), and once a coroutine's buffers have grown to its deepest stack a switch allocates nothing.
-- **Close on drop from a finalization queue.** This heap is traced, so a coroutine's last reference going away is not observable when it happens. The collection that finds a suspended coroutine unreachable keeps it alive and queues it; while a close is queued, the fuel counter is set aside so the next charge takes its cold branch, which starts the close before that instruction. Closing costs nothing when nothing is queued.
+- **Close on drop from a finalization queue (tracing).** A traced heap cannot observe a coroutine's last reference going away when it happens. The collection that finds a suspended coroutine unreachable keeps it alive and queues it; while a close is queued, the fuel counter is set aside so the next charge takes its cold branch, which starts the close before that instruction. Closing costs nothing when nothing is queued. Under `Memory::Rc` the close starts at the last reference instead, through the same settling step as destructors.
 - **Precise errors.** A failing instruction breaks out before writing its destination, records its pc, and the unwinder searches that function's handlers in order, then each caller's at its call instruction.
-- **Copy-on-write aggregates.** Arrays and maps share their storage between `dup` copies and between loads of one constant; the first write copies. PHP's value semantics are a `dup` per assignment, O(1) until written. Each container carries LSB §5.16's `cow` and `aliased` bits, so `dsep_*` copies an inner container only when another container may hold it, and the decisions are deterministic (no reference counts, no collection timing). Every such decision goes through two small functions, the seam the reference-counting profile (DECISIONS D22, alpha.4) replaces.
+- **Copy-on-write aggregates.** Arrays and maps share their storage between `dup` copies and between loads of one constant; the first write copies. PHP's value semantics are a `dup` per assignment, O(1) until written. Each container carries LSB §5.16's `cow` and `aliased` bits, so `dsep_*` copies an inner container only when another container may hold it, and the decisions are deterministic (no reference counts, no collection timing) and the same in both memory profiles: deciding with counts, as LSB would allow under RC, was tried and diverged from tracing on generated code that stores a container without `dup`.
+- **Two memory profiles, one dispatch loop each.** The dispatch loop, its out-of-line half, and the coroutine switch are compiled once per profile (a const generic), so the tracing loop has no counting code at all; every register write goes through one macro that is a plain store when tracing and a count move when counting. Under RC a count reaching zero frees nothing mid-instruction: the object waits on a list settled before the next instruction (where destructors and closes start), so no word an instruction holds goes stale, and freeing is iterative. Counts live in the existing slot's padding (the slot did not grow), and array and map storage counts its words once however many containers share it.
+- **Cycle collection by trial deletion.** Bacon and Rajan's synchronous algorithm over the possible roots counting buffers, with shared storage as nodes of its own, PHP's adaptive threshold, work lists in every phase, and fuel charged per 64 objects visited.
 - **References are flagged in the word.** A PHP reference is a heap box whose reference word has one bit set (generations are 15 bits), so every slot access checks `is reference?` with one compare on the word it already loaded, and only then looks at the slot's type: containers without references pay one predictable branch.
-- **Two binders, one rule.** Dynamic calls whose arguments are all positional bind with an allocation-free binder; calls with names use `bytecode_lang::ParamList::bind`, the family's single statement of PHP's and Python's argument rules. A property test holds the first to the second.
+- **Two binders, one rule.** Dynamic calls whose arguments are all positional bind with an allocation-free binder; calls with names bind through a hashed name index built at load time. Property tests hold both to `bytecode_lang::ParamList::bind`, the family's single statement of PHP's and Python's argument rules.
 - **Hostile-input budgets everywhere.** Constant nesting (64), inheritance depth (256), call depth, register stack, heap bytes, and fuel are all bounded; collection and constant materialisation are iterative or depth-capped.
 
 <hr>

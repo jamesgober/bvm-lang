@@ -107,6 +107,12 @@ pub enum VmError {
         /// The argument's position.
         index: usize,
     },
+    /// [`Vm::set_destructor`](crate::Vm::set_destructor): the method the
+    /// name finds for some struct type cannot be called with the instance
+    /// as its one argument (it takes a different number of parameters, its
+    /// parameter is not `dyn` or a `ref` the instance's type descends to, or
+    /// it has captures).
+    BadDestructor(FuncId),
 }
 
 impl VmError {
@@ -206,6 +212,12 @@ impl fmt::Display for VmError {
             }
             VmError::ArgumentType { index } => {
                 write!(f, "argument {index} does not convert to its parameter type")
+            }
+            VmError::BadDestructor(id) => {
+                write!(
+                    f,
+                    "{id} cannot be a destructor: it must take the instance as its one parameter"
+                )
             }
         }
     }

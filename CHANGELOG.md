@@ -21,6 +21,37 @@
 
 ---
 
+## [2.0.0-alpha.4] - 2026-10-12
+
+**The reference-counting memory profile** (DECISIONS D22). A VM made with `Vm::with_memory(&program, Memory::Rc)` counts references and collects garbage cycles by trial deletion, PHP's model: objects die at their last reference, before the next instruction, so a destructor named with `Vm::set_destructor` runs where PHP runs `__destruct` and a dropped generator closes where PHP destroys it; copying an array unbinds a PHP reference nothing else holds, as PHP does (LSB §5.17's divergence closed at run time, ISSUES P34). The tracing profile stays the default and is unchanged unless asked for a destructor. Dynamic-call binding is now fuel-proportional (ISSUES P33). Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
+
+### Breaking
+
+- **Large dynamic calls cost more fuel** (ISSUES P33). A `dcall_shape` whose flattened call has `n >= 64` items is charged `n / 64` units more, after flattening and before binding (so binding errors after a large flattening are charged those units); one unit short is the `OutOfFuel` trap at the call, which has no effect. Calls of fewer than 64 items (every call whose arguments are a window among them) cost exactly what LSB §5.14 says. Migration: a host whose fuel budgets are exact for calls with large spreads raises them by `items / 64`.
+- `VmError` gains `BadDestructor(FuncId)` (the enum is `#[non_exhaustive]`; only exhaustive matches inside this crate's own code needed an arm).
+
+### Added
+
+- **`Memory`** (`Tracing`, the default, and `Rc`), **`Vm::with_memory`**, **`Vm::memory`**: the memory profile, fixed when the VM is made. LSB format 2 has no module flag for it; the runner maps the language's `[runtime] memory` key (`"gc"`, `"rc"`) to it.
+- **The RC profile.** Counts over the existing generation-checked slots (no raw pointers; still `#![forbid(unsafe_code)]`): every holder of a reference word counts once (reference-typed registers of live and suspended frames, frame closures, reference-typed object slots, array and map storage once however many containers share it, globals, caches, the resume chain, the scheduler, values handed to the host). A count reaching zero is settled before the next instruction: the object is freed iteratively (the zero list is the work list; a million-node chain frees without recursion), in PHP's order (a function's variables in declaration order, an array's elements first to last, an object before what it holds). A count that would pass `u32::MAX` sticks (the object is never freed again) and the run ends with the `OutOfMemory` trap at the next boundary.
+- **The cycle collector**: synchronous trial deletion (Bacon and Rajan's algorithm, as PHP's `gc_collect_cycles`) over the possible roots counting buffers, with shared array and map storage as nodes of its own (so cycles through `dup`ed containers are found), work lists in every phase (a million-node ring collects without recursion), PHP's adaptive threshold (10,000 roots; +10,000 up to 1,000,000 after a collection that frees fewer than 100 objects), and one unit of fuel per 64 objects visited. Garbage needing code (a destructor, a suspended coroutine) is kept with what it reaches until that code ran. `Vm::collect_garbage` runs a full collection under RC.
+- **Destructors**: `Vm::set_destructor(name)` makes every struct type's method of that name (own or inherited) its destructor, called with the instance when it dies, at most once, its result and errors discarded, charged fuel, skipped when the limits cannot hold its frame. Under RC at the last reference (PHP's timing: reassignment, `unset`, scope exit, element overwrite, container destruction, the cycle collector for cycles); objects that die together are destructed one after another, never nested, while what a destructor drops is destructed inside it. Under tracing, the collection that finds the object queues it (after the dropped coroutines) for the next fuel charge point or `Vm::run_finalizers`.
+- **Close on drop at the last reference** under RC (LSB §5.13 rule 13 for `rc` runtimes): a suspended coroutine whose count reaches zero is closed before the next instruction.
+- **PHP's reference unbinding on copy** under RC: every contents copy (copy-on-write and a struct `dup`, PHP's `clone`) turns a reference slot whose reference only the copied contents hold into a plain slot of its value, and a write through a reference slot of shared contents copies first (`SEPARATE_ARRAY`). `foreach ($a as &$v) {} $b = $a; $b[0] = 7;` leaves `$a` as PHP does, with no `dunref` emitted.
+- **`MemoryStats`** and **`Vm::memory_stats`**: collections, objects freed, of those by the cycle collector, finalizations started, references unbound, live objects, bytes.
+- **Fuel-proportional binding** (ISSUES P33): calls with named arguments bind through a hashed name index built at load time for lists of more than eight named parameters, with an ordered set for names repeated in a rest collection (O(n log n), was O(n x parameters)); large calls are charged per item (see Breaking); an empty rest parameter shares one empty storage until its first write.
+- Tests: `tests/memory_rc.rs` (26: PHP's destructor order for reassignment, `unset`, scope exit, element overwrite, array and nested-object destruction, resurrection, errors and traps in destructors, fuel and depth, cycles at the collection point and inside a run, tracing destructors, inherited and invalid destructors, close on drop at the last reference, unbinding for arrays, `foreach` by reference, maps, and clones, cycles through shared storage, million-node rings and chains, the collector's fuel, the memory budget, host values), `tests/binding.rs` (3: per-item fuel at 0 to 6,400 items, a 200,000-key hostile named spread, empty rests); RC versions of both whole-module differential properties (6,000 random programs against the reference interpreters, with a guard that at least 95% of programs are compared) and of the untrusted-input fuzz properties; in debug builds every RC run recounts every count when it ends and every RC collection checks that nothing it kept is unreachable; a unit test drives a count to saturation; the named binder is property-tested against `ParamList::bind` (4,000 lists and calls, with and without the index); mutation-checked.
+- Benchmarks `profile/<workload>/{tracing,rc}` (calls, dynamic loop, nested append, allocation churn, generator iteration, 100k destructors, 100k garbage cycles) and `call/dcall_spread_named_200k`. Example `memory_profiles`.
+
+### Changed
+
+- Copy-on-write and separation decisions stay on LSB §5.16's two bits in both profiles (LSB would let RC use counts; that diverges from tracing on code that stores a container without `dup`, which the differential tests generate). Under RC the counts decide only whether a copy is physical, which is where references are unbound.
+- `Vm::run_finalizers` and `Vm::pending_finalizers` also cover queued destructors, and under RC whatever died outside a run; `run_finalizers` returns the finalizations it started, those they caused included.
+- A map entry's key and value words are cleared when the entry is deleted (the store holds only live entries' words).
+- The struct-, array-, and frame-releasing paths gained one predictable branch each where the tracing profile used to store directly; the dispatch loop is compiled once per profile, so the tracing loop has no counting code. Measured against alpha.3 with an alternating harness (tracing): `fib(25)` ~8% faster, dynamic loops, generators, nested append, and allocation churn at parity (within ~3%), `map/int_keys` ~4% and `foreach_by_ref` ~5-8% slower. Under RC the same workloads run ~1.1x to ~3.4x slower than tracing (README, Performance).
+
+---
+
 ## [2.0.0-alpha.3] - 2026-10-09
 
 **LSB format 2.** The VM now executes the format [`bytecode-lang`](https://crates.io/crates/bytecode-lang) 0.3 defines: dynamic calls that bind to parameter lists (named arguments, variadics, defaults, by-reference parameters decided at run time), host functions as values, PHP references with transparent reference slots, copy-on-write separation for nested writes, OPS v2's `pow`, `abs`, and saturating shifts with the family's shared `ls_pow` routine, `raise` with error payloads, and PHP's generator keys. Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
@@ -198,7 +229,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.3...HEAD
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.4...HEAD
+[2.0.0-alpha.4]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.3...v2.0.0-alpha.4
 [2.0.0-alpha.3]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.2...v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.1...v2.0.0-alpha.2
 [2.0.0-alpha.1]: https://github.com/jamesgober/bvm-lang/compare/v1.0.0...v2.0.0-alpha.1

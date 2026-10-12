@@ -25,15 +25,26 @@
 //! - `php/*`: `$g[$i % 64][] = $i` for 100k `$i`, with `dsep_index` and with
 //!   the `dup`-per-write lowering format 1 required; `foreach ($a as &$v)
 //!   $v++` over 100k elements (`dref_index`, `cell_get`, `cell_set`).
+//! - `profile/<workload>/{tracing,rc}`: the same programs under both
+//!   memory profiles (DECISIONS D22): calls (`fib(25)`), the dynamic loop,
+//!   the nested-append loop, allocation churn with a live set, generator
+//!   iteration, 100k objects with a destructor made and dropped one by one
+//!   (RC runs each at its last reference; tracing queues them at
+//!   collections), and 100k self-referencing objects (garbage cycles: the
+//!   RC cycle collector against tracing).
+//! - `call/dcall_spread_named_200k`: one dynamic call binding a named
+//!   spread of 200k keys to a 200-parameter list (ISSUES P33: the hashed
+//!   name index keeps it linear).
 //!
 //! Run with `cargo bench`.
 
 use std::hint::black_box;
 
-use bvm_lang::{Host, Limits, Program, Value, Vm};
+use bvm_lang::{Host, HostCtx, HostError, Limits, Memory, Program, Value, Vm};
 use bytecode_lang::{
-    ArgKind, Callee, Const, FuncId, FunctionBuilder, Hook, Inst, IntOp, IntTy, ModuleBuilder,
-    Param, ParamKind, ParamList, Policy, Prim, Reg, TypeDef, ValType,
+    ArgKind, Callee, Const, Field, FieldIdx, FuncId, FunctionBuilder, Hook, Inst, IntOp, IntTy,
+    Method, ModuleBuilder, Param, ParamKind, ParamList, Policy, Prim, Reg, StructDef, TypeDef,
+    ValType,
 };
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -976,6 +987,179 @@ fn bench_php(c: &mut Criterion) {
     g.finish();
 }
 
+/// `for i in 0..n { o = new Obj; o.self = o (when `cycle`); o = nil }`,
+/// with `Obj` carrying a destructor that counts.
+fn objects_program(cycle: bool) -> (Program, FuncId) {
+    let mut m = ModuleBuilder::new();
+    let obj = m.reserve_type();
+    let count = m.global("count", I64, true, None);
+    let mut d = m.function("Obj::__destruct", &[D], &[]);
+    let (c, one) = (d.reg(I64), d.reg(I64));
+    d.emit(Inst::GetGlobal {
+        dst: c,
+        global: count,
+    });
+    d.emit(Inst::LoadInt {
+        dst: one,
+        val: 1,
+        ty: IntTy::I64,
+    });
+    d.emit(Inst::IAdd {
+        dst: c,
+        lhs: c,
+        rhs: one,
+        op: op(),
+    });
+    d.emit(Inst::SetGlobal {
+        global: count,
+        src: c,
+    });
+    d.ret_void();
+    let dtor = m.add_function(d).expect("builds");
+    let (name, slf, dn) = (m.string("Obj"), m.string("self"), m.string("__destruct"));
+    m.define_type(
+        obj,
+        TypeDef::Struct(StructDef {
+            name,
+            parent: None,
+            fields: vec![Field { name: slf, ty: D }],
+            methods: vec![Method {
+                name: dn,
+                func: dtor,
+            }],
+        }),
+    );
+    let mut f = m.function("main", &[I64], &[]);
+    let ty = f.type_ref(obj);
+    let o = f.reg(D);
+    counted(&mut f, Reg(0), |f, _| {
+        f.emit(Inst::NewStruct { dst: o, ty });
+        if cycle {
+            f.emit(Inst::SetField {
+                obj: o,
+                field: FieldIdx(0),
+                src: o,
+            });
+        }
+        f.emit(Inst::LoadNil { dst: o });
+    });
+    f.ret_void();
+    let main = m.add_function(f).expect("builds");
+    (load(m), main)
+}
+
+fn bench_profiles(c: &mut Criterion) {
+    let mut g = c.benchmark_group("profile");
+    g.sample_size(10);
+    let profiles = [("tracing", Memory::Tracing), ("rc", Memory::Rc)];
+    let n = 100_000i64;
+    let fib = fib_program();
+    let dyn5 = dyn_loop(false);
+    let append = nested_append_program(true);
+    let churn = gc_program();
+    let (generator, gen_main) = generator_program();
+    let (objects, obj_main) = objects_program(false);
+    let (cycles, cyc_main) = objects_program(true);
+    for (pname, memory) in profiles {
+        let mut vm = Vm::with_memory(&fib, memory);
+        g.bench_function(format!("fib25/{pname}"), |b| {
+            b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(25)]).expect("runs")));
+        });
+        let mut vm = Vm::with_memory(&dyn5, memory);
+        g.bench_function(format!("dyn_loop5_100k/{pname}"), |b| {
+            b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(n)]).expect("runs")));
+        });
+        let mut vm = Vm::with_memory(&append, memory);
+        g.bench_function(format!("nested_append_100k/{pname}"), |b| {
+            b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(n)]).expect("runs")));
+        });
+        let mut vm = Vm::with_memory(&churn, memory);
+        vm.set_limits(Limits::new().with_memory(16 << 20));
+        g.bench_function(format!("alloc_1m_live_10k/{pname}"), |b| {
+            b.iter(|| black_box(vm.run(FuncId(0), &[Value::Int(1_000_000)]).expect("runs")));
+        });
+        let mut vm = Vm::with_memory(&generator, memory);
+        g.bench_function(format!("generator_iter_100k/{pname}"), |b| {
+            b.iter(|| black_box(vm.run(gen_main, &[Value::Int(n)]).expect("runs")));
+        });
+        let mut vm = Vm::with_memory(&objects, memory);
+        vm.set_destructor("__destruct").expect("fits");
+        g.bench_function(format!("destructors_100k/{pname}"), |b| {
+            b.iter(|| {
+                vm.run(obj_main, &[Value::Int(n)]).expect("runs");
+                // Tracing runs what its collections queued here.
+                black_box(vm.run_finalizers().expect("runs"))
+            });
+        });
+        let mut vm = Vm::with_memory(&cycles, memory);
+        g.bench_function(format!("cycles_100k/{pname}"), |b| {
+            b.iter(|| {
+                vm.run(cyc_main, &[Value::Int(n)]).expect("runs");
+                vm.collect_garbage();
+                black_box(vm.heap_objects())
+            });
+        });
+    }
+    g.finish();
+}
+
+/// One dynamic call binding a named spread of `n` keys (200 of them the
+/// parameter names of the callee, the rest collected by its named rest).
+fn named_spread_program(n: usize) -> (Program, FuncId) {
+    let mut m = ModuleBuilder::new();
+    let names: Vec<_> = (0..200).map(|i| m.string(&format!("p{i}"))).collect();
+    let extra = m.string("extra");
+    let mut params: Vec<Param> = names.iter().map(|&s| Param::normal(s)).collect();
+    params.push(Param::new(ParamKind::RestNamed, Some(extra)));
+    let sig = vec![D; 201];
+    let mut f = m.function("f", &sig, &[D]);
+    f.set_params(ParamList::new(params));
+    f.ret(Reg(0));
+    let f = m.add_function(f).expect("builds");
+    let isig = m.func_type(&[], &[D]);
+    let named = m.import("env", "named", isig);
+    let mut main = m.function("main", &[], &[D]);
+    let fv = main.reg(D);
+    let w = main.regs(&[D, D]);
+    main.emit(Inst::MakeClosure { dst: fv, func: f });
+    main.emit(Inst::CallImport {
+        dst: Reg(w.0 + 1),
+        import: named,
+        argc: 0,
+    });
+    main.dcall_shape(w, fv, &[ArgKind::SpreadNamed]);
+    main.ret(w);
+    let main = m.add_function(main).expect("builds");
+    let mut host = Host::new();
+    host.register("env", "named", move |ctx: &mut HostCtx<'_>, _: &[Value]| {
+        let mut entries = Vec::with_capacity(n);
+        for i in 0..n {
+            let key = if i < 200 {
+                format!("p{i}")
+            } else {
+                format!("k{i}")
+            };
+            entries.push((ctx.new_str(key.as_bytes())?, Value::Int(1)));
+        }
+        ctx.new_map(&entries)
+            .map_err(|_: HostError| HostError::Raise(bytecode_lang::ErrorKind::OutOfMemory))
+    });
+    let p = Program::load(m.finish().expect("builds"), &host).expect("loads");
+    (p, main)
+}
+
+fn bench_binding(c: &mut Criterion) {
+    let mut g = c.benchmark_group("call");
+    g.sample_size(10);
+    let (p, main) = named_spread_program(200_000);
+    let mut vm = Vm::new(&p);
+    g.throughput(Throughput::Elements(200_000));
+    g.bench_function("dcall_spread_named_200k", |b| {
+        b.iter(|| black_box(vm.run(main, &[]).expect("runs")));
+    });
+    g.finish();
+}
+
 criterion_group!(
     benches,
     bench_dispatch,
@@ -986,6 +1170,8 @@ criterion_group!(
     bench_load,
     bench_coroutines,
     bench_async,
-    bench_php
+    bench_php,
+    bench_profiles,
+    bench_binding
 );
 criterion_main!(benches);

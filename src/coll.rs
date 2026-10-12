@@ -24,6 +24,16 @@
 //! **Copies mark what they share** (LSB §5.16). When a write copies shared
 //! contents, every array and map among them becomes `aliased` (two
 //! containers now hold it), before the copy is made.
+//!
+//! **Counted stores** (the RC profile). Every store into a reference-typed
+//! element or map entry moves a count from the old word to the new one, a
+//! push or an insertion adds one, a pop or a deletion removes one. A copy of
+//! shared storage holds its own counts on everything it copies, except that
+//! a reference slot whose reference nothing else holds (count 1: only the
+//! storage being copied) becomes, in the copy, a plain slot holding the
+//! reference's value (separated as by `dup` when an array or map): PHP's
+//! rule that a copy of an array drops references nobody else shares
+//! (`zend_array_dup` keeps a reference only while its refcount is above 1).
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -273,6 +283,9 @@ pub(crate) fn map_store_mut(
     map: u64,
     extra: usize,
 ) -> Result<&mut MapStore, Fault> {
+    if heap.rc {
+        return map_store_mut_counted(heap, map, extra);
+    }
     let (shared_bytes, frozen, old) = match heap.get(map) {
         Some(Object::Map(m)) => {
             let cow = m.contents_shared();
@@ -310,6 +323,130 @@ pub(crate) fn map_store_mut(
     }
 }
 
+/// [`map_store_mut`] in the RC profile: a physical copy holds its own
+/// counts and unbinds references only the old storage holds.
+#[inline(never)]
+fn map_store_mut_counted(heap: &mut Heap, map: u64, extra: usize) -> Result<&mut MapStore, Fault> {
+    let (shared_bytes, frozen, old, kty, vty) = match heap.get(map) {
+        Some(Object::Map(m)) => {
+            let cow = m.contents_shared();
+            let holds_refs = m.key.is_reference() || m.value.is_reference();
+            (
+                if Arc::strong_count(&m.store) > 1 {
+                    m.store.bytes()
+                } else {
+                    0
+                },
+                m.frozen,
+                (cow && holds_refs).then(|| Arc::clone(&m.store)),
+                m.key,
+                m.value,
+            )
+        }
+        _ => return Err(not_a(heap, map)),
+    };
+    if frozen {
+        return Err(Fault::type_error());
+    }
+    heap.charge(shared_bytes.saturating_add(extra))?;
+    let mut unbound = Vec::new();
+    if let Some(old) = old {
+        // `old` is one more holder of the storage: physically shared means
+        // some container besides this one still holds it.
+        if Arc::strong_count(&old) > 2 {
+            // The copy about to be made holds its own counts (see the
+            // module docs for the references it unbinds).
+            if vty == ValType::Dyn {
+                for (pos, e) in old.entries().iter().enumerate() {
+                    if e.live {
+                        if let Some(v) = unbind(heap, e.value)? {
+                            unbound.push((pos, v));
+                        }
+                    }
+                }
+            }
+            let mut next = unbound.iter().peekable();
+            for (pos, e) in old.entries().iter().enumerate() {
+                if !e.live {
+                    continue;
+                }
+                if kty.is_reference() {
+                    heap.inc(e.key);
+                }
+                match next.peek() {
+                    Some(&&(p, v)) if p == pos => {
+                        heap.inc(v);
+                        let _ = next.next();
+                    }
+                    _ if vty.is_reference() => heap.inc(e.value),
+                    _ => {}
+                }
+            }
+        }
+        heap.mark_aliased(
+            old.entries()
+                .iter()
+                .filter(|e| e.live)
+                .flat_map(|e| [e.key, e.value]),
+        );
+    }
+    match heap.get_mut(map) {
+        Some(Object::Map(m)) => {
+            m.cow = false;
+            let store = Arc::make_mut(&mut m.store);
+            for &(pos, v) in &unbound {
+                let _reference = store.set_value(pos, v);
+            }
+            Ok(store)
+        }
+        _ => Err(Fault::type_error()),
+    }
+}
+
+/// A reference slot's word when the copy being made should hold its value
+/// instead (RC): the word is a reference only the storage being copied
+/// holds. Returns that value, separated as by `dup` when an array or map.
+fn unbind(heap: &mut Heap, w: u64) -> Result<Option<u64>, Fault> {
+    if !dynv::is_box(w) || heap.count(w) != Some(1) {
+        return Ok(None);
+    }
+    let v = heap.box_value(w).unwrap_or(dynv::NIL);
+    let v = share(heap, v)?;
+    heap.stats.unbound += 1;
+    Ok(Some(v))
+}
+
+/// An O(1) copy of an array or map (a new container sharing the contents
+/// copy-on-write, LSB §5.16), or the value itself for anything else.
+pub(crate) fn share(heap: &mut Heap, v: u64) -> Result<u64, Fault> {
+    let copy = match heap.get(v) {
+        Some(Object::Array(a)) => Object::Array(ArrayObj {
+            elem: a.elem,
+            frozen: false,
+            cow: true,
+            aliased: false,
+            items: Arc::clone(&a.items),
+        }),
+        Some(Object::Map(m)) => Object::Map(MapObj {
+            key: m.key,
+            value: m.value,
+            frozen: false,
+            cow: true,
+            aliased: false,
+            store: Arc::clone(&m.store),
+        }),
+        _ => return Ok(v),
+    };
+    let c = heap.alloc(copy)?;
+    // Both containers now share their contents (LSB §5.16 `cow`).
+    match heap.get_mut(v) {
+        Some(Object::Array(a)) => a.cow = true,
+        Some(Object::Map(m)) => m.cow = true,
+        _ => {}
+    }
+    Ok(c)
+}
+
 /// Makes a map's contents its own before a write (copy-on-write).
 pub(crate) fn unique_map(heap: &mut Heap, map: u64) -> Result<(), Fault> {
     map_store_mut(heap, map, 0).map(|_| ())
@@ -328,6 +465,64 @@ pub(crate) fn unique_array(heap: &mut Heap, arr: u64) -> Result<(), Fault> {
 /// and the growth estimate: splitting them into a search returning a record
 /// and a separate store measured ~15% slower on `map/int_keys_100k_set_get`.
 pub(crate) fn map_set(
+    heap: &mut Heap,
+    seed: Seed,
+    map: u64,
+    key: u64,
+    value: u64,
+) -> Result<(), Fault> {
+    if heap.rc {
+        return map_set_counted(heap, seed, map, key, value);
+    }
+    let m = map_ref(heap, map)?;
+    let kty = m.key;
+    let key = normalize_key(kty, key);
+    let hash = hash_key(heap, seed, kty, key);
+    let ik = int_key(heap, kty, key);
+    let pos = m.store.find(hash, ik, |k| key_eq(heap, kty, k, key));
+    let mut value = value;
+    let mut through = None;
+    if m.value == ValType::Dyn {
+        if let Some(w) = pos.and_then(|p| m.store.entry(p)).map(|e| e.value) {
+            if dynv::is_box(w) {
+                through = Some(w);
+            }
+        }
+        if dynv::is_box(value) {
+            value = heap.deref(value);
+        }
+    }
+    let growth = if pos.is_none() {
+        m.store.growth_bytes(ik)
+    } else {
+        0
+    };
+    if let Some(w) = through {
+        if heap.set_box(w, value) {
+            return Ok(());
+        }
+    }
+    let store = map_store_mut(heap, map, growth)?;
+    match pos {
+        Some(p) => {
+            let _old = store.set_value(p, value);
+        }
+        None => {
+            if !store.insert(hash, key, value, ik) {
+                return Err(Fault::Trap(ErrorKind::OutOfMemory));
+            }
+            if let Some(k) = ik {
+                store.note_int_key(k);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`map_set`] in the RC profile: counted stores, and a write through a
+/// reference slot of shared contents separates first.
+#[inline(never)]
+fn map_set_counted(
     heap: &mut Heap,
     seed: Seed,
     map: u64,
@@ -357,12 +552,22 @@ pub(crate) fn map_set(
     } else {
         0
     };
-    if let Some(w) = through {
-        if heap.set_box(w, value) {
+    let types = (m.key, m.value);
+    if let Some(mut w) = through {
+        if heap.rc {
+            // RC: the write separates first (PHP's `SEPARATE_ARRAY`), and
+            // the copy it may make unbinds a reference only the old storage
+            // holds: the slot is then a plain slot, written below.
+            unique_map(heap, map)?;
+            w = pos
+                .and_then(|p| map_word_at(heap, map, p))
+                .unwrap_or(dynv::NIL);
+        }
+        if dynv::is_box(w) && heap.set_box(w, value) {
             return Ok(());
         }
     }
-    store_at(heap, map, (pos, key, hash, ik, growth), value)
+    store_at(heap, map, (pos, key, hash, ik, growth), types, value)
 }
 
 /// Stores `value` under `key` as it is (a box makes a reference slot):
@@ -375,21 +580,35 @@ pub(crate) fn map_set_raw(
     value: u64,
 ) -> Result<(), Fault> {
     let f = map_find(heap, seed, map, key)?;
-    store_at(heap, map, (f.pos, f.key, f.hash, f.ik, f.growth), value)
+    let types = map_ref(heap, map).map(|m| (m.key, m.value))?;
+    store_at(
+        heap,
+        map,
+        (f.pos, f.key, f.hash, f.ik, f.growth),
+        types,
+        value,
+    )
 }
 
 /// The store half of a map write: (position, key, hash, integer key,
-/// growth) from the search.
+/// growth) from the search, and the map's (key, value) types.
 #[inline(always)]
 fn store_at(
     heap: &mut Heap,
     map: u64,
     (pos, key, hash, ik, growth): (Option<usize>, u64, u64, Option<i128>, usize),
+    (kty, vty): (ValType, ValType),
     value: u64,
 ) -> Result<(), Fault> {
+    let counted = heap.rc;
     let store = map_store_mut(heap, map, growth)?;
     match pos {
-        Some(p) => store.set_value(p, value),
+        Some(p) => {
+            let old = store.set_value(p, value);
+            if counted && vty.is_reference() {
+                heap.swap(value, old);
+            }
+        }
         None => {
             if !store.insert(hash, key, value, ik) {
                 return Err(Fault::Trap(ErrorKind::OutOfMemory));
@@ -397,9 +616,23 @@ fn store_at(
             if let Some(k) = ik {
                 store.note_int_key(k);
             }
+            if counted {
+                insert_counts(heap, (kty, key), (vty, value));
+            }
         }
     }
     Ok(())
+}
+
+/// The counts a new map entry holds (RC).
+#[inline(never)]
+fn insert_counts(heap: &mut Heap, (kty, key): (ValType, u64), (vty, value): (ValType, u64)) {
+    if kty.is_reference() {
+        heap.inc(key);
+    }
+    if vty.is_reference() {
+        heap.inc(value);
+    }
 }
 
 /// `map_del`: removes the key if present.
@@ -415,7 +648,18 @@ pub(crate) fn map_del(heap: &mut Heap, seed: Seed, map: u64, key: u64) -> Result
         }
         return Ok(());
     };
-    map_store_mut(heap, map, 0)?.remove(pos);
+    let vty = m.value;
+    let removed = map_store_mut(heap, map, 0)?.remove(pos);
+    if heap.rc {
+        if let Some((k, v)) = removed {
+            if kty.is_reference() {
+                heap.dec(k);
+            }
+            if vty.is_reference() {
+                heap.dec(v);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -502,6 +746,9 @@ pub(crate) fn array_items_mut(
     arr: u64,
     extra: usize,
 ) -> Result<&mut Vec<u64>, Fault> {
+    if heap.rc {
+        return array_items_mut_counted(heap, arr, extra);
+    }
     let (shared_bytes, frozen, old) = match heap.get(arr) {
         Some(Object::Array(a)) => {
             let cow = a.contents_shared();
@@ -533,6 +780,82 @@ pub(crate) fn array_items_mut(
     }
 }
 
+/// [`array_items_mut`] in the RC profile, as [`map_store_mut_counted`].
+#[inline(never)]
+fn array_items_mut_counted(
+    heap: &mut Heap,
+    arr: u64,
+    extra: usize,
+) -> Result<&mut Vec<u64>, Fault> {
+    let (shared_bytes, frozen, old, elem) = match heap.get(arr) {
+        Some(Object::Array(a)) => {
+            let cow = a.contents_shared();
+            (
+                if Arc::strong_count(&a.items) > 1 {
+                    a.items.len() * 8
+                } else {
+                    0
+                },
+                a.frozen,
+                (cow && a.elem.is_reference()).then(|| Arc::clone(&a.items)),
+                a.elem,
+            )
+        }
+        _ => return Err(not_a(heap, arr)),
+    };
+    if frozen {
+        return Err(Fault::type_error());
+    }
+    heap.charge(shared_bytes.saturating_add(extra))?;
+    let mut unbound = Vec::new();
+    if let Some(old) = old {
+        // `old` is one more holder of the storage: physically shared means
+        // some container besides this one still holds it.
+        if Arc::strong_count(&old) > 2 {
+            // The copy about to be made holds its own counts (see the
+            // module docs for the references it unbinds).
+            if elem == ValType::Dyn {
+                for (i, &w) in old.iter().enumerate() {
+                    if let Some(v) = unbind(heap, w)? {
+                        unbound.push((i, v));
+                    }
+                }
+            }
+            let mut next = unbound.iter().peekable();
+            for (i, &w) in old.iter().enumerate() {
+                match next.peek() {
+                    Some(&&(j, v)) if j == i => {
+                        heap.inc(v);
+                        let _ = next.next();
+                    }
+                    _ => heap.inc(w),
+                }
+            }
+        }
+        heap.mark_aliased(old.iter().copied());
+    }
+    match heap.get_mut(arr) {
+        Some(Object::Array(a)) => {
+            a.cow = false;
+            let items = Arc::make_mut(&mut a.items);
+            for &(i, v) in &unbound {
+                if let Some(slot) = items.get_mut(i) {
+                    *slot = v;
+                }
+            }
+            Ok(items)
+        }
+        _ => Err(Fault::type_error()),
+    }
+}
+
+/// Whether stores into an array's elements are counted (RC, reference
+/// elements).
+#[inline]
+fn counted_elems(heap: &Heap, arr: u64) -> bool {
+    heap.rc && matches!(heap.get(arr), Some(Object::Array(a)) if a.elem.is_reference())
+}
+
 /// `array_set`: in an array of `dyn` a box is stored as its value and a
 /// reference slot is written through (LSB §5.17).
 pub(crate) fn array_set(heap: &mut Heap, arr: u64, idx: i64, v: u64) -> Result<(), Fault> {
@@ -546,7 +869,16 @@ pub(crate) fn array_set(heap: &mut Heap, arr: u64, idx: i64, v: u64) -> Result<(
     let mut v = v;
     if dyn_elems {
         v = heap.deref(v);
-        let old = a.items.get(i).copied().unwrap_or(dynv::NIL);
+        let mut old = a.items.get(i).copied().unwrap_or(dynv::NIL);
+        if heap.rc && dynv::is_box(old) {
+            // RC: separate first, as `map_set` does.
+            unique_array(heap, arr)?;
+            old = array_ref(heap, arr)?
+                .items
+                .get(i)
+                .copied()
+                .unwrap_or(dynv::NIL);
+        }
         if dynv::is_box(old) && heap.set_box(old, v) {
             return Ok(());
         }
@@ -556,9 +888,27 @@ pub(crate) fn array_set(heap: &mut Heap, arr: u64, idx: i64, v: u64) -> Result<(
 
 /// Stores `v` at the in-range index `i` as it is (a box makes a reference
 /// slot).
+#[inline]
 pub(crate) fn array_set_raw(heap: &mut Heap, arr: u64, i: usize, v: u64) -> Result<(), Fault> {
+    if heap.rc {
+        return array_set_counted(heap, arr, i, v);
+    }
     if let Some(slot) = array_items_mut(heap, arr, 0)?.get_mut(i) {
         *slot = v;
+    }
+    Ok(())
+}
+
+/// [`array_set_raw`] with a counted store (RC).
+#[inline(never)]
+fn array_set_counted(heap: &mut Heap, arr: u64, i: usize, v: u64) -> Result<(), Fault> {
+    let counted = counted_elems(heap, arr);
+    let old = match array_items_mut(heap, arr, 0)?.get_mut(i) {
+        Some(slot) => core::mem::replace(slot, v),
+        None => return Ok(()),
+    };
+    if counted {
+        heap.swap(v, old);
     }
     Ok(())
 }
@@ -576,7 +926,11 @@ pub(crate) fn array_push(heap: &mut Heap, arr: u64, v: u64) -> Result<(), Fault>
     } else {
         v
     };
+    let counted = counted_elems(heap, arr);
     array_items_mut(heap, arr, grow)?.push(v);
+    if counted {
+        heap.inc(v);
+    }
     Ok(())
 }
 
@@ -587,9 +941,16 @@ pub(crate) fn array_pop(heap: &mut Heap, arr: u64) -> Result<u64, Fault> {
         return Err(out_of_bounds());
     }
     let dyn_elems = a.elem == ValType::Dyn;
+    let counted = counted_elems(heap, arr);
     let w = array_items_mut(heap, arr, 0)?
         .pop()
         .ok_or_else(out_of_bounds)?;
+    // The storage gives up its count; the value is read now and counted
+    // again where it is stored (nothing is freed before the instruction
+    // ends).
+    if counted {
+        heap.dec(w);
+    }
     Ok(if dyn_elems { heap.deref(w) } else { w })
 }
 
@@ -696,10 +1057,22 @@ pub(crate) fn iter_next(heap: &mut Heap, it: u64) -> Result<Option<u64>, Fault> 
     } else {
         (k, v)
     };
-    if let Some(Object::Iter(i)) = heap.get_mut(it) {
-        i.index = index + 1;
-        i.cursor = cursor;
-        i.key = Some(k);
+    let rc = heap.rc;
+    let replaced = match heap.get_mut(it) {
+        Some(Object::Iter(i)) => {
+            i.index = index + 1;
+            i.cursor = cursor;
+            let old = i.key.replace(k);
+            (rc && i.key_ty.is_reference()).then_some(old)
+        }
+        _ => None,
+    };
+    // The iterator holds its current key (counted when it is a reference).
+    if let Some(old) = replaced {
+        heap.inc(k);
+        if let Some(old) = old {
+            heap.dec(old);
+        }
     }
     Ok(Some(v))
 }

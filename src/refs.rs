@@ -27,7 +27,7 @@ use crate::coll::{self, not_a};
 use crate::conv;
 use crate::dynv;
 use crate::fault::Fault;
-use crate::heap::{ArrayObj, CellObj, MapObj, Object, StructObj};
+use crate::heap::{CellObj, Object, StructObj};
 use crate::machine::Machine;
 use crate::program::Program;
 
@@ -58,22 +58,23 @@ fn read(m: &Machine, s: Slot) -> u64 {
 /// Stores `w` into a slot as it is, writing an array or map container
 /// first (copy-on-write: usually the caller already did, and then this
 /// copies nothing). Struct fields are never shared.
+///
+/// Every slot written here is reference-typed (a `dyn` or `ref` element,
+/// value, or field), so the store is counted in the RC profile.
 fn write(m: &mut Machine, s: Slot, w: u64) -> Result<(), Fault> {
-    match s {
-        Slot::Arr(o, i) => coll::array_set_raw(&mut m.heap, o, i, w),
-        Slot::Map(o, p) => {
-            coll::map_store_mut(&mut m.heap, o, 0)?.set_value(p, w);
-            Ok(())
-        }
-        Slot::Field(o, f) => {
-            if let Some(Object::Struct(st)) = m.heap.get_mut(o) {
-                if let Some(x) = st.fields.get_mut(f) {
-                    *x = w;
-                }
-            }
-            Ok(())
-        }
-    }
+    let old = match s {
+        Slot::Arr(o, i) => return coll::array_set_raw(&mut m.heap, o, i, w),
+        Slot::Map(o, p) => coll::map_store_mut(&mut m.heap, o, 0)?.set_value(p, w),
+        Slot::Field(o, f) => match m.heap.get_mut(o) {
+            Some(Object::Struct(st)) => match st.fields.get_mut(f) {
+                Some(x) => core::mem::replace(x, w),
+                None => return Ok(()),
+            },
+            _ => return Ok(()),
+        },
+    };
+    m.heap.swap(w, old);
+    Ok(())
 }
 
 /// `dup` (LSB §5.10, §5.16): a shallow copy with a new identity of an array,
@@ -82,6 +83,10 @@ fn write(m: &mut Machine, s: Slot, w: u64) -> Result<(), Fault> {
 /// copied fields become aliased. Strings, functions, and boxed ints are
 /// returned as they are; iterators, coroutines, and references raise
 /// `TypeError` (a reference is not a value, §5.17).
+///
+/// In the RC profile a struct's copy holds its own counts, and a `dyn`
+/// field holding a reference nothing else holds becomes a plain field of
+/// its value in the copy, as PHP's `clone` unbinds a refcount-1 reference.
 pub(crate) fn dup(m: &mut Machine, prog: &Program, v: u64) -> Result<u64, Fault> {
     let copy = match m.heap.get(v) {
         None => {
@@ -92,34 +97,47 @@ pub(crate) fn dup(m: &mut Machine, prog: &Program, v: u64) -> Result<u64, Fault>
                 Ok(v)
             };
         }
-        Some(Object::Array(a)) => Object::Array(ArrayObj {
-            elem: a.elem,
-            frozen: false,
-            cow: true,
-            aliased: false,
-            items: alloc::sync::Arc::clone(&a.items),
-        }),
-        Some(Object::Map(mm)) => Object::Map(MapObj {
-            key: mm.key,
-            value: mm.value,
-            frozen: false,
-            cow: true,
-            aliased: false,
-            store: alloc::sync::Arc::clone(&mm.store),
-        }),
+        Some(Object::Array(_) | Object::Map(_)) => return coll::share(&mut m.heap, v),
         Some(Object::Struct(s)) => {
             if !m.heap.fits(s.fields.len().saturating_mul(8)) {
                 return Err(Fault::Trap(ErrorKind::OutOfMemory));
             }
-            let fields = s.fields.clone();
+            let mut fields = s.fields.clone();
+            let ty = s.ty;
+            if m.heap.rc {
+                let dyn_fields = prog
+                    .struct_info(ty)
+                    .map_or(&[][..], |i| &i.fields[..])
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| **t == ValType::Dyn)
+                    .map(|(i, _)| i);
+                let mut unbound = alloc::vec::Vec::new();
+                for i in dyn_fields {
+                    let w = fields.get(i).copied().unwrap_or(dynv::NIL);
+                    if dynv::is_box(w) && m.heap.count(w) == Some(1) {
+                        let inner = m.heap.box_value(w).unwrap_or(dynv::NIL);
+                        unbound.push((i, coll::share(&mut m.heap, inner)?));
+                    }
+                }
+                m.heap.stats.unbound += unbound.len() as u64;
+                for (i, x) in unbound {
+                    if let Some(f) = fields.get_mut(i) {
+                        *f = x;
+                    }
+                }
+            }
             let refs: alloc::vec::Vec<u64> = prog
-                .struct_ref_fields(s.ty)
+                .struct_ref_fields(ty)
                 .iter()
                 .filter_map(|&f| fields.get(usize::from(f)).copied())
                 .collect();
-            let ty = s.ty;
             m.heap.mark_aliased(refs);
-            Object::Struct(StructObj { ty, fields })
+            Object::Struct(StructObj {
+                ty,
+                destructed: false,
+                fields,
+            })
         }
         Some(Object::Cell(c)) => {
             let (elem, value) = (c.elem, c.value);
@@ -136,16 +154,8 @@ pub(crate) fn dup(m: &mut Machine, prog: &Program, v: u64) -> Result<u64, Fault>
         }
         Some(Object::Str(_) | Object::Func(_) | Object::Int(_) | Object::Error(_)) => return Ok(v),
     };
-    let shares = matches!(copy, Object::Array(_) | Object::Map(_));
     let c = m.heap.alloc(copy)?;
-    if shares {
-        // Both containers now share their contents (LSB §5.16 `cow`).
-        match m.heap.get_mut(v) {
-            Some(Object::Array(a)) => a.cow = true,
-            Some(Object::Map(mm)) => mm.cow = true,
-            _ => {}
-        }
-    }
+    m.heap.adopt(c, prog);
     Ok(c)
 }
 
@@ -183,6 +193,7 @@ pub(crate) fn separated(m: &mut Machine, prog: &Program, v: u64) -> Result<u64, 
 
 /// The in-range array index a `dyn` key names, `Err(())` for a key that is
 /// not an int, `Ok(None)` out of range.
+#[inline(always)]
 fn array_index(m: &Machine, o: u64, k: u64) -> Result<Option<usize>, ()> {
     let len = match m.heap.get(o) {
         Some(Object::Array(a)) => a.items.len(),
@@ -193,6 +204,7 @@ fn array_index(m: &Machine, o: u64, k: u64) -> Result<Option<usize>, ()> {
 }
 
 /// The struct field named `name` (canonical string id): its slot and type.
+#[inline(always)]
 fn field(m: &Machine, prog: &Program, o: u64, name: u32) -> Option<(usize, ValType)> {
     let Some(Object::Struct(s)) = m.heap.get(o) else {
         return None;
@@ -322,11 +334,13 @@ fn make_ref(m: &mut Machine, prog: &Program, s: Slot) -> Result<u64, Fault> {
 }
 
 /// The `dyn` key of a map (`k` converted to the key type), or `TypeError`.
+#[inline(always)]
 fn map_key(m: &Machine, prog: &Program, kty: ValType, k: u64) -> Result<u64, Fault> {
     conv::from_dyn(&m.heap, prog, kty, k).map_err(|_| Fault::type_error())
 }
 
 /// `dref_index`: a reference to `obj[key]`.
+#[inline(always)]
 pub(crate) fn dref_index(m: &mut Machine, prog: &Program, o: u64, k: u64) -> Result<u64, Fault> {
     match shape(m, o) {
         Shape::Array(ValType::Dyn) => {
@@ -360,6 +374,7 @@ fn map_ref_at(m: &mut Machine, prog: &Program, o: u64, key: u64) -> Result<u64, 
 
 /// `dref_prop`: a reference to a `dyn` struct field or a map entry keyed by
 /// the name.
+#[inline(always)]
 pub(crate) fn dref_prop(m: &mut Machine, prog: &Program, o: u64, name: u32) -> Result<u64, Fault> {
     match shape(m, o) {
         Shape::Struct => match field(m, prog, o, name) {
@@ -385,6 +400,7 @@ fn reference(m: &Machine, src: u64) -> Result<u64, Fault> {
 }
 
 /// `dbind_index`: the slot `obj[key]` becomes the reference `src`.
+#[inline(always)]
 pub(crate) fn dbind_index(
     m: &mut Machine,
     prog: &Program,
@@ -410,6 +426,7 @@ pub(crate) fn dbind_index(
 
 /// `dbind_prop`: a `dyn` struct field or a map entry becomes the reference
 /// `src`.
+#[inline(always)]
 pub(crate) fn dbind_prop(
     m: &mut Machine,
     prog: &Program,
@@ -445,6 +462,7 @@ fn unref(m: &mut Machine, prog: &Program, s: Slot) -> Result<(), Fault> {
 }
 
 /// `dunref_index`.
+#[inline(always)]
 pub(crate) fn dunref_index(m: &mut Machine, prog: &Program, o: u64, k: u64) -> Result<(), Fault> {
     match shape(m, o) {
         Shape::Array(ValType::Dyn) => match array_index(m, o, k) {
@@ -466,6 +484,7 @@ pub(crate) fn dunref_index(m: &mut Machine, prog: &Program, o: u64, k: u64) -> R
 }
 
 /// `dunref_prop`.
+#[inline(always)]
 pub(crate) fn dunref_prop(m: &mut Machine, prog: &Program, o: u64, name: u32) -> Result<(), Fault> {
     match shape(m, o) {
         Shape::Struct => match field(m, prog, o, name) {
@@ -503,15 +522,17 @@ pub(crate) fn new_ref(m: &mut Machine, src: u64) -> Result<u64, Fault> {
 #[inline]
 pub(crate) fn cell_set(m: &mut Machine, c: u64, v: u64) -> Result<(), Fault> {
     let v_deref = m.heap.deref(v);
-    match m.heap.get_mut(c) {
+    let (new, old) = match m.heap.get_mut(c) {
         Some(Object::Cell(x)) => {
-            x.value = v;
-            Ok(())
+            let old = core::mem::replace(&mut x.value, v);
+            if !x.elem.is_reference() {
+                return Ok(());
+            }
+            (v, old)
         }
-        Some(Object::Ref(x)) => {
-            *x = v_deref;
-            Ok(())
-        }
-        _ => Err(not_a(&m.heap, c)),
-    }
+        Some(Object::Ref(x)) => (v_deref, core::mem::replace(x, v_deref)),
+        _ => return Err(not_a(&m.heap, c)),
+    };
+    m.heap.swap(new, old);
+    Ok(())
 }

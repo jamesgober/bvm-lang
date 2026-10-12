@@ -3,13 +3,16 @@
 //! callee's arguments from the binding.
 //!
 //! **The binder.** Binding follows `bytecode_lang::ParamList::bind`, the
-//! family's one statement of PHP's and Python's argument rules. Calls whose
-//! items are all positional (every `dcall`, and every `dcall_shape` without
-//! named arguments) take [`bind_positional`], which allocates nothing for a
-//! callee without a rest parameter; a property test compares it with
-//! `ParamList::bind` on random lists and argument counts, slot for slot and
-//! presence bit for presence bit. Calls with named items go to
-//! `ParamList::bind` itself.
+//! family's one statement of PHP's and Python's argument rules, and property
+//! tests compare both binders here with it, slot for slot and presence bit
+//! for presence bit. Calls whose items are all positional (every `dcall`,
+//! and every `dcall_shape` without named arguments) take
+//! [`bind_positional`], which allocates nothing for a callee without a rest
+//! parameter. Calls with named items take [`bind_named`], which finds each
+//! named parameter through the callee's hashed name index when its list has
+//! many ([`NameIndex`]), so a hostile named spread costs O(items), not
+//! O(items x parameters) (ISSUES P33). The caller charges fuel per item for
+//! large calls ([`item_units`]).
 //!
 //! **Order.** Flattening (whose errors are `TypeError` for a spread of a
 //! non-container and `ArgumentError` for a spread map key that is neither
@@ -32,8 +35,21 @@ use crate::dynv;
 use crate::fault::Fault;
 use crate::heap::{Callable, Object};
 use crate::machine::Machine;
-use crate::program::Program;
+use crate::program::{NameIndex, Program, takes_names};
 use crate::refs;
+
+/// Items of a dynamic call per extra unit of fuel (ISSUES P33): a call with
+/// `n` flattened items costs `n / ITEMS_PER_FUEL` units on top of its one
+/// unit, so the work of binding stays proportional to the fuel spent.
+/// Calls of fewer items (every call whose arguments are a window, which
+/// has at most 255) cost exactly what LSB §5.14 says.
+pub(crate) const ITEMS_PER_FUEL: usize = 64;
+
+/// The extra fuel units a dynamic call of `n` flattened items costs.
+#[inline]
+pub(crate) fn item_units(n: usize) -> u64 {
+    (n / ITEMS_PER_FUEL) as u64
+}
 
 /// The name of one flattened argument item.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +112,17 @@ pub(crate) fn target_of(m: &Machine, v: u64) -> Option<Callable> {
     match m.heap.get(v) {
         Some(Object::Func(f)) => Some(f.target),
         _ => None,
+    }
+}
+
+/// The hashed name index of a callable's parameter list, if it has one.
+pub(crate) fn index_of(prog: &Program, target: Callable) -> Option<&NameIndex> {
+    match target {
+        Callable::Func(f) => prog.func(f).and_then(|i| i.param_index.as_ref()),
+        Callable::Import(i) => prog
+            .imports
+            .get(i as usize)
+            .and_then(|imp| imp.param_index.as_ref()),
     }
 }
 
@@ -244,12 +271,12 @@ fn presence(list: &ParamList, slots: &[Bound]) -> Result<u64, ()> {
 }
 
 /// Binds items to a callee (§5.15 step 3): `list` is its parameter list
-/// (`None`: exact arity over `nparams`, positional only). Returns the
-/// presence mask; `out` receives one slot per parameter of the list (per
-/// signature parameter without a list).
+/// (`None`: exact arity over `nparams`, positional only) and `index` its
+/// hashed name index. Returns the presence mask; `out` receives one slot
+/// per parameter of the list (per signature parameter without a list).
 pub(crate) fn bind(
     prog: &Program,
-    list: Option<&ParamList>,
+    (list, index): (Option<&ParamList>, Option<&NameIndex>),
     nparams: usize,
     flat: Option<&Flat>,
     n: usize,
@@ -269,22 +296,106 @@ pub(crate) fn bind(
         (Some(list), false) => bind_positional(list, n, out).map_err(|()| argument_error()),
         (Some(list), true) => {
             let names = flat.map_or(&[][..], |f| &f.names[..]);
-            let items: Vec<ArgItem<'_>> = names
-                .iter()
-                .map(|name| match name {
-                    Name::Pos => ArgItem::Positional,
-                    Name::Module(s) => ArgItem::Named(prog.string(*s).as_bytes()),
-                    Name::Bytes(b) => ArgItem::Named(b),
-                })
-                .collect();
-            let binding = list
-                .bind(&prog.module, &items)
-                .map_err(|_| argument_error())?;
-            out.clear();
-            out.extend(binding.slots().iter().cloned());
-            Ok(binding.presence())
+            let items = names.iter().map(|name| match name {
+                Name::Pos => ArgItem::Positional,
+                Name::Module(s) => ArgItem::Named(prog.string(*s).as_bytes()),
+                Name::Bytes(b) => ArgItem::Named(b),
+            });
+            bind_named(&prog.module, list, index, items, out).map_err(|()| argument_error())
         }
     }
+}
+
+/// Binds items, named ones included, to `list` (§5.15 step 3, the rule of
+/// `ParamList::bind`): the same slots and presence mask, or `Err(())`
+/// exactly when it fails. Parameter names are strings of `module`; with an
+/// `index` each named item costs one hash and a binary search, without one
+/// (a list of at most [`crate::program::NAME_SCAN`] named parameters) a
+/// scan of the list. Names repeated within a rest collection are found
+/// with an ordered set, O(log n) each.
+pub(crate) fn bind_named<'a>(
+    module: &bytecode_lang::Module,
+    list: &ParamList,
+    index: Option<&NameIndex>,
+    items: impl Iterator<Item = ArgItem<'a>>,
+    out: &mut Vec<Bound>,
+) -> Result<u64, ()> {
+    out.clear();
+    out.extend(list.params.iter().map(|p| {
+        if p.kind.is_rest() {
+            Bound::Collected(Vec::new())
+        } else {
+            Bound::Default
+        }
+    }));
+    let rest = list
+        .params
+        .iter()
+        .position(|p| matches!(p.kind, ParamKind::Rest | ParamKind::RestMap));
+    let named_rest = list
+        .params
+        .iter()
+        .position(|p| p.kind == ParamKind::RestNamed)
+        .or_else(|| {
+            list.params
+                .iter()
+                .position(|p| p.kind == ParamKind::RestMap)
+        });
+    let find = |name: &[u8]| match index {
+        Some(ix) => ix.find(module, list, name),
+        None => list.params.iter().position(|p| {
+            takes_names(p.kind)
+                && p.name
+                    .and_then(|s| module.string(s))
+                    .is_some_and(|s| s.as_bytes() == name)
+        }),
+    };
+    // The next parameter that may take a positional item: it only moves
+    // forward, so finding all of them is O(parameters) in total.
+    let mut cursor = 0usize;
+    let mut seen_named = false;
+    let mut rest_names: alloc::collections::BTreeSet<&[u8]> = alloc::collections::BTreeSet::new();
+    for (item, arg) in items.enumerate() {
+        match arg {
+            ArgItem::Positional => {
+                if seen_named {
+                    return Err(());
+                }
+                while list.params.get(cursor).is_some_and(|p| {
+                    !matches!(p.kind, ParamKind::PositionalOnly | ParamKind::Normal)
+                }) {
+                    cursor += 1;
+                }
+                if let Some(slot) = out.get_mut(cursor) {
+                    cursor += 1;
+                    *slot = Bound::Arg(item);
+                } else if let Some(Bound::Collected(items)) = rest.and_then(|r| out.get_mut(r)) {
+                    items.push(item);
+                } else if !list.ignore_extra {
+                    return Err(());
+                }
+            }
+            ArgItem::Named(name) => {
+                seen_named = true;
+                if let Some(param) = find(name) {
+                    match out.get_mut(param) {
+                        Some(slot @ Bound::Default) => *slot = Bound::Arg(item),
+                        _ => return Err(()),
+                    }
+                } else if let Some(Bound::Collected(items)) =
+                    named_rest.and_then(|r| out.get_mut(r))
+                {
+                    if !rest_names.insert(name) {
+                        return Err(());
+                    }
+                    items.push(item);
+                } else {
+                    return Err(());
+                }
+            }
+        }
+    }
+    presence(list, out)
 }
 
 /// A by-value argument (§5.15 step 5): a reference gives its value,
@@ -377,6 +488,11 @@ fn collect(
     flat: Option<&Flat>,
     items: &[usize],
 ) -> Result<u64, Fault> {
+    if items.is_empty() {
+        // An empty rest collection shares the machine's empty storage and
+        // allocates storage of its own only when first written (P33).
+        return m.empty_rest(kind == ParamKind::Rest);
+    }
     if kind == ParamKind::Rest {
         let mut words = Vec::with_capacity(items.len());
         for &k in items {
@@ -499,6 +615,84 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4000))]
+        /// The named binder (P33: hashed lookup, ordered-set duplicate
+        /// check) binds exactly as `ParamList::bind` does, slot for slot and
+        /// presence bit for presence bit, failing exactly when it fails,
+        /// with the hashed index and with a scan, on lists of up to 26
+        /// parameters. Calls are built from the list (a positional prefix,
+        /// then some named parameters in a rotated order) with noise: extra
+        /// positional items, unknown names, a repeated name, a positional
+        /// item after a named one.
+        #[test]
+        fn named_binder_matches_param_list_bind(
+            counts in (0usize..3, 0usize..12, 0u8..3, 0usize..12, any::<bool>()),
+            flags in proptest::collection::vec((any::<bool>(), any::<bool>()), 32),
+            ignore in any::<bool>(),
+            plan in proptest::collection::vec(0u8..4, 32),
+            (k, rot, extra_pos, extra_named) in (0usize..16, 0usize..32, 0usize..3, 0usize..3),
+            noise in 0u8..8,
+        ) {
+            let mut mb = ModuleBuilder::new();
+            let names: Vec<_> = (0..32).map(|i| mb.string(&alloc::format!("p{i}"))).collect();
+            let module = mb.finish().unwrap_or_default();
+            let mut list = list_of(counts, &flags, &names);
+            list.ignore_extra = ignore;
+            prop_assert!(list.validate().is_ok());
+            let texts: Vec<alloc::string::String> =
+                (0..32).map(|i| alloc::format!("p{i}")).collect();
+            let unknown: Vec<alloc::string::String> =
+                (0..3).map(|i| alloc::format!("q{i}")).collect();
+            let positional = list
+                .params
+                .iter()
+                .take_while(|p| matches!(p.kind, ParamKind::PositionalOnly | ParamKind::Normal))
+                .count();
+            // Positional-only parameters can only be given positionally.
+            let only = list
+                .params
+                .iter()
+                .take_while(|p| p.kind == ParamKind::PositionalOnly)
+                .count();
+            let k = only + k % (positional - only + 1);
+            let mut items: Vec<ArgItem<'_>> = alloc::vec![ArgItem::Positional; k + extra_pos];
+            let mut named: Vec<ArgItem<'_>> = list
+                .params
+                .iter()
+                .enumerate()
+                .skip(k)
+                .filter(|(i, p)| takes_names(p.kind) && (plan[*i] != 0 || !p.default))
+                .map(|(i, _)| ArgItem::Named(texts[i].as_bytes()))
+                .collect();
+            named.extend(unknown.iter().take(extra_named).map(|u| ArgItem::Named(u.as_bytes())));
+            if !named.is_empty() {
+                let r = rot % named.len();
+                named.rotate_left(r);
+            }
+            match noise {
+                0 => {
+                    if let Some(&first) = named.first() {
+                        named.push(first);
+                    }
+                }
+                1 => named.push(ArgItem::Positional),
+                _ => {}
+            }
+            items.extend(named);
+            let want = list.bind(&module, &items);
+            let index = crate::program::NameIndex::build(&module, &list);
+            for ix in [None, Some(&index)] {
+                let mut out = Vec::new();
+                let got = bind_named(&module, &list, ix, items.iter().copied(), &mut out);
+                match &want {
+                    Ok(b) => {
+                        prop_assert_eq!(got, Ok(b.presence()));
+                        prop_assert_eq!(&out[..], b.slots());
+                    }
+                    Err(_) => prop_assert!(got.is_err()),
+                }
+            }
+        }
+
         /// The positional fast path binds exactly as `ParamList::bind` does.
         #[test]
         fn positional_fast_path_matches_param_list_bind(

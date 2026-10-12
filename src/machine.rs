@@ -18,6 +18,7 @@ use crate::hash::Seed;
 use crate::heap::{ArrayObj, Callable, ErrorObj, FuncObj, Heap, MapObj, Object};
 use crate::host::{HostCtx, HostError, HostFn};
 use crate::int;
+use crate::map::MapStore;
 use crate::program::{Program, TypeInfo};
 use crate::value::Value;
 
@@ -47,6 +48,12 @@ pub(crate) enum Cont {
     /// it) finishes the innermost running coroutine (LSB §5.13 rule 3), and
     /// the result goes to whoever drove it ([`Active::driver`]).
     Coro,
+    /// A destructor's frame, pushed before an instruction (RC: at the
+    /// boundary after the last reference went; tracing: at a fuel charge
+    /// point after a collection). Its result is discarded, an error escaping
+    /// it is discarded, and the frame below resumes at its pc, before the
+    /// instruction it was about to execute.
+    Finalizer,
 }
 
 /// Who resumed a running coroutine, and so receives what it produces next.
@@ -129,11 +136,6 @@ impl Sched {
         ready.chain(waiting)
     }
 
-    pub(crate) fn clear(&mut self) {
-        self.ready.clear();
-        self.waiters.clear();
-    }
-
     pub(crate) fn len(&self) -> usize {
         self.ready.len() + self.waiters.values().map(Vec::len).sum::<usize>()
     }
@@ -202,6 +204,24 @@ pub(crate) struct Machine {
     pub(crate) coro_seq: u64,
     /// Pooled list of coroutines a collection found dropped.
     pub(crate) dropped: Vec<u64>,
+    /// RC: values handed to the host, held until the next run or collection.
+    pub(crate) pins: Vec<u64>,
+    /// RC: per running destructor or drop-close (innermost last), the length
+    /// the zero list had when it started: what died before it waits until
+    /// it ends, so siblings are destructed one after another, each with
+    /// what it frees, as PHP does (not nested inside each other).
+    pub(crate) floors: Vec<usize>,
+    /// The scheduler entry being run by `run_async` (it holds its counts
+    /// until the task stops).
+    pub(crate) waking: Option<(u64, Wake)>,
+    /// The empty storage every empty rest collection starts with (P33): a
+    /// rest parameter that receives nothing allocates no storage until it is
+    /// written.
+    empty_items: Arc<Vec<u64>>,
+    empty_store: Arc<MapStore>,
+    /// RC: the result of the run's entry function once it returned, while
+    /// what its frame held is settled (destructors may still run).
+    pub(crate) exit: Option<Option<u64>>,
 }
 
 /// The outcome of the cold branch of a fuel charge.
@@ -214,6 +234,9 @@ pub(crate) enum Charge {
     /// A dropped coroutine's close was started on top of the frames, before
     /// the charging instruction: raise its close signal there.
     Close,
+    /// A queued destructor's frame was pushed on top of the frames, before
+    /// the charging instruction: continue in it.
+    Call,
 }
 
 /// What a returning frame leads to.
@@ -225,12 +248,14 @@ pub(crate) enum Next {
 }
 
 impl Machine {
-    pub(crate) fn new(prog: &Program, memory: usize) -> Machine {
+    pub(crate) fn new(prog: &Program, memory: usize, rc: bool) -> Machine {
         let m = &prog.module;
+        let mut heap = Heap::new(memory);
+        heap.rc = rc;
         Machine {
             stack: Vec::new(),
             frames: Vec::new(),
-            heap: Heap::new(memory),
+            heap,
             globals: alloc::vec![0; m.globals().len()],
             seed: Seed::new(),
             str_consts: alloc::vec![0; m.consts().len()],
@@ -255,6 +280,49 @@ impl Machine {
             sched: Sched::default(),
             coro_seq: 0,
             dropped: Vec::new(),
+            pins: Vec::new(),
+            floors: Vec::new(),
+            waking: None,
+            empty_items: Arc::new(Vec::new()),
+            empty_store: Arc::new(MapStore::default()),
+            exit: None,
+        }
+    }
+
+    /// A new empty `dyn` array (`array`) or map for a rest parameter that
+    /// received nothing: it shares the machine's empty storage
+    /// copy-on-write, so it costs a slot and no storage until written.
+    pub(crate) fn empty_rest(&mut self, array: bool) -> Result<u64, Fault> {
+        let obj = if array {
+            Object::Array(ArrayObj {
+                elem: ValType::Dyn,
+                frozen: false,
+                cow: true,
+                aliased: false,
+                items: Arc::clone(&self.empty_items),
+            })
+        } else {
+            Object::Map(MapObj {
+                key: ValType::Dyn,
+                value: ValType::Dyn,
+                frozen: false,
+                cow: true,
+                aliased: false,
+                store: Arc::clone(&self.empty_store),
+            })
+        };
+        self.heap.alloc(obj)
+    }
+
+    /// Whether a collection should run before an allocation of about
+    /// `extra` bytes: the tracing collector, or in the RC profile the cycle
+    /// collector.
+    #[inline]
+    pub(crate) fn wants_gc(&self, extra: usize) -> bool {
+        if self.heap.rc {
+            self.heap.wants_cycles(extra)
+        } else {
+            self.heap.wants_gc(extra)
         }
     }
 
@@ -286,6 +354,10 @@ impl Machine {
             closure,
             cont,
         });
+        // The frame holds its closure (RC); a direct call has none.
+        if dynv::is_ref(closure) {
+            self.heap.inc(closure);
+        }
         Ok(base)
     }
 
@@ -294,21 +366,74 @@ impl Machine {
     /// A coroutine body's result is converted to `dyn` before its frame is
     /// given up: on a conversion error (a `u64` above `i64::MAX`) the frame is
     /// back on top and the caller raises the error there, at the `ret`.
-    pub(crate) fn finish(
+    ///
+    /// `RC` is the memory profile (the dispatch loop is compiled once per
+    /// profile): with it the popped frame's counts are released and the
+    /// result's destination is a counted write.
+    ///
+    /// The common case is inlined into the dispatch loop, before any other
+    /// continuation is looked at: a typed call's result written to the
+    /// caller's register, tracing. Testing it first (rather than matching
+    /// every continuation, the coroutine body's included) measured ~15%
+    /// faster on `call/fib25` and removed the alpha.2 call-path regression;
+    /// inlining it keeps the argument the counting profile added (`prog`)
+    /// off the tracing profile's return path.
+    #[inline(always)]
+    pub(crate) fn finish<const RC: bool>(
         &mut self,
         stack: &mut Vec<u64>,
+        prog: &Program,
+        result: Option<u64>,
+        ty: Option<ValType>,
+    ) -> Result<Next, Fault> {
+        if !RC {
+            if let Some(&Frame {
+                cont: Cont::Write(dst),
+                base,
+                ..
+            }) = self.frames.last()
+            {
+                let _ = self.frames.pop();
+                stack.truncate(base);
+                if let Some(top) = self.frames.last_mut() {
+                    if let (Some(v), Some(slot)) =
+                        (result, stack.get_mut(top.base + usize::from(dst)))
+                    {
+                        *slot = v;
+                    }
+                    top.pc += 1;
+                }
+                return Ok(Next::Resume);
+            }
+        }
+        self.finish_other::<RC>(stack, prog, result, ty)
+    }
+
+    /// [`finish`](Machine::finish) of every other case.
+    #[inline(never)]
+    fn finish_other<const RC: bool>(
+        &mut self,
+        stack: &mut Vec<u64>,
+        prog: &Program,
         result: Option<u64>,
         ty: Option<ValType>,
     ) -> Result<Next, Fault> {
         let Some(frame) = self.frames.pop() else {
             return Ok(Next::Exit(result));
         };
-        // The common case first, before any other continuation is looked
-        // at: a typed call's result written to the caller's register.
-        // Testing it first (rather than matching every continuation, the
-        // coroutine body's included) measured ~15% faster on `call/fib25`
-        // and removed the alpha.2 call-path regression.
         if let Cont::Write(dst) = frame.cont {
+            if RC {
+                self.release_frame(stack, prog, &frame);
+                stack.truncate(frame.base);
+                if let Some(v) = result {
+                    let fi = self.frames.len().wrapping_sub(1);
+                    self.set_reg(stack, prog, fi, dst, v);
+                }
+                if let Some(top) = self.frames.last_mut() {
+                    top.pc += 1;
+                }
+                return Ok(Next::Resume);
+            }
             stack.truncate(frame.base);
             if let Some(top) = self.frames.last_mut() {
                 if let (Some(v), Some(slot)) = (result, stack.get_mut(top.base + usize::from(dst)))
@@ -321,14 +446,30 @@ impl Machine {
         }
         match frame.cont {
             Cont::Entry => {
+                if RC {
+                    self.release_frame(stack, prog, &frame);
+                }
                 stack.truncate(frame.base);
                 return Ok(Next::Exit(result));
             }
-            Cont::Coro => return self.finish_coro(stack, frame, result, ty),
+            Cont::Coro => return self.finish_coro(stack, prog, frame, result, ty),
+            Cont::Finalizer => {
+                // The result is discarded, and the frame below resumes
+                // where it was interrupted.
+                if RC {
+                    self.release_frame(stack, prog, &frame);
+                }
+                stack.truncate(frame.base);
+                self.end_finalizer();
+                return Ok(Next::Resume);
+            }
             _ => {}
         }
+        if RC {
+            self.release_frame(stack, prog, &frame);
+        }
         stack.truncate(frame.base);
-        self.apply_cont(stack, frame.cont, result, ty)?;
+        self.apply_cont(stack, prog, frame.cont, result, ty)?;
         if let Some(top) = self.frames.last_mut() {
             top.pc += 1;
         }
@@ -341,6 +482,7 @@ impl Machine {
     fn finish_coro(
         &mut self,
         stack: &mut Vec<u64>,
+        prog: &Program,
         frame: Frame,
         result: Option<u64>,
         ty: Option<ValType>,
@@ -356,8 +498,9 @@ impl Machine {
             },
             _ => dynv::NIL,
         };
+        self.release_frame(stack, prog, &frame);
         stack.truncate(frame.base);
-        self.coro_returned(stack, value);
+        self.coro_returned(stack, prog, value);
         Ok(Next::Resume)
     }
 
@@ -365,13 +508,13 @@ impl Machine {
     pub(crate) fn apply_cont(
         &mut self,
         stack: &mut [u64],
+        prog: &Program,
         cont: Cont,
         result: Option<u64>,
         ty: Option<ValType>,
     ) -> Result<(), Fault> {
-        let base = self.frames.last().map_or(0, |f| f.base);
         let (dst, v) = match cont {
-            Cont::Entry | Cont::Discard | Cont::Coro => return Ok(()),
+            Cont::Entry | Cont::Discard | Cont::Coro | Cont::Finalizer => return Ok(()),
             Cont::Write(dst) => match result {
                 Some(v) => (dst, v),
                 None => return Ok(()),
@@ -409,9 +552,8 @@ impl Machine {
                 (dst, it)
             }
         };
-        if let Some(slot) = stack.get_mut(base + usize::from(dst)) {
-            *slot = v;
-        }
+        let fi = self.frames.len().wrapping_sub(1);
+        self.set_reg(stack, prog, fi, dst, v);
         Ok(())
     }
 
@@ -477,7 +619,7 @@ impl Machine {
                 // close stays armed for the next charge).
                 let (target, catch, func) = (h.target.0, h.catch, frame.func);
                 if self.fuel == 0 {
-                    if self.charge_slow(stack, None) == Charge::Spent {
+                    if self.charge_slow(stack, prog, None) == Charge::Spent {
                         return Err(VmError::Trap {
                             kind: ErrorKind::OutOfFuel,
                             func: FuncId(func),
@@ -491,32 +633,40 @@ impl Machine {
                     return Ok(());
                 };
                 frame.pc = target;
-                let slot = frame.base + catch.index();
-                if let Some(s) = stack.get_mut(slot) {
-                    *s = value;
-                }
+                let fi = self.frames.len() - 1;
+                self.set_reg(stack, prog, fi, catch.0, value);
                 return Ok(());
             }
             let cont = frame.cont;
             let base = frame.base;
-            let _ = self.frames.pop();
+            if let Some(popped) = self.frames.pop() {
+                self.release_frame(stack, prog, &popped);
+            }
             stack.truncate(base);
             match cont {
                 Cont::Entry => return Err(self.uncaught(value, func, pc)),
+                // An error escaping a destructor has no one to go to: it is
+                // discarded, and the interrupted frame resumes.
+                Cont::Finalizer => {
+                    self.end_finalizer();
+                    return Ok(());
+                }
                 // The error escapes a coroutine's body (rule 3): it fails,
                 // unless it is being closed and the error is the close signal
                 // itself (rule 11), and the search continues at whoever drove
                 // it (the resumer's `resume`/`resume_throw`/`coro_close`/
                 // `iter_next`, still at its pc), or stops for a driver that is
                 // not a frame (the host scheduler, a drop-close).
-                Cont::Coro if self.coro_escaped(stack, value, (func, pc)) => return Ok(()),
+                Cont::Coro if self.coro_escaped(stack, prog, value, (func, pc)) => return Ok(()),
                 _ => {}
             }
         }
     }
 
-    /// The error for a value no handler caught.
-    pub(crate) fn uncaught(&self, value: u64, func: u32, pc: u32) -> VmError {
+    /// The error for a value no handler caught. In the RC profile the value
+    /// is held for the host, like a run's result.
+    pub(crate) fn uncaught(&mut self, value: u64, func: u32, pc: u32) -> VmError {
+        self.pin(value);
         match self.heap.get(value) {
             Some(Object::Error(e)) => VmError::Raised {
                 kind: e.kind,
@@ -603,6 +753,8 @@ impl Machine {
         let v = self.heap.alloc_str(prog.string(id).as_bytes())?;
         if let Some(slot) = self.names.get_mut(id as usize) {
             *slot = v;
+            // A cache holds what it caches (RC), for the life of the VM.
+            self.heap.inc(v);
         }
         Ok(v)
     }
@@ -620,6 +772,7 @@ impl Machine {
         }))?;
         if let Some(slot) = self.fn_refs.get_mut(func as usize) {
             *slot = v;
+            self.heap.inc(v);
         }
         Ok(v)
     }
@@ -637,6 +790,7 @@ impl Machine {
         }))?;
         if let Some(slot) = self.imp_refs.get_mut(imp as usize) {
             *slot = v;
+            self.heap.inc(v);
         }
         Ok(v)
     }
@@ -662,6 +816,7 @@ impl Machine {
         };
         if let Some(slot) = self.str_consts.get_mut(k as usize) {
             *slot = v;
+            self.heap.inc(v);
         }
         Ok(v)
     }
@@ -739,6 +894,7 @@ impl Machine {
         let v = self.heap.alloc(Object::Int(i))?;
         if let Some(slot) = self.dyn_consts.get_mut(k as usize) {
             *slot = v;
+            self.heap.inc(v);
         }
         Ok(v)
     }
@@ -809,6 +965,7 @@ impl Machine {
                 let _previous = self.typed_consts.insert((k, t), v);
             }
         }
+        self.heap.inc(v);
         Ok(v)
     }
 
@@ -870,7 +1027,10 @@ impl Machine {
                 }
             };
             if let Some(slot) = self.globals.get_mut(i) {
-                *slot = v;
+                let old = core::mem::replace(slot, v);
+                if ty.is_reference() {
+                    self.heap.swap(v, old);
+                }
             }
         }
         Ok(())
@@ -882,7 +1042,15 @@ impl Machine {
 
     /// Collects with every root the machine holds; `stack` is the register
     /// stack the frames index (the interpreter holds it while running).
+    ///
+    /// In the RC profile this is the cycle collector instead
+    /// ([`collect_cycles`](Machine::collect_cycles)): counts free everything
+    /// else, so there is nothing to trace.
     pub(crate) fn collect(&mut self, stack: &[u64], prog: &Program) {
+        if self.heap.rc {
+            self.collect_cycles(prog, false);
+            return;
+        }
         let Machine {
             frames,
             heap,

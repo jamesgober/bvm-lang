@@ -39,6 +39,15 @@
 //! **Coroutines** live in [`coro`](crate::coro); the loop sees them only as
 //! frame changes (`Step::Frame`) and as unwinds that start in a frame other
 //! than the one that was executing (`Step::Unwind`).
+//!
+//! **Memory profiles.** The loop is compiled twice, once per profile
+//! (`run::<false>` for tracing, `run::<true>` for reference counting), so
+//! the tracing loop carries no trace of the counting one. Every register
+//! write goes through `w!`: a plain store when tracing; with counting, a
+//! store that moves one count from the old word to the new when the
+//! register is reference-typed. The counting loop also settles the zero
+//! list before each instruction ([`Machine::settle`]): that is where objects
+//! die, destructors run, and dropped coroutines close.
 
 use alloc::vec::Vec;
 
@@ -47,7 +56,7 @@ use bytecode_lang::{Callee, ErrorKind, FloatTy, Hook, Inst, IntTy, ValType};
 use crate::bind;
 use crate::coll::{self, index_of, not_a};
 use crate::conv::{self, prim_type};
-use crate::coro::{self, Entered};
+use crate::coro::{self, Entered, Started};
 use crate::dynops::{self, DOp};
 use crate::dynv;
 use crate::error::VmError;
@@ -58,6 +67,7 @@ use crate::int::{self, Bin, Cmp, Un};
 use crate::machine::{Charge, Cont, Driver, Machine, Next, Stop, Wake};
 use crate::pow;
 use crate::program::{FuncInfo, Program, TypeInfo};
+use crate::rc::Settled;
 use crate::refs;
 
 const SIGN32: u64 = 0x8000_0000;
@@ -65,13 +75,16 @@ const SIGN64: u64 = 1 << 63;
 
 /// Runs `func` with `args` (already in their parameters' representations)
 /// until its frame returns. Returns the result word, or `None` for a void
-/// function.
+/// function. With `entry` (a host's run, not the start function) the values
+/// the host held from the previous run are let go once the arguments are in
+/// the frame (RC).
 pub(crate) fn execute(
     m: &mut Machine,
     prog: &Program,
     func: u32,
     args: &[u64],
     fuel: &mut u64,
+    entry: bool,
 ) -> Result<Option<u64>, VmError> {
     // The interpreter owns the register stack while it runs (so its buffer
     // pointer lives in a register rather than behind `m`); the allocation
@@ -81,7 +94,7 @@ pub(crate) fn execute(
     let base = match pushed {
         Ok(b) => b,
         Err(_) => {
-            *fuel = end(m, stack, false);
+            *fuel = end(m, stack, prog, false);
             return Err(VmError::Raised {
                 kind: ErrorKind::StackOverflow,
                 payload: crate::Value::Nil,
@@ -93,9 +106,26 @@ pub(crate) fn execute(
     if let Some(dst) = stack.get_mut(base..base + args.len()) {
         dst.copy_from_slice(args);
     }
-    let result = run(m, &mut stack, prog);
-    *fuel = end(m, stack, result.is_err());
+    m.adopt_args(&stack, prog, func, base, args.len());
+    if entry {
+        m.release_pins();
+    }
+    let result = run_any(m, &mut stack, prog);
+    *fuel = end(m, stack, prog, result.is_err());
     result
+}
+
+/// The dispatch loop of the VM's memory profile.
+pub(crate) fn run_any(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+) -> Result<Option<u64>, VmError> {
+    if m.heap.rc {
+        run::<true>(m, stack, prog)
+    } else {
+        run::<false>(m, stack, prog)
+    }
 }
 
 /// Takes the pooled register stack for a run with `fuel`, with no frames and
@@ -110,16 +140,32 @@ fn begin(m: &mut Machine, fuel: u64) -> Vec<u64> {
     m.outcome = None;
     m.fuel = fuel;
     m.bank = None;
+    m.exit = None;
+    m.floors.clear();
     m.set_finalizing(false);
     stack
 }
 
 /// Returns the register stack to the pool and the fuel left. A run that
 /// ended abnormally (a trap or an uncaught error) left its running
-/// coroutines without frames: they become `failed`.
-fn end(m: &mut Machine, mut stack: Vec<u64>, aborted: bool) -> u64 {
+/// coroutines without frames: they become `failed`. In the RC profile the
+/// frames left behind give up their counts, and what dies then is settled
+/// without running code (destructors and closes are queued).
+fn end(m: &mut Machine, mut stack: Vec<u64>, prog: &Program, aborted: bool) -> u64 {
     if aborted || !m.coros.is_empty() {
-        m.abort_coros();
+        m.abort_coros(prog);
+    }
+    if m.heap.rc {
+        m.floors.clear();
+        while let Some(f) = m.frames.pop() {
+            m.release_frame(&stack, prog, &f);
+        }
+        let _quiet = m.settle(&mut stack, prog, false);
+        #[cfg(debug_assertions)]
+        if m.heap.slots.len() <= 50_000 {
+            let checked = m.check_counts(&stack, prog);
+            debug_assert!(checked.is_ok(), "{checked:?}");
+        }
     }
     stack.clear();
     m.stack = stack;
@@ -127,6 +173,16 @@ fn end(m: &mut Machine, mut stack: Vec<u64>, aborted: bool) -> u64 {
     m.set_finalizing(false);
     m.unbank();
     m.fuel
+}
+
+/// Settles what died outside a run (RC): the host let go of something.
+/// Code cannot run here, so destructors and closes are queued.
+pub(crate) fn settle_quiet(m: &mut Machine, prog: &Program) {
+    if m.heap.rc && m.heap.pending {
+        let mut stack = core::mem::take(&mut m.stack);
+        let _quiet = m.settle(&mut stack, prog, false);
+        m.stack = stack;
+    }
 }
 
 /// Resumes the coroutine `coro` from the host (the built-in scheduler):
@@ -141,10 +197,10 @@ pub(crate) fn drive(
     fuel: &mut u64,
 ) -> Result<Stop, VmError> {
     let mut stack = begin(m, *fuel);
-    let entered = match m.coro_enter(&mut stack, coro, Driver::Host) {
+    let entered = match m.coro_enter_dyn(&mut stack, coro, Driver::Host) {
         Ok(e) => e,
         Err(fault) => {
-            *fuel = end(m, stack, false);
+            *fuel = end(m, stack, prog, false);
             let (func, pc) = m
                 .heap
                 .coro(coro)
@@ -164,44 +220,44 @@ pub(crate) fn drive(
     };
     let started = match (entered, wake) {
         (Entered::Suspended(d), Wake::Send(v)) => {
-            m.coro_send(&mut stack, d, v);
+            m.coro_send_dyn(&mut stack, prog, d, v);
             Ok(())
         }
         (Entered::Suspended(_), Wake::Throw(e)) => m.unwind(&mut stack, prog, Fault::Throw(e)),
         // A created coroutine starts; the sent value is ignored (rule 1).
         (Entered::Fresh, _) => Ok(()),
     };
-    let result = started.and_then(|()| run(m, &mut stack, prog));
+    let result = started.and_then(|()| run_any(m, &mut stack, prog));
     let outcome = m.outcome.take();
-    *fuel = end(m, stack, result.is_err());
+    *fuel = end(m, stack, prog, result.is_err());
     let _ = result?;
     // The host-driven coroutine is the bottom of the frame stack, so the
     // run returns exactly when its delivery has recorded an outcome.
     Ok(outcome.unwrap_or(Stop::Returned(dynv::NIL)))
 }
 
-/// Closes queued dropped coroutines (rule 13) from the host, outside any
-/// run: each runs on an empty stack until its close ends. Returns how many
-/// were closed.
+/// Runs queued finalizations (rule 13 closes, destructors) from the host,
+/// outside any run: each runs on an empty stack until it ends. Returns how
+/// many were started, those they caused included.
 pub(crate) fn finalize_all(
     m: &mut Machine,
     prog: &Program,
     fuel: &mut u64,
 ) -> Result<usize, VmError> {
-    let mut closed = 0;
+    let before = m.heap.stats.finalized;
     while !m.finalize.is_empty() {
         let mut stack = begin(m, *fuel);
-        let r = if m.start_finalizer(&mut stack) {
-            closed += 1;
-            m.unwind(&mut stack, prog, Fault::Throw(dynv::NIL))
-                .and_then(|()| run(m, &mut stack, prog).map(|_| ()))
-        } else {
-            Ok(())
+        let r = match m.start_finalizer(&mut stack, prog) {
+            Started::Close => m
+                .unwind(&mut stack, prog, Fault::Throw(dynv::NIL))
+                .and_then(|()| run_any(m, &mut stack, prog).map(|_| ())),
+            Started::Call => run_any(m, &mut stack, prog).map(|_| ()),
+            Started::None => Ok(()),
         };
-        *fuel = end(m, stack, r.is_err());
+        *fuel = end(m, stack, prog, r.is_err());
         r?;
     }
-    Ok(closed)
+    Ok(usize::try_from(m.heap.stats.finalized - before).unwrap_or(usize::MAX))
 }
 
 /// The read of a float register as `f32`.
@@ -266,11 +322,57 @@ enum Lookup {
     Miss(ErrorKind),
 }
 
+/// A counted register write (RC): the register's count moves from the
+/// word it held to the new one when it is reference-typed.
+#[inline]
+fn rc_write(m: &mut Machine, info: &FuncInfo, r: usize, slot: &mut u64, v: u64) {
+    let old = core::mem::replace(slot, v);
+    if old != v && info.regs.get(r).is_some_and(|t| t.is_reference()) {
+        m.heap.swap(v, old);
+    }
+}
+
+/// Holds the entry function's result for the host (RC) while what its
+/// frame held is settled.
+#[cold]
+fn hold_exit(m: &mut Machine, v: Option<u64>, ty: Option<ValType>) {
+    if let (Some(w), Some(t)) = (v, ty) {
+        if t.is_reference() {
+            m.pin(w);
+        }
+    }
+    m.exit = Some(v);
+}
+
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u64>, VmError> {
+fn run<const RC: bool>(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+) -> Result<Option<u64>, VmError> {
     'frame: loop {
         let Some(&top) = m.frames.last() else {
-            return Ok(None);
+            // No frame left: the run is over, once what died is settled
+            // (RC: the entry frame's objects get their destructors before
+            // the result goes to the host).
+            if RC {
+                match m.settle(stack, prog, true) {
+                    Settled::Done => {}
+                    Settled::Call => continue 'frame,
+                    Settled::Close => {
+                        m.unwind(stack, prog, Fault::Throw(dynv::NIL))?;
+                        continue 'frame;
+                    }
+                    Settled::Trap => {
+                        return Err(VmError::Trap {
+                            kind: ErrorKind::OutOfMemory,
+                            func: bytecode_lang::FuncId(u32::MAX),
+                            pc: 0,
+                        });
+                    }
+                }
+            }
+            return Ok(m.exit.take().flatten());
         };
         let fi = m.frames.len() - 1;
         let func = top.func;
@@ -287,11 +389,44 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
         // `Unwind` from the coroutine machinery has already positioned the
         // frames and the pc the unwind starts at).
         let (fault, here): (Fault, bool) = 'dispatch: loop {
+            // RC: objects that died settle before the next instruction.
+            if RC && m.heap.pending {
+                m.frames[fi].pc = pc as u32;
+                match m.settle(stack, prog, true) {
+                    Settled::Done => {}
+                    Settled::Call => continue 'frame,
+                    Settled::Close => break 'dispatch (Fault::Throw(dynv::NIL), false),
+                    Settled::Trap => break 'dispatch (Fault::Trap(ErrorKind::OutOfMemory), true),
+                }
+            }
             let inst = code[pc];
             macro_rules! r {
                 ($x:expr) => {
                     stack[base + ($x).index()]
                 };
+            }
+            // A register write: counted in the RC loop.
+            macro_rules! w {
+                ($x:expr, $v:expr) => {{
+                    let v = $v;
+                    let i = base + ($x).index();
+                    if RC {
+                        rc_write(m, info, ($x).index(), &mut stack[i], v);
+                    } else {
+                        stack[i] = v;
+                    }
+                }};
+            }
+            // The run's entry frame returned.
+            macro_rules! exit {
+                ($v:expr, $ty:expr) => {{
+                    let v = $v;
+                    if RC {
+                        hold_exit(m, v, $ty);
+                        continue 'frame;
+                    }
+                    return Ok(v);
+                }};
             }
             macro_rules! t {
                 ($e:expr) => {
@@ -311,12 +446,13 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
             macro_rules! charge {
                 () => {
                     if m.fuel == 0 {
-                        match m.charge_slow(stack, Some((fi, pc as u32))) {
+                        match m.charge_slow(stack, prog, Some((fi, pc as u32))) {
                             Charge::Done => {}
                             Charge::Spent => {
                                 break 'dispatch (Fault::Trap(ErrorKind::OutOfFuel), true);
                             }
                             Charge::Close => break 'dispatch (Fault::Throw(dynv::NIL), false),
+                            Charge::Call => continue 'frame,
                         }
                     } else {
                         m.fuel -= 1;
@@ -325,7 +461,12 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
             }
             macro_rules! gc {
                 ($extra:expr) => {
-                    if m.heap.wants_gc($extra) {
+                    let wants = if RC {
+                        m.heap.wants_cycles($extra)
+                    } else {
+                        m.heap.wants_gc($extra)
+                    };
+                    if wants {
                         m.collect(stack, prog);
                     }
                 };
@@ -348,7 +489,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                         closure,
                         fi,
                     };
-                    match cold(m, stack, prog, &cx, pc, inst) {
+                    match cold::<RC>(m, stack, prog, &cx, pc, inst) {
                         Step::Next => {}
                         Step::Frame => continue 'frame,
                         Step::Fault(f) => break 'dispatch (f, true),
@@ -359,7 +500,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
             macro_rules! fast_arith {
                 ($op:expr, $dst:expr, $lhs:expr, $rhs:expr) => {{
                     match dynops::arith_inline($op, r!($lhs), r!($rhs)) {
-                        Some(v) => r!($dst) = v,
+                        Some(v) => w!($dst, v),
                         None => cold!(),
                     }
                 }};
@@ -369,7 +510,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     let (a, b) = ($a, $b);
                     if dynv::is_inline_int(a) && dynv::is_inline_int(b) {
                         let (x, y) = (dynv::inline_int_value(a), dynv::inline_int_value(b));
-                        r!($dst) = u64::from(x < y || ($le && x == y));
+                        w!($dst, u64::from(x < y || ($le && x == y)));
                     } else {
                         cold!();
                     }
@@ -379,7 +520,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 ($op:expr, $dst:expr, $lhs:expr, $rhs:expr, $iop:expr) => {{
                     let (a, b) = (r!($lhs), r!($rhs));
                     let v = t!(int::bin($op, $iop, a, b));
-                    r!($dst) = v;
+                    w!($dst, v);
                 }};
             }
             // `iadd`/`isub` at `i64` without overflow: no policy needed.
@@ -387,7 +528,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 ($op:ident, $bin:expr, $dst:expr, $lhs:expr, $rhs:expr, $iop:expr) => {{
                     let (a, b) = (r!($lhs) as i64, r!($rhs) as i64);
                     match a.$op(b) {
-                        Some(v) if $iop.ty() == IntTy::I64 => r!($dst) = v as u64,
+                        Some(v) if $iop.ty() == IntTy::I64 => w!($dst, v as u64),
                         _ => int_bin!($bin, $dst, $lhs, $rhs, $iop),
                     }
                 }};
@@ -395,41 +536,53 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
             macro_rules! fbin {
                 ($ty:expr, $dst:expr, $lhs:expr, $rhs:expr, |$a:ident, $b:ident| $e:expr) => {{
                     let (x, y) = (r!($lhs), r!($rhs));
-                    r!($dst) = match $ty {
-                        FloatTy::F32 => {
-                            let ($a, $b) = (f32_of(x), f32_of(y));
-                            f32_bits($e)
+                    w!(
+                        $dst,
+                        match $ty {
+                            FloatTy::F32 => {
+                                let ($a, $b) = (f32_of(x), f32_of(y));
+                                f32_bits($e)
+                            }
+                            FloatTy::F64 => {
+                                let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
+                                ($e).to_bits()
+                            }
                         }
-                        FloatTy::F64 => {
-                            let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
-                            ($e).to_bits()
-                        }
-                    };
+                    );
                 }};
             }
             macro_rules! fcmp {
                 ($ty:expr, $dst:expr, $lhs:expr, $rhs:expr, $cmp:expr) => {{
                     let (x, y) = (r!($lhs), r!($rhs));
-                    r!($dst) = u64::from(match $ty {
-                        FloatTy::F32 => $cmp.test(f32_of(x), f32_of(y)),
-                        FloatTy::F64 => $cmp.test(f64::from_bits(x), f64::from_bits(y)),
-                    });
+                    w!(
+                        $dst,
+                        u64::from(match $ty {
+                            FloatTy::F32 => $cmp.test(f32_of(x), f32_of(y)),
+                            FloatTy::F64 => $cmp.test(f64::from_bits(x), f64::from_bits(y)),
+                        })
+                    );
                 }};
             }
 
             match inst {
                 Inst::Nop {} => {}
-                Inst::Mov { dst, src } => r!(dst) = r!(src),
+                Inst::Mov { dst, src } => w!(dst, r!(src)),
                 Inst::LoadInt { dst, val, ty } => {
-                    r!(dst) = int::normalize(ty, i64::from(val) as u64);
+                    w!(dst, int::normalize(ty, i64::from(val) as u64));
                 }
                 Inst::DLoadInt { dst, val } => {
-                    r!(dst) = dynv::inline_int(i64::from(val)).unwrap_or(dynv::NIL);
+                    w!(dst, dynv::inline_int(i64::from(val)).unwrap_or(dynv::NIL));
                 }
-                Inst::LoadBool { dst, val } => r!(dst) = u64::from(val),
-                Inst::LoadNil { dst } => r!(dst) = dynv::NIL,
-                Inst::GetGlobal { dst, global } => r!(dst) = m.globals[global.index()],
-                Inst::SetGlobal { global, src } => m.globals[global.index()] = r!(src),
+                Inst::LoadBool { dst, val } => w!(dst, u64::from(val)),
+                Inst::LoadNil { dst } => w!(dst, dynv::NIL),
+                Inst::GetGlobal { dst, global } => w!(dst, m.globals[global.index()]),
+                Inst::SetGlobal { global, src } => {
+                    let v = r!(src);
+                    let old = core::mem::replace(&mut m.globals[global.index()], v);
+                    if RC && prog.global_types[global.index()].is_reference() {
+                        m.heap.swap(v, old);
+                    }
+                }
                 Inst::IAdd { dst, lhs, rhs, op } => {
                     fast_int!(checked_add, Bin::Add, dst, lhs, rhs, op)
                 }
@@ -452,26 +605,26 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 Inst::IShr { dst, lhs, rhs, op } => int_bin!(Bin::Shr, dst, lhs, rhs, op),
                 Inst::IMin { dst, lhs, rhs, op } => int_bin!(Bin::Min, dst, lhs, rhs, op),
                 Inst::IMax { dst, lhs, rhs, op } => int_bin!(Bin::Max, dst, lhs, rhs, op),
-                Inst::INeg { dst, src, op } => r!(dst) = t!(int::un(Un::Neg, op, r!(src))),
-                Inst::IBitNot { dst, src, op } => r!(dst) = t!(int::un(Un::Not, op, r!(src))),
-                Inst::IAbs { dst, src, op } => r!(dst) = t!(int::un(Un::Abs, op, r!(src))),
+                Inst::INeg { dst, src, op } => w!(dst, t!(int::un(Un::Neg, op, r!(src)))),
+                Inst::IBitNot { dst, src, op } => w!(dst, t!(int::un(Un::Not, op, r!(src)))),
+                Inst::IAbs { dst, src, op } => w!(dst, t!(int::un(Un::Abs, op, r!(src)))),
                 Inst::IEq { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Eq, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Eq, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::INe { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Ne, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Ne, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::ILt { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Lt, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Lt, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::ILe { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Le, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Le, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::IGt { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Gt, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Gt, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::IGe { dst, lhs, rhs, ty } => {
-                    r!(dst) = u64::from(int::cmp(Cmp::Ge, ty, r!(lhs), r!(rhs)));
+                    w!(dst, u64::from(int::cmp(Cmp::Ge, ty, r!(lhs), r!(rhs))));
                 }
                 Inst::FAdd { dst, lhs, rhs, ty } => fbin!(ty, dst, lhs, rhs, |a, b| a + b),
                 Inst::FSub { dst, lhs, rhs, ty } => fbin!(ty, dst, lhs, rhs, |a, b| a - b),
@@ -479,17 +632,23 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 Inst::FDiv { dst, lhs, rhs, ty } => fbin!(ty, dst, lhs, rhs, |a, b| a / b),
                 Inst::FNeg { dst, src, ty } => {
                     let x = r!(src);
-                    r!(dst) = match ty {
-                        FloatTy::F32 => (x & 0xFFFF_FFFF) ^ SIGN32,
-                        FloatTy::F64 => x ^ SIGN64,
-                    };
+                    w!(
+                        dst,
+                        match ty {
+                            FloatTy::F32 => (x & 0xFFFF_FFFF) ^ SIGN32,
+                            FloatTy::F64 => x ^ SIGN64,
+                        }
+                    );
                 }
                 Inst::FAbs { dst, src, ty } => {
                     let x = r!(src);
-                    r!(dst) = match ty {
-                        FloatTy::F32 => x & 0x7FFF_FFFF,
-                        FloatTy::F64 => x & !SIGN64,
-                    };
+                    w!(
+                        dst,
+                        match ty {
+                            FloatTy::F32 => x & 0x7FFF_FFFF,
+                            FloatTy::F64 => x & !SIGN64,
+                        }
+                    );
                 }
                 Inst::FEq { dst, lhs, rhs, ty } => fcmp!(ty, dst, lhs, rhs, Cmp::Eq),
                 Inst::FNe { dst, lhs, rhs, ty } => fcmp!(ty, dst, lhs, rhs, Cmp::Ne),
@@ -497,25 +656,25 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 Inst::FLe { dst, lhs, rhs, ty } => fcmp!(ty, dst, lhs, rhs, Cmp::Le),
                 Inst::FGt { dst, lhs, rhs, ty } => fcmp!(ty, dst, lhs, rhs, Cmp::Gt),
                 Inst::FGe { dst, lhs, rhs, ty } => fcmp!(ty, dst, lhs, rhs, Cmp::Ge),
-                Inst::BNot { dst, src } => r!(dst) = u64::from(r!(src) == 0),
+                Inst::BNot { dst, src } => w!(dst, u64::from(r!(src) == 0)),
                 Inst::BAnd { dst, lhs, rhs } => {
-                    r!(dst) = u64::from(r!(lhs) != 0 && r!(rhs) != 0);
+                    w!(dst, u64::from(r!(lhs) != 0 && r!(rhs) != 0));
                 }
                 Inst::BOr { dst, lhs, rhs } => {
-                    r!(dst) = u64::from(r!(lhs) != 0 || r!(rhs) != 0);
+                    w!(dst, u64::from(r!(lhs) != 0 || r!(rhs) != 0));
                 }
                 Inst::BXor { dst, lhs, rhs } => {
-                    r!(dst) = u64::from((r!(lhs) != 0) != (r!(rhs) != 0));
+                    w!(dst, u64::from((r!(lhs) != 0) != (r!(rhs) != 0)));
                 }
-                Inst::RefEq { dst, lhs, rhs } => r!(dst) = u64::from(r!(lhs) == r!(rhs)),
-                Inst::IntCast { dst, src, conv } => r!(dst) = t!(int::int_cast(conv, r!(src))),
-                Inst::Zext { dst, src, pair } => r!(dst) = int::zext(pair, r!(src)),
-                Inst::Sext { dst, src, pair } => r!(dst) = int::sext(pair, r!(src)),
-                Inst::Trunc { dst, src, pair } => r!(dst) = int::trunc(pair, r!(src)),
+                Inst::RefEq { dst, lhs, rhs } => w!(dst, u64::from(r!(lhs) == r!(rhs))),
+                Inst::IntCast { dst, src, conv } => w!(dst, t!(int::int_cast(conv, r!(src)))),
+                Inst::Zext { dst, src, pair } => w!(dst, int::zext(pair, r!(src))),
+                Inst::Sext { dst, src, pair } => w!(dst, int::sext(pair, r!(src))),
+                Inst::Trunc { dst, src, pair } => w!(dst, int::trunc(pair, r!(src))),
                 Inst::IntToF64 { dst, src, ty } => {
-                    r!(dst) = (int::value(ty, r!(src)) as f64).to_bits();
+                    w!(dst, (int::value(ty, r!(src)) as f64).to_bits());
                 }
-                Inst::BoolToInt { dst, src, .. } => r!(dst) = u64::from(r!(src) != 0),
+                Inst::BoolToInt { dst, src, .. } => w!(dst, u64::from(r!(src) != 0)),
                 Inst::Jmp { target } => jump!(target),
                 Inst::JmpIf { cond, target } => {
                     if r!(cond) != 0 {
@@ -548,6 +707,9 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     let cb = t!(m.push_frame(stack, prog, callee.0, dynv::NIL, Cont::Write(dst.0)));
                     let first = base + dst.index() + 1;
                     stack.copy_within(first..first + usize::from(argc), cb);
+                    if RC {
+                        m.adopt_args(stack, prog, callee.0, cb, usize::from(argc));
+                    }
                     m.frames[fi].pc = pc as u32;
                     continue 'frame;
                 }
@@ -564,6 +726,12 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     }
                     let first = base + args.index();
                     let argc = usize::from(argc);
+                    if RC {
+                        // The old frame goes; the arguments are counted again
+                        // as the new frame's parameters.
+                        let old = m.frames[fi];
+                        m.release_frame(stack, prog, &old);
+                    }
                     stack.copy_within(first..first + argc, base);
                     stack.truncate(base + argc);
                     stack.resize(base + nregs, 0);
@@ -571,6 +739,9 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     fr.func = callee.0;
                     fr.pc = 0;
                     fr.closure = dynv::NIL;
+                    if RC {
+                        m.adopt_args(stack, prog, callee.0, base, argc);
+                    }
                     continue 'frame;
                 }
                 Inst::TailCallIndirect { callee, args, argc } => {
@@ -594,6 +765,13 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                             if base + c.nregs > m.max_stack {
                                 fail!(Fault::raise(ErrorKind::StackOverflow));
                             }
+                            if RC {
+                                // The callee may be held only by this frame:
+                                // its new count comes before the old ones go.
+                                m.heap.inc(cv);
+                                let old = m.frames[fi];
+                                m.release_frame(stack, prog, &old);
+                            }
                             stack.copy_within(first..first + argc, base);
                             stack.truncate(base + argc);
                             stack.resize(base + c.nregs, 0);
@@ -601,6 +779,9 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                             fr.func = f;
                             fr.pc = 0;
                             fr.closure = cv;
+                            if RC {
+                                m.adopt_args(stack, prog, f, base, argc);
+                            }
                             continue 'frame;
                         }
                         Callable::Import(i) => {
@@ -612,8 +793,8 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                             charge!();
                             let res = t!(host_window(m, stack, prog, i, first, argc));
                             let ty = prog.imports.get(i as usize).and_then(|imp| imp.result);
-                            match m.finish(stack, res, ty) {
-                                Ok(Next::Exit(v)) => return Ok(v),
+                            match m.finish::<RC>(stack, prog, res, ty) {
+                                Ok(Next::Exit(v)) => exit!(v, ty),
                                 Ok(Next::Resume) => continue 'frame,
                                 Err(f) => {
                                     if let Some(fr) = m.frames.get_mut(fi) {
@@ -628,8 +809,8 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 }
                 Inst::Ret { src } => {
                     let v = r!(src);
-                    match m.finish(stack, Some(v), info.result) {
-                        Ok(Next::Exit(v)) => return Ok(v),
+                    match m.finish::<RC>(stack, prog, Some(v), info.result) {
+                        Ok(Next::Exit(v)) => exit!(v, info.result),
                         Ok(Next::Resume) => continue 'frame,
                         Err(f) => {
                             // A coroutine body whose result does not convert
@@ -643,8 +824,8 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                         }
                     }
                 }
-                Inst::RetVoid {} => match m.finish(stack, None, None) {
-                    Ok(Next::Exit(v)) => return Ok(v),
+                Inst::RetVoid {} => match m.finish::<RC>(stack, prog, None, None) {
+                    Ok(Next::Exit(v)) => exit!(v, None),
                     Ok(Next::Resume) => continue 'frame,
                     Err(f) => {
                         m.unwind(stack, prog, f)?;
@@ -658,9 +839,9 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                 Inst::CellGet { dst, cell } => {
                     let c = r!(cell);
                     match m.heap.get(c) {
-                        Some(Object::Cell(x)) => r!(dst) = x.value,
+                        Some(Object::Cell(x)) => w!(dst, x.value),
                         // A reference is a cell of `dyn` (LSB §5.17).
-                        Some(Object::Ref(v)) => r!(dst) = *v,
+                        Some(Object::Ref(v)) => w!(dst, *v),
                         _ => fail!(not_a(&m.heap, c)),
                     }
                 }
@@ -675,19 +856,25 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     };
                     // A reference slot reads as its value (LSB §5.17): one
                     // compare on the word, the field's type checked only then.
-                    r!(dst) = if dynv::is_box(w) {
-                        field_read(m, prog, o, field.index(), w)
-                    } else {
-                        w
-                    };
+                    w!(
+                        dst,
+                        if dynv::is_box(w) {
+                            field_read(m, prog, o, field.index(), w)
+                        } else {
+                            w
+                        }
+                    );
                 }
                 Inst::SetField { obj, field, src } => {
                     let (o, v) = (r!(obj), r!(src));
                     match m.heap.get_mut(o) {
                         Some(Object::Struct(s)) => match s.fields.get_mut(field.index()) {
                             // Neither the slot nor the value is a reference:
-                            // a plain store.
-                            Some(slot) if !dynv::is_box(*slot) && !dynv::is_box(v) => *slot = v,
+                            // a plain store (counted stores take the slow
+                            // path, which knows the field's type).
+                            Some(slot) if !RC && !dynv::is_box(*slot) && !dynv::is_box(v) => {
+                                *slot = v;
+                            }
                             Some(_) => field_write(m, prog, o, field.index(), v),
                             None => fail!(Fault::type_error()),
                         },
@@ -711,7 +898,7 @@ fn run(m: &mut Machine, stack: &mut Vec<u64>, prog: &Program) -> Result<Option<u
                     let (a, b) = (r!(lhs), r!(rhs));
                     if dynv::is_inline_int(a) && dynv::is_inline_int(b) {
                         // Inline ints are canonical: equal values, equal bits.
-                        r!(dst) = u64::from((a == b) != matches!(inst, Inst::DNe { .. }));
+                        w!(dst, u64::from((a == b) != matches!(inst, Inst::DNe { .. })));
                     } else {
                         cold!();
                     }
@@ -757,7 +944,7 @@ pub(crate) struct Cx<'a> {
 /// transfer differs (a [`Step`] instead of a `continue`).
 #[inline(never)]
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
-fn cold(
+fn cold<const RC: bool>(
     m: &mut Machine,
     stack: &mut Vec<u64>,
     prog: &Program,
@@ -791,46 +978,69 @@ fn cold(
     }
     macro_rules! charge {
         () => {
-            if let Some(step) = charge(m, stack, fi, pc) {
+            if let Some(step) = charge(m, stack, prog, fi, pc) {
                 return step;
             }
         };
     }
     macro_rules! gc {
         ($extra:expr) => {
-            if m.heap.wants_gc($extra) {
+            let wants = if RC {
+                m.heap.wants_cycles($extra)
+            } else {
+                m.heap.wants_gc($extra)
+            };
+            if wants {
                 m.collect(stack, prog);
             }
         };
     }
+    // A register write, counted in the RC profile.
+    macro_rules! w {
+        ($x:expr, $v:expr) => {{
+            let v = $v;
+            let i = base + ($x).index();
+            if RC {
+                rc_write(m, info, ($x).index(), &mut stack[i], v);
+            } else {
+                stack[i] = v;
+            }
+        }};
+    }
     macro_rules! fbin {
         ($ty:expr, $dst:expr, $lhs:expr, $rhs:expr, |$a:ident, $b:ident| $e:expr) => {{
             let (x, y) = (r!($lhs), r!($rhs));
-            r!($dst) = match $ty {
-                FloatTy::F32 => {
-                    let ($a, $b) = (f32_of(x), f32_of(y));
-                    f32_bits($e)
+            w!(
+                $dst,
+                match $ty {
+                    FloatTy::F32 => {
+                        let ($a, $b) = (f32_of(x), f32_of(y));
+                        f32_bits($e)
+                    }
+                    FloatTy::F64 => {
+                        let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
+                        ($e).to_bits()
+                    }
                 }
-                FloatTy::F64 => {
-                    let ($a, $b) = (f64::from_bits(x), f64::from_bits(y));
-                    ($e).to_bits()
-                }
-            };
+            );
         }};
     }
     macro_rules! fun {
         ($ty:expr, $dst:expr, $src:expr, |$a:ident| $e32:expr, $e64:expr) => {{
             let x = r!($src);
-            r!($dst) = match $ty {
-                FloatTy::F32 => {
-                    let $a = f32_of(x);
-                    f32_bits($e32)
+            w!(
+                $dst,
+                match $ty {
+                    FloatTy::F32 => {
+                        let $a = f32_of(x);
+                        f32_bits($e32)
+                    }
+                    FloatTy::F64 => {
+                        let $a = f64::from_bits(x);
+                        ($e64).to_bits()
+                    }
                 }
-                FloatTy::F64 => {
-                    let $a = f64::from_bits(x);
-                    ($e64).to_bits()
-                }
-            };
+            );
         }};
     }
     // Invokes the hook bound to `$h` with `dyn` operands; `$none` runs when
@@ -846,13 +1056,16 @@ fn cold(
                     charge!();
                     let hb = t!(m.push_frame(stack, prog, hf.0, dynv::NIL, $cont));
                     stack[hb..hb + args.len()].copy_from_slice(&args);
+                    if RC {
+                        m.adopt_args(stack, prog, hf.0, hb, args.len());
+                    }
                     m.frames[fi].pc = pc as u32;
                     return Step::Frame;
                 }
                 Some(Callee::Import(hi)) => {
                     charge!();
                     let res = t!(m.call_host_dyn(prog, hi.0, &args));
-                    t!(m.apply_cont(stack, $cont, res, Some(ValType::Dyn)));
+                    t!(m.apply_cont(stack, prog, $cont, res, Some(ValType::Dyn)));
                 }
             }
         }};
@@ -861,7 +1074,7 @@ fn cold(
         ($op:expr, $hook:expr, $dst:expr, $lhs:expr, $rhs:expr, $pol:expr) => {{
             let (a, b) = (r!($lhs), r!($rhs));
             match t!(dynops::arith(&mut m.heap, $op, $pol, a, b)) {
-                Some(v) => r!($dst) = v,
+                Some(v) => w!($dst, v),
                 None => {
                     gc!(0);
                     hook!(
@@ -878,23 +1091,26 @@ fn cold(
         Inst::LoadConst { dst, k } => {
             gc!(0);
             let ty = info.regs[dst.index()];
-            r!(dst) = t!(m.load_const(prog, k.0, ty));
+            w!(dst, t!(m.load_const(prog, k.0, ty)));
         }
         Inst::DLoadConst { dst, k } => {
             gc!(0);
-            r!(dst) = t!(m.dload_const(prog, k.0));
+            w!(dst, t!(m.dload_const(prog, k.0)));
         }
         Inst::LoadImport { dst, import } => {
             gc!(0);
-            r!(dst) = t!(m.import_ref(import.0));
+            w!(dst, t!(m.import_ref(import.0)));
         }
         Inst::FRem { dst, lhs, rhs, ty } => fbin!(ty, dst, lhs, rhs, |a, b| a % b),
         Inst::FIeeeRem { dst, lhs, rhs, ty } => {
             let (x, y) = (r!(lhs), r!(rhs));
-            r!(dst) = match ty {
-                FloatTy::F32 => f32_bits(fmath::rem_ieee_f32(f32_of(x), f32_of(y))),
-                FloatTy::F64 => fmath::rem_ieee(f64::from_bits(x), f64::from_bits(y)).to_bits(),
-            };
+            w!(
+                dst,
+                match ty {
+                    FloatTy::F32 => f32_bits(fmath::rem_ieee_f32(f32_of(x), f32_of(y))),
+                    FloatTy::F64 => fmath::rem_ieee(f64::from_bits(x), f64::from_bits(y)).to_bits(),
+                }
+            );
         }
         Inst::FMin { dst, lhs, rhs, ty } => {
             fbin!(ty, dst, lhs, rhs, |a, b| fmath::fmin(a, b));
@@ -904,12 +1120,16 @@ fn cold(
         }
         Inst::FFma { dst, lhs, rhs, ty } => {
             let (x, y, z) = (r!(lhs), r!(rhs), r!(dst));
-            r!(dst) = match ty {
-                FloatTy::F32 => f32_bits(fmath::fma_f32(f32_of(x), f32_of(y), f32_of(z))),
-                FloatTy::F64 => {
-                    fmath::fma(f64::from_bits(x), f64::from_bits(y), f64::from_bits(z)).to_bits()
+            w!(
+                dst,
+                match ty {
+                    FloatTy::F32 => f32_bits(fmath::fma_f32(f32_of(x), f32_of(y), f32_of(z))),
+                    FloatTy::F64 => {
+                        fmath::fma(f64::from_bits(x), f64::from_bits(y), f64::from_bits(z))
+                            .to_bits()
+                    }
                 }
-            };
+            );
         }
         Inst::FSqrt { dst, src, ty } => {
             fun!(ty, dst, src, |a| fmath::sqrt_f32(a), fmath::sqrt(a));
@@ -937,59 +1157,62 @@ fn cold(
         }
         Inst::FTotalCmp { dst, lhs, rhs, ty } => {
             let (x, y) = (r!(lhs), r!(rhs));
-            r!(dst) = ordering_word(match ty {
-                FloatTy::F32 => f32_of(x).total_cmp(&f32_of(y)),
-                FloatTy::F64 => f64::from_bits(x).total_cmp(&f64::from_bits(y)),
-            });
+            w!(
+                dst,
+                ordering_word(match ty {
+                    FloatTy::F32 => f32_of(x).total_cmp(&f32_of(y)),
+                    FloatTy::F64 => f64::from_bits(x).total_cmp(&f64::from_bits(y)),
+                })
+            );
         }
         Inst::CEq { dst, lhs, rhs } => {
-            r!(dst) = u64::from(r!(lhs) as u32 == r!(rhs) as u32);
+            w!(dst, u64::from(r!(lhs) as u32 == r!(rhs) as u32));
         }
         Inst::CNe { dst, lhs, rhs } => {
-            r!(dst) = u64::from(r!(lhs) as u32 != r!(rhs) as u32);
+            w!(dst, u64::from(r!(lhs) as u32 != r!(rhs) as u32));
         }
         Inst::CLt { dst, lhs, rhs } => {
-            r!(dst) = u64::from((r!(lhs) as u32) < (r!(rhs) as u32));
+            w!(dst, u64::from((r!(lhs) as u32) < (r!(rhs) as u32)));
         }
         Inst::CLe { dst, lhs, rhs } => {
-            r!(dst) = u64::from(r!(lhs) as u32 <= r!(rhs) as u32);
+            w!(dst, u64::from(r!(lhs) as u32 <= r!(rhs) as u32));
         }
         Inst::CGt { dst, lhs, rhs } => {
-            r!(dst) = u64::from(r!(lhs) as u32 > r!(rhs) as u32);
+            w!(dst, u64::from(r!(lhs) as u32 > r!(rhs) as u32));
         }
         Inst::CGe { dst, lhs, rhs } => {
-            r!(dst) = u64::from(r!(lhs) as u32 >= r!(rhs) as u32);
+            w!(dst, u64::from(r!(lhs) as u32 >= r!(rhs) as u32));
         }
         Inst::IntToF32 { dst, src, ty } => {
-            r!(dst) = f32_bits(int::value(ty, r!(src)) as f32);
+            w!(dst, f32_bits(int::value(ty, r!(src)) as f32));
         }
         Inst::F32ToInt { dst, src, conv } => {
-            r!(dst) = t!(float_to_int(f64::from(f32_of(r!(src))), conv));
+            w!(dst, t!(float_to_int(f64::from(f32_of(r!(src))), conv)));
         }
         Inst::F64ToInt { dst, src, conv } => {
-            r!(dst) = t!(float_to_int(f64::from_bits(r!(src)), conv));
+            w!(dst, t!(float_to_int(f64::from_bits(r!(src)), conv)));
         }
-        Inst::F32ToF64 { dst, src } => r!(dst) = f64::from(f32_of(r!(src))).to_bits(),
+        Inst::F32ToF64 { dst, src } => w!(dst, f64::from(f32_of(r!(src))).to_bits()),
         Inst::F64ToF32 { dst, src } => {
-            r!(dst) = f32_bits(f64::from_bits(r!(src)) as f32);
+            w!(dst, f32_bits(f64::from_bits(r!(src)) as f32));
         }
         Inst::FloatToBits { dst, src, ty } => {
             let x = r!(src);
             let raw = if ty.bits() == 32 { x & 0xFFFF_FFFF } else { x };
-            r!(dst) = int::normalize(ty, raw);
+            w!(dst, int::normalize(ty, raw));
         }
         Inst::BitsToFloat { dst, src, ty } => {
             let x = r!(src);
-            r!(dst) = if ty.bits() == 32 { x & 0xFFFF_FFFF } else { x };
+            w!(dst, if ty.bits() == 32 { x & 0xFFFF_FFFF } else { x });
         }
         Inst::CharFromU32 { dst, src } => {
             let v = r!(src) as u32;
             match char::from_u32(v) {
-                Some(c) => r!(dst) = u64::from(c as u32),
+                Some(c) => w!(dst, u64::from(c as u32)),
                 None => fail!(Fault::raise(ErrorKind::InvalidChar)),
             }
         }
-        Inst::CharToU32 { dst, src } => r!(dst) = r!(src) & 0xFFFF_FFFF,
+        Inst::CharToU32 { dst, src } => w!(dst, r!(src) & 0xFFFF_FFFF),
         Inst::DAdd { dst, lhs, rhs, pol } => {
             darith!(DOp::Add, Hook::Add, dst, lhs, rhs, pol);
         }
@@ -1038,14 +1261,14 @@ fn cold(
         | Inst::DBindIndex { .. }
         | Inst::DBindProp { .. }
         | Inst::DUnrefIndex { .. }
-        | Inst::DUnrefProp { .. } => return format2(m, stack, prog, cx, inst),
+        | Inst::DUnrefProp { .. } => return format2::<RC>(m, stack, prog, cx, inst),
         Inst::DPow { dst, lhs, rhs, pol } => {
             darith!(DOp::Pow, Hook::Pow, dst, lhs, rhs, pol);
         }
         Inst::DAbs { dst, src, pol } => {
             let a = r!(src);
             match t!(dynops::abs(&mut m.heap, pol, a)) {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => {
                     gc!(0);
                     hook!(
@@ -1060,7 +1283,7 @@ fn cold(
         Inst::DNeg { dst, src, pol } => {
             let a = r!(src);
             match t!(dynops::neg(&mut m.heap, pol, a)) {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => {
                     gc!(0);
                     hook!(
@@ -1075,7 +1298,7 @@ fn cold(
         Inst::DBitNot { dst, src, .. } => {
             let a = r!(src);
             match t!(dynops::not(&mut m.heap, a)) {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => {
                     gc!(0);
                     hook!(
@@ -1091,14 +1314,14 @@ fn cold(
             let negate = matches!(inst, Inst::DNe { .. });
             let (a, b) = (r!(lhs), r!(rhs));
             match dynops::eq_builtin(&m.heap, a, b) {
-                Some(e) => r!(dst) = u64::from(e != negate),
+                Some(e) => w!(dst, u64::from(e != negate)),
                 None => {
                     gc!(0);
                     hook!(
                         Hook::Eq,
                         [a, b],
                         Cont::Bool { dst: dst.0, negate },
-                        r!(dst) = u64::from((a == b) != negate)
+                        w!(dst, u64::from((a == b) != negate))
                     );
                 }
             }
@@ -1115,11 +1338,11 @@ fn cold(
             }
             if dynv::is_inline_int(a) && dynv::is_inline_int(b) {
                 let (x, y) = (dynv::inline_int_value(a), dynv::inline_int_value(b));
-                r!(dst) = u64::from(x < y || (le && x == y));
+                w!(dst, u64::from(x < y || (le && x == y)));
                 return Step::Next;
             }
             match dynops::lt_builtin(&m.heap, a, b, le) {
-                Some(x) => r!(dst) = u64::from(x),
+                Some(x) => w!(dst, u64::from(x)),
                 None => {
                     gc!(0);
                     let h = if le { Hook::Le } else { Hook::Lt };
@@ -1139,14 +1362,14 @@ fn cold(
             let negate = matches!(inst, Inst::DNot { .. });
             let v = r!(src);
             match dynops::truthy(&m.heap, v) {
-                Ok(b) => r!(dst) = u64::from(b != negate),
+                Ok(b) => w!(dst, u64::from(b != negate)),
                 Err(builtin) => {
                     gc!(0);
                     hook!(
                         Hook::Truthy,
                         [v],
                         Cont::Bool { dst: dst.0, negate },
-                        r!(dst) = u64::from(builtin != negate)
+                        w!(dst, u64::from(builtin != negate))
                     );
                 }
             }
@@ -1160,7 +1383,7 @@ fn cold(
             match lens {
                 Some(n) => {
                     gc!(n);
-                    r!(dst) = t!(concat(m, &[a, b], n));
+                    w!(dst, t!(concat(m, &[a, b], n)));
                 }
                 None => {
                     gc!(0);
@@ -1175,26 +1398,29 @@ fn cold(
         }
         Inst::ToDyn { dst, src, from } => {
             gc!(0);
-            r!(dst) = t!(conv::to_dyn(&mut m.heap, prim_type(from), r!(src)));
+            w!(dst, t!(conv::to_dyn(&mut m.heap, prim_type(from), r!(src))));
         }
         Inst::FromDyn { dst, src, to } => {
-            r!(dst) = t!(conv::from_dyn(&m.heap, prog, prim_type(to), r!(src)));
+            w!(
+                dst,
+                t!(conv::from_dyn(&m.heap, prog, prim_type(to), r!(src)))
+            );
         }
         Inst::TypeOf { dst, src } => {
-            r!(dst) = u64::from(m.heap.kind(r!(src)).code());
+            w!(dst, u64::from(m.heap.kind(r!(src)).code()));
         }
         Inst::IsKind { dst, src, kind } => {
-            r!(dst) = u64::from(m.heap.kind(r!(src)) == kind);
+            w!(dst, u64::from(m.heap.kind(r!(src)) == kind));
         }
         Inst::IsType { dst, src, ty } => {
             let t = info.type_refs[ty.index()];
-            r!(dst) = u64::from(conv::cast_ok(&m.heap, prog, r!(src), t));
+            w!(dst, u64::from(conv::cast_ok(&m.heap, prog, r!(src), t)));
         }
         Inst::Cast { dst, src, ty } => {
             let t = info.type_refs[ty.index()];
             let v = r!(src);
             if v == dynv::NIL || conv::cast_ok(&m.heap, prog, v, t) {
-                r!(dst) = v;
+                w!(dst, v);
             } else {
                 fail!(Fault::type_error());
             }
@@ -1206,12 +1432,12 @@ fn cold(
                 // other `obj` is exactly `dget_index`.
                 gc!(64);
                 if let Some(v) = t!(refs::dsep_index(m, prog, o, k)) {
-                    r!(dst) = v;
+                    w!(dst, v);
                     return Step::Next;
                 }
             }
             match t!(dget_index(m, prog, o, k)) {
-                Lookup::Found(v) => r!(dst) = v,
+                Lookup::Found(v) => w!(dst, v),
                 Lookup::Miss(kind) => {
                     gc!(0);
                     hook!(
@@ -1241,12 +1467,12 @@ fn cold(
             if let Inst::DSepProp { .. } = inst {
                 gc!(64);
                 if let Some(v) = t!(refs::dsep_prop(m, prog, o, id)) {
-                    r!(dst) = v;
+                    w!(dst, v);
                     return Step::Next;
                 }
             }
             match t!(get_prop(m, prog, o, id)) {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => {
                     gc!(0);
                     let n = t!(m.name_str(prog, id));
@@ -1277,7 +1503,7 @@ fn cold(
             let o = r!(obj);
             let id = info.names[name.index()];
             match has_prop(m, prog, o, id) {
-                Some(b) => r!(dst) = u64::from(b),
+                Some(b) => w!(dst, u64::from(b)),
                 None => {
                     gc!(0);
                     let n = t!(m.name_str(prog, id));
@@ -1288,7 +1514,7 @@ fn cold(
                             dst: dst.0,
                             negate: false
                         },
-                        r!(dst) = 0
+                        w!(dst, 0)
                     );
                 }
             }
@@ -1352,6 +1578,12 @@ fn cold(
             gc!(n * 8 + 64);
             let mut flat = core::mem::take(&mut m.flat);
             let flattened = bind::flatten(m, sh, &stack[first..first + n], &mut flat);
+            if flattened.is_ok() {
+                if let Some(step) = charge_items(m, stack, prog, fi, pc, flat.vals.len()) {
+                    m.flat = flat;
+                    return step;
+                }
+            }
             let shape_hook = prog.hooks[usize::from(Hook::CallShape.code())].is_some();
             let call_hook = prog.hooks[usize::from(Hook::Call.code())].is_some();
             let operands = flattened.and_then(|()| {
@@ -1385,7 +1617,7 @@ fn cold(
             gc!(64);
             let v = r!(src);
             match coll::new_iter(&mut m.heap, v, true) {
-                Some(it) => r!(dst) = t!(it),
+                Some(it) => w!(dst, t!(it)),
                 None => hook!(
                     Hook::Iter,
                     [v],
@@ -1403,7 +1635,7 @@ fn cold(
                 _ => None,
             };
             match len {
-                Some(n) => r!(dst) = n as u64,
+                Some(n) => w!(dst, n as u64),
                 None => {
                     gc!(0);
                     hook!(Hook::Len, [v], Cont::Len(dst.0), fail!(Fault::type_error()));
@@ -1427,6 +1659,9 @@ fn cold(
                     gc!(0);
                     let cb = t!(m.push_frame(stack, prog, f, cv, Cont::Write(dst.0)));
                     stack.copy_within(first..first + argc, cb);
+                    if RC {
+                        m.adopt_args(stack, prog, f, cb, argc);
+                    }
                     m.frames[fi].pc = pc as u32;
                     return Step::Frame;
                 }
@@ -1438,7 +1673,7 @@ fn cold(
                     }
                     charge!();
                     if let Some(v) = t!(host_window(m, stack, prog, i, first, argc)) {
-                        r!(dst) = v;
+                        w!(dst, v);
                     }
                 }
             }
@@ -1454,15 +1689,18 @@ fn cold(
                 first,
                 usize::from(argc)
             )) {
-                r!(dst) = v;
+                w!(dst, v);
             }
         }
         Inst::Throw { src } => fail!(Fault::Throw(r!(src))),
         Inst::ErrCode { dst, src } => {
-            r!(dst) = match m.heap.get(r!(src)) {
-                Some(Object::Error(e)) => u64::from(e.kind.code()),
-                _ => 0,
-            };
+            w!(
+                dst,
+                match m.heap.get(r!(src)) {
+                    Some(Object::Error(e)) => u64::from(e.kind.code()),
+                    _ => 0,
+                }
+            );
         }
         Inst::Unreachable {} => fail!(Fault::Trap(ErrorKind::Unreachable)),
         Inst::MakeClosure { dst, func: target } => {
@@ -1470,10 +1708,12 @@ fn cold(
             gc!(n * 8);
             let first = base + dst.index() + 1;
             let captures: alloc::boxed::Box<[u64]> = stack[first..first + n].into();
-            r!(dst) = t!(m.heap.alloc(Object::Func(FuncObj {
+            let c = t!(m.heap.alloc(Object::Func(FuncObj {
                 target: Callable::Func(target.0),
                 captures,
             })));
+            m.heap.adopt(c, prog);
+            w!(dst, c);
         }
         Inst::GetUpval { dst, idx } => {
             let v = match m.heap.get(closure) {
@@ -1481,7 +1721,7 @@ fn cold(
                 _ => None,
             };
             match v {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => fail!(Fault::type_error()),
             }
         }
@@ -1492,7 +1732,10 @@ fn cold(
                 _ => ValType::Dyn,
             };
             let v = r!(src);
-            r!(dst) = t!(m.heap.alloc(Object::Cell(CellObj { elem, value: v })));
+            w!(
+                dst,
+                t!(m.heap.alloc(Object::Cell(CellObj { elem, value: v })))
+            );
         }
         Inst::CellSet { cell, src } => {
             let (c, v) = (r!(cell), r!(src));
@@ -1505,10 +1748,14 @@ fn cold(
             if !m.heap.fits(n.saturating_mul(8)) {
                 fail!(Fault::Trap(ErrorKind::OutOfMemory));
             }
-            r!(dst) = t!(m.heap.alloc(Object::Struct(StructObj {
-                ty: t,
-                fields: alloc::vec![0; n].into_boxed_slice(),
-            })));
+            w!(
+                dst,
+                t!(m.heap.alloc(Object::Struct(StructObj {
+                    ty: t,
+                    destructed: false,
+                    fields: alloc::vec![0; n].into_boxed_slice(),
+                })))
+            );
         }
         Inst::NewArray { dst, len, ty } => {
             let n = index_of(r!(len));
@@ -1517,13 +1764,19 @@ fn cold(
                 _ => ValType::Dyn,
             };
             gc!(usize::try_from(n).unwrap_or(0).saturating_mul(8));
-            r!(dst) = t!(coll::new_array(&mut m.heap, elem, n));
+            w!(dst, t!(coll::new_array(&mut m.heap, elem, n)));
         }
         Inst::ArrayLen { dst, arr } => {
-            r!(dst) = t!(coll::array_ref(&m.heap, r!(arr))).items.len() as u64;
+            w!(
+                dst,
+                t!(coll::array_ref(&m.heap, r!(arr))).items.len() as u64
+            );
         }
         Inst::ArrayGet { dst, arr, idx } => {
-            r!(dst) = t!(coll::array_get(&m.heap, r!(arr), index_of(r!(idx))));
+            w!(
+                dst,
+                t!(coll::array_get(&m.heap, r!(arr), index_of(r!(idx))))
+            );
         }
         Inst::ArraySet { arr, idx, src } => {
             let (a, i, v) = (r!(arr), index_of(r!(idx)), r!(src));
@@ -1535,7 +1788,7 @@ fn cold(
             t!(coll::array_push(&mut m.heap, a, v));
         }
         Inst::ArrayPop { dst, arr } => {
-            r!(dst) = t!(coll::array_pop(&mut m.heap, r!(arr)));
+            w!(dst, t!(coll::array_pop(&mut m.heap, r!(arr))));
         }
         Inst::NewMap { dst, ty } => {
             gc!(0);
@@ -1543,24 +1796,24 @@ fn cold(
                 Some(TypeInfo::Map(k, v)) => (*k, *v),
                 _ => (ValType::Dyn, ValType::Dyn),
             };
-            r!(dst) = t!(coll::new_map(&mut m.heap, k, v));
+            w!(dst, t!(coll::new_map(&mut m.heap, k, v)));
         }
         Inst::MapLen { dst, map } => {
-            r!(dst) = t!(coll::map_ref(&m.heap, r!(map))).store.len() as u64;
+            w!(dst, t!(coll::map_ref(&m.heap, r!(map))).store.len() as u64);
         }
         Inst::MapGet { dst, map, key } => {
             match t!(coll::map_get(&m.heap, m.seed, r!(map), r!(key))) {
-                Some(v) => r!(dst) = v,
+                Some(v) => w!(dst, v),
                 None => fail!(Fault::raise(ErrorKind::KeyNotFound)),
             }
         }
         Inst::MapFind { dst, map, key } => {
             let found = t!(coll::map_get(&m.heap, m.seed, r!(map), r!(key)));
-            r!(dst) = found.unwrap_or(dynv::NIL);
+            w!(dst, found.unwrap_or(dynv::NIL));
         }
         Inst::MapHas { dst, map, key } => {
             let found = t!(coll::map_get(&m.heap, m.seed, r!(map), r!(key)));
-            r!(dst) = u64::from(found.is_some());
+            w!(dst, u64::from(found.is_some()));
         }
         Inst::MapSet { map, key, src } => {
             gc!(64);
@@ -1580,7 +1833,7 @@ fn cold(
             gc!(64);
             let v = r!(src);
             match coll::new_iter(&mut m.heap, v, false) {
-                Some(it) => r!(dst) = t!(it),
+                Some(it) => w!(dst, t!(it)),
                 None => fail!(not_a(&m.heap, v)),
             }
         }
@@ -1590,26 +1843,26 @@ fn cold(
             if let Some(Object::Iter(i)) = m.heap.get(it) {
                 if i.coro {
                     let src = i.src;
-                    return coro::iter_next(m, stack, prog, cx, pc, (has.0, it, val.0), src);
+                    return coro::iter_next::<RC>(m, stack, prog, cx, pc, (has.0, it, val.0), src);
                 }
             }
             match t!(coll::iter_next(&mut m.heap, it)) {
                 Some(v) => {
-                    r!(val) = v;
-                    r!(has) = 1;
+                    w!(val, v);
+                    w!(has, 1);
                 }
-                None => r!(has) = 0,
+                None => w!(has, 0),
             }
         }
-        Inst::IterKey { dst, iter } => r!(dst) = t!(coll::iter_key(&m.heap, r!(iter))),
+        Inst::IterKey { dst, iter } => w!(dst, t!(coll::iter_key(&m.heap, r!(iter)))),
         Inst::Dup { dst, src } => {
             gc!(64);
-            r!(dst) = t!(refs::dup(m, prog, r!(src)));
+            w!(dst, t!(refs::dup(m, prog, r!(src))));
         }
         Inst::StrLen { dst, s } => {
             let v = r!(s);
             match m.heap.str(v) {
-                Some(b) => r!(dst) = b.len() as u64,
+                Some(b) => w!(dst, b.len() as u64),
                 None => fail!(not_a(&m.heap, v)),
             }
         }
@@ -1621,7 +1874,7 @@ fn cold(
                 (_, None) => fail!(not_a(&m.heap, b)),
             };
             gc!(n);
-            r!(dst) = t!(concat(m, &[a, b], n));
+            w!(dst, t!(concat(m, &[a, b], n)));
         }
         Inst::StrConcatN { dst, first, count } => {
             let start = base + first.index();
@@ -1642,7 +1895,7 @@ fn cold(
             }
             gc!(n);
             let parts: Vec<u64> = stack[start..start + usize::from(count)].to_vec();
-            r!(dst) = t!(concat(m, &parts, n));
+            w!(dst, t!(concat(m, &parts, n)));
         }
         Inst::StrEq { dst, lhs, rhs } => {
             let (a, b) = (r!(lhs), r!(rhs));
@@ -1651,7 +1904,7 @@ fn cold(
                 (None, _) => fail!(not_a(&m.heap, a)),
                 (_, None) => fail!(not_a(&m.heap, b)),
             };
-            r!(dst) = u64::from(eq);
+            w!(dst, u64::from(eq));
         }
         Inst::StrCmp { dst, lhs, rhs } => {
             let (a, b) = (r!(lhs), r!(rhs));
@@ -1660,7 +1913,7 @@ fn cold(
                 (None, _) => fail!(not_a(&m.heap, a)),
                 (_, None) => fail!(not_a(&m.heap, b)),
             };
-            r!(dst) = ordering_word(o);
+            w!(dst, ordering_word(o));
         }
         Inst::StrSlice {
             dst,
@@ -1690,7 +1943,7 @@ fn cold(
                 Some(b) => b[lo..hi].into(),
                 None => fail!(not_a(&m.heap, v)),
             };
-            r!(dst) = t!(m.heap.alloc(Object::Str(piece)));
+            w!(dst, t!(m.heap.alloc(Object::Str(piece))));
         }
         Inst::StrByte { dst, s, idx } => {
             let v = r!(s);
@@ -1699,7 +1952,7 @@ fn cold(
                 fail!(not_a(&m.heap, v));
             };
             match usize::try_from(i).ok().and_then(|i| b.get(i)) {
-                Some(&byte) => r!(dst) = u64::from(byte),
+                Some(&byte) => w!(dst, u64::from(byte)),
                 None => fail!(coll::out_of_bounds()),
             }
         }
@@ -1715,7 +1968,7 @@ fn cold(
         | Inst::Spawn { .. }
         | Inst::CoroClose { .. }
         | Inst::CoroKey { .. }
-        | Inst::CoroResult { .. } => return coro::exec(m, stack, prog, cx, pc, inst),
+        | Inst::CoroResult { .. } => return coro::exec::<RC>(m, stack, prog, cx, pc, inst),
         // Handled inline by the dispatch loop.
         _ => {}
     }
@@ -1727,8 +1980,26 @@ fn cold(
 /// [`cold`] so that adding them did not grow it: the helpers `cold` inlines
 /// (map and array access among them) stay inlined.
 #[inline(never)]
-fn format2(m: &mut Machine, stack: &mut [u64], prog: &Program, cx: &Cx<'_>, inst: Inst) -> Step {
+fn format2<const RC: bool>(
+    m: &mut Machine,
+    stack: &mut [u64],
+    prog: &Program,
+    cx: &Cx<'_>,
+    inst: Inst,
+) -> Step {
     let Cx { info, base, .. } = *cx;
+    // A register write, counted in the RC profile.
+    macro_rules! w {
+        ($x:expr, $v:expr) => {{
+            let v = $v;
+            let i = base + ($x).index();
+            if RC {
+                rc_write(m, info, ($x).index(), &mut stack[i], v);
+            } else {
+                stack[i] = v;
+            }
+        }};
+    }
     macro_rules! r {
         ($x:expr) => {
             stack[base + ($x).index()]
@@ -1749,7 +2020,12 @@ fn format2(m: &mut Machine, stack: &mut [u64], prog: &Program, cx: &Cx<'_>, inst
     }
     macro_rules! gc {
         ($extra:expr) => {
-            if m.heap.wants_gc($extra) {
+            let wants = if RC {
+                m.heap.wants_cycles($extra)
+            } else {
+                m.heap.wants_gc($extra)
+            };
+            if wants {
                 m.collect(stack, prog);
             }
         };
@@ -1757,49 +2033,61 @@ fn format2(m: &mut Machine, stack: &mut [u64], prog: &Program, cx: &Cx<'_>, inst
     match inst {
         Inst::IPow { dst, lhs, rhs, op } => {
             let (a, b) = (r!(lhs), r!(rhs));
-            r!(dst) = t!(int::bin(Bin::Pow, op, a, b));
+            w!(dst, t!(int::bin(Bin::Pow, op, a, b)));
         }
         Inst::FPow { dst, lhs, rhs, ty } => {
             let (x, y) = (r!(lhs), r!(rhs));
-            r!(dst) = match ty {
-                FloatTy::F32 => f32_bits(pow::ls_pow_f32(f32_of(x), f32_of(y))),
-                FloatTy::F64 => pow::ls_pow(f64::from_bits(x), f64::from_bits(y)).to_bits(),
-            };
+            w!(
+                dst,
+                match ty {
+                    FloatTy::F32 => f32_bits(pow::ls_pow_f32(f32_of(x), f32_of(y))),
+                    FloatTy::F64 => pow::ls_pow(f64::from_bits(x), f64::from_bits(y)).to_bits(),
+                }
+            );
         }
         Inst::DParamRef { dst, callee, pos } => {
             let target = bind::target_of(m, r!(callee));
-            r!(dst) = u64::from(bind::param_ref(prog, target, r!(pos) as i64));
+            w!(
+                dst,
+                u64::from(bind::param_ref(prog, target, r!(pos) as i64))
+            );
         }
         Inst::DParamRefNamed { dst, callee, name } => {
             let target = bind::target_of(m, r!(callee));
             let id = info.names[name.index()];
-            r!(dst) = u64::from(bind::param_ref_named(
-                prog,
-                target,
-                prog.string(id).as_bytes(),
-            ));
+            w!(
+                dst,
+                u64::from(bind::param_ref_named(
+                    prog,
+                    target,
+                    prog.string(id).as_bytes(),
+                ))
+            );
         }
         Inst::Raise { src, kind } => fail!(Fault::RaiseWith(kind, r!(src))),
         Inst::ErrPayload { dst, src } => {
-            r!(dst) = match m.heap.get(r!(src)) {
-                Some(Object::Error(e)) => e.payload,
-                _ => dynv::NIL,
-            };
+            w!(
+                dst,
+                match m.heap.get(r!(src)) {
+                    Some(Object::Error(e)) => e.payload,
+                    _ => dynv::NIL,
+                }
+            );
         }
         Inst::NewRef { dst, src } => {
             gc!(0);
-            r!(dst) = t!(refs::new_ref(m, r!(src)));
+            w!(dst, t!(refs::new_ref(m, r!(src))));
         }
         Inst::DRefIndex { dst, obj, key } => {
             gc!(64);
             let (o, k) = (r!(obj), r!(key));
-            r!(dst) = t!(refs::dref_index(m, prog, o, k));
+            w!(dst, t!(refs::dref_index(m, prog, o, k)));
         }
         Inst::DRefProp { dst, obj, name } => {
             gc!(64);
             let o = r!(obj);
             let id = info.names[name.index()];
-            r!(dst) = t!(refs::dref_prop(m, prog, o, id));
+            w!(dst, t!(refs::dref_prop(m, prog, o, id)));
         }
         Inst::DBindIndex { obj, key, src } => {
             gc!(64);
@@ -1831,17 +2119,66 @@ fn format2(m: &mut Machine, stack: &mut [u64], prog: &Program, cx: &Cx<'_>, inst
 /// One unit of fuel for the out-of-line instructions (LSB §5.14): `None`
 /// to continue, or the step to take (the `OutOfFuel` trap, or a pending
 /// drop-close that starts before this instruction).
-#[inline]
-pub(crate) fn charge(m: &mut Machine, stack: &mut Vec<u64>, fi: usize, pc: usize) -> Option<Step> {
+#[inline(always)]
+pub(crate) fn charge(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+    fi: usize,
+    pc: usize,
+) -> Option<Step> {
     if m.fuel != 0 {
         m.fuel -= 1;
         return None;
     }
-    match m.charge_slow(stack, Some((fi, pc as u32))) {
+    charge_cold(m, stack, prog, fi, pc)
+}
+
+/// The cold branch of [`charge`].
+#[cold]
+#[inline(never)]
+fn charge_cold(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+    fi: usize,
+    pc: usize,
+) -> Option<Step> {
+    match m.charge_slow(stack, prog, Some((fi, pc as u32))) {
         Charge::Done => None,
         Charge::Spent => Some(Step::Fault(Fault::Trap(ErrorKind::OutOfFuel))),
         Charge::Close => Some(Step::Unwind(Fault::Throw(dynv::NIL))),
+        Charge::Call => Some(Step::Frame),
     }
+}
+
+/// The extra fuel of a dynamic call of `n` flattened items
+/// ([`bind::item_units`]): nothing below [`bind::ITEMS_PER_FUEL`] items;
+/// otherwise the first unit is an ordinary charge (a queued finalization may
+/// start there, before the instruction has had any effect) and the rest are
+/// taken at once, the `OutOfFuel` trap when they are not all there.
+fn charge_items(
+    m: &mut Machine,
+    stack: &mut Vec<u64>,
+    prog: &Program,
+    fi: usize,
+    pc: usize,
+    n: usize,
+) -> Option<Step> {
+    let units = bind::item_units(n);
+    if units == 0 {
+        return None;
+    }
+    if let Some(step) = charge(m, stack, prog, fi, pc) {
+        return Some(step);
+    }
+    let rest = units - 1;
+    if m.fuel < rest {
+        m.fuel = 0;
+        return Some(Step::Fault(Fault::Trap(ErrorKind::OutOfFuel)));
+    }
+    m.fuel -= rest;
+    None
 }
 
 /// The call shapes of a function (`dcall_shape` operands).
@@ -1871,7 +2208,7 @@ fn dyn_call(
     // Collect before flattening: nothing below collects, so what a spread
     // allocates (boxed ints of a typed array) stays alive until the
     // arguments are in the callee's frame.
-    if m.heap.wants_gc(64) {
+    if m.wants_gc(64) {
         m.collect(stack, prog);
     }
     let list = bind::params_of(prog, target);
@@ -1900,9 +2237,14 @@ fn dyn_call(
         if let Err(f) = flattened {
             break 'call Step::Fault(f);
         }
+        // A call of many items (a large spread) is charged per item before
+        // they are bound (P33), so binding work stays within the fuel.
+        if let Some(step) = charge_items(m, stack, prog, fi, pc, flat.vals.len()) {
+            break 'call step;
+        }
         let mask = match bind::bind(
             prog,
-            list,
+            (list, bind::index_of(prog, target)),
             sig.len(),
             named.then_some(&flat),
             flat.vals.len(),
@@ -1912,7 +2254,7 @@ fn dyn_call(
             Err(f) => break 'call Step::Fault(f),
         };
         // Step 4: the charge, once the callee is known to take the items.
-        if let Some(step) = charge(m, stack, fi, pc) {
+        if let Some(step) = charge(m, stack, prog, fi, pc) {
             break 'call step;
         }
         let built = bind::build_args(
@@ -1938,6 +2280,7 @@ fn dyn_call(
                 if let Some(slots) = stack.get_mut(cb..cb + args.len()) {
                     slots.copy_from_slice(&args);
                 }
+                m.adopt_args(stack, prog, f, cb, args.len());
                 m.frames[fi].pc = pc as u32;
                 Step::Frame
             }
@@ -1959,7 +2302,7 @@ fn dyn_call(
                     },
                     _ => dynv::NIL,
                 };
-                stack[cx.base + usize::from(dst)] = v;
+                m.set_reg(stack, prog, fi, dst, v);
                 Step::Next
             }
         }
@@ -1983,14 +2326,16 @@ fn field_read(m: &Machine, prog: &Program, o: u64, slot: usize, w: u64) -> u64 {
     }
 }
 
-/// A store into a struct field when the slot or the value is a box: in a
-/// `dyn` field a reference value stores its value and a reference slot is
-/// written through; any other field stores the word as it is.
+/// A store into a struct field when the slot or the value is a box, or when
+/// stores are counted: in a `dyn` field a reference value stores its value
+/// and a reference slot is written through; any other field stores the word
+/// as it is.
 #[cold]
 #[inline(never)]
 fn field_write(m: &mut Machine, prog: &Program, o: u64, slot: usize, v: u64) {
     let mut v = v;
-    if field_type(m, prog, o, slot) == ValType::Dyn {
+    let ty = field_type(m, prog, o, slot);
+    if ty == ValType::Dyn {
         v = m.heap.deref(v);
         let old = match m.heap.get(o) {
             Some(Object::Struct(s)) => s.fields.get(slot).copied().unwrap_or(dynv::NIL),
@@ -2000,10 +2345,15 @@ fn field_write(m: &mut Machine, prog: &Program, o: u64, slot: usize, v: u64) {
             return;
         }
     }
-    if let Some(Object::Struct(s)) = m.heap.get_mut(o) {
-        if let Some(f) = s.fields.get_mut(slot) {
-            *f = v;
-        }
+    let old = match m.heap.get_mut(o) {
+        Some(Object::Struct(s)) => match s.fields.get_mut(slot) {
+            Some(f) => core::mem::replace(f, v),
+            None => return,
+        },
+        _ => return,
+    };
+    if ty.is_reference() {
+        m.heap.swap(v, old);
     }
 }
 
@@ -2165,7 +2515,7 @@ fn get_prop(m: &mut Machine, prog: &Program, o: u64, name: u32) -> Result<Option
 
 /// A method by name on a struct or its ancestors (at most
 /// `MAX_INHERITANCE_DEPTH` steps, checked at load).
-fn find_method(prog: &Program, ty: u32, name: u32) -> Option<u32> {
+pub(crate) fn find_method(prog: &Program, ty: u32, name: u32) -> Option<u32> {
     let mut cur = Some(ty);
     while let Some(t) = cur {
         let info = prog.struct_info(t)?;

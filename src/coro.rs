@@ -26,14 +26,17 @@
 //! suspended with it. `CannotSuspend` is raised exactly when no coroutine is
 //! running.
 //!
-//! **Close on drop** (rule 13 as decided in LSB §10 question 9). bvm's heap
-//! is traced, not reference-counted, so the last reference going away is not
-//! observable when it happens; a suspended coroutine found unreachable by a
-//! collection is resurrected and queued ([`Machine::finalize`]), and the VM
-//! closes queued coroutines one at a time, oldest first, at the next frame
-//! transition (a call, return, resume, suspension, or handler entry) of a
-//! run, or when the host calls [`Vm::run_finalizers`]. The close signal is
-//! `nil`; the outcome (return value, error, or a refusal) is discarded.
+//! **Close on drop** (rule 13 as decided in LSB §10 question 9). When follows
+//! the memory profile. In the tracing profile the last reference going away
+//! is not observable when it happens; a suspended coroutine found
+//! unreachable by a collection is resurrected and queued
+//! ([`Machine::finalize`]), and the VM closes queued coroutines one at a
+//! time, oldest first, at the next fuel charge point of a run, or when the
+//! host calls [`Vm::run_finalizers`]. In the RC profile it is closed at the
+//! last reference, before the next instruction ([`crate::rc`]). The close
+//! signal is `nil`; the outcome (return value, error, or a refusal) is
+//! discarded. The queue also holds objects whose destructor is due
+//! ([`Machine::start_finalizer`] starts either kind).
 //!
 //! [`Vm::run_finalizers`]: crate::Vm::run_finalizers
 
@@ -51,6 +54,7 @@ use crate::fault::Fault;
 use crate::heap::{Callable, CoroObj, FRAME_BYTES, Object};
 use crate::machine::{Active, Charge, Cont, Driver, Frame, Machine, Stop, Wake};
 use crate::program::Program;
+use crate::rc::Settled;
 use crate::value::{Obj, Value};
 
 /// What a suspending or finishing coroutine hands its driver.
@@ -99,7 +103,7 @@ impl Machine {
         }
         let seq = self.coro_seq;
         self.coro_seq = self.coro_seq.wrapping_add(1);
-        self.heap.alloc(Object::Coro(Box::new(CoroObj {
+        let c = self.heap.alloc(Object::Coro(Box::new(CoroObj {
             state: CoroState::Created,
             closing: false,
             finalized: false,
@@ -119,7 +123,12 @@ impl Machine {
             max_key: -1,
             result: dynv::NIL,
             signal: dynv::NIL,
-        })))
+        })))?;
+        // It holds its arguments and its body's closure (RC).
+        if self.heap.rc {
+            self.heap.adopt(c, prog);
+        }
+        Ok(c)
     }
 
     /// The state of the coroutine `v` names (`NullReference`/`TypeError` for
@@ -136,7 +145,12 @@ impl Machine {
     /// resumer's pc. Fails, changing nothing, for a non-coroutine, a state
     /// other than `created`/`yielded`/`awaiting` (`InvalidCoroState`), or a
     /// stack the depth or register limits cannot hold (`StackOverflow`).
-    pub(crate) fn coro_enter(
+    ///
+    /// `RC` is the memory profile, known at compile time in the dispatch
+    /// loop (one executor per profile), so the tracing switch carries no
+    /// counting code; [`coro_enter_dyn`](Machine::coro_enter_dyn) asks the
+    /// heap.
+    pub(crate) fn coro_enter<const RC: bool>(
         &mut self,
         stack: &mut Vec<u64>,
         coro: u64,
@@ -180,18 +194,180 @@ impl Machine {
             floor,
             driver,
         });
+        // The resume chain holds the running coroutine, and the iterator
+        // driving it (RC).
+        if RC {
+            heap.inc(coro);
+            if let Driver::Iter { iter, .. } = driver {
+                heap.inc(iter);
+            }
+        }
         Ok(entered)
+    }
+
+    /// [`coro_enter`](Machine::coro_enter) under the profile of the heap.
+    pub(crate) fn coro_enter_dyn(
+        &mut self,
+        stack: &mut Vec<u64>,
+        coro: u64,
+        driver: Driver,
+    ) -> Result<Entered, Fault> {
+        if self.heap.rc {
+            self.coro_enter::<true>(stack, coro, driver)
+        } else {
+            self.coro_enter::<false>(stack, coro, driver)
+        }
+    }
+
+    /// [`pop_active`](Machine::pop_active) under the profile of the heap.
+    fn pop_active_dyn(&mut self) -> Option<Active> {
+        if self.heap.rc {
+            self.pop_active::<true>()
+        } else {
+            self.pop_active::<false>()
+        }
+    }
+
+    /// Pops the innermost link of the resume chain, giving up what it held.
+    #[inline(always)]
+    fn pop_active<const RC: bool>(&mut self) -> Option<Active> {
+        let act = self.coros.pop()?;
+        if RC {
+            self.heap.dec(act.coro);
+            if let Driver::Iter { iter, .. } = act.driver {
+                self.heap.dec(iter);
+            }
+        }
+        Some(act)
     }
 
     /// After [`coro_enter`](Machine::coro_enter) of a suspended coroutine:
     /// the sent value becomes the suspending instruction's result and its
     /// frame continues after it.
-    pub(crate) fn coro_send(&mut self, stack: &mut [u64], dst: u16, value: u64) {
+    ///
+    /// Kept small enough to inline on every switch (the counted write is out
+    /// of line).
+    #[inline(always)]
+    pub(crate) fn coro_send<const RC: bool>(
+        &mut self,
+        stack: &mut [u64],
+        prog: &Program,
+        dst: u16,
+        value: u64,
+    ) {
+        if RC {
+            self.send_counted(stack, prog, dst, value);
+            return;
+        }
         if let Some(top) = self.frames.last_mut() {
             if let Some(slot) = stack.get_mut(top.base + usize::from(dst)) {
                 *slot = value;
             }
             top.pc += 1;
+        }
+    }
+
+    /// [`coro_send`](Machine::coro_send) under the profile of the heap.
+    pub(crate) fn coro_send_dyn(
+        &mut self,
+        stack: &mut [u64],
+        prog: &Program,
+        dst: u16,
+        value: u64,
+    ) {
+        if self.heap.rc {
+            self.coro_send::<true>(stack, prog, dst, value);
+        } else {
+            self.coro_send::<false>(stack, prog, dst, value);
+        }
+    }
+
+    /// [`coro_send`](Machine::coro_send) with a counted write (RC).
+    #[inline(never)]
+    fn send_counted(&mut self, stack: &mut [u64], prog: &Program, dst: u16, value: u64) {
+        let fi = self.frames.len().wrapping_sub(1);
+        self.set_reg(stack, prog, fi, dst, value);
+        if let Some(top) = self.frames.last_mut() {
+            top.pc += 1;
+        }
+    }
+
+    /// Marks a coroutine finished: its state, its result (the return value
+    /// or the error that escaped), no close in progress, and its stack
+    /// released (a created coroutine's arguments, or nothing).
+    #[inline(always)]
+    pub(crate) fn end_coro(&mut self, prog: &Program, coro: u64, state: CoroState, result: u64) {
+        if self.heap.rc {
+            self.end_coro_counted(prog, coro, state, result);
+        } else if let Some(co) = self.heap.coro_mut(coro) {
+            co.state = state;
+            co.result = result;
+            co.closing = false;
+            co.signal = dynv::NIL;
+            co.frames = Vec::new();
+            co.regs = Vec::new();
+        }
+    }
+
+    /// Ends a coroutine an error escaped (one lookup in the tracing
+    /// profile): `returned` when it was closing and the error is its close
+    /// signal (rule 11), else `failed` with the error. Returns whether the
+    /// close succeeded.
+    #[inline(always)]
+    fn end_escaped(&mut self, prog: &Program, coro: u64, value: u64) -> bool {
+        if self.heap.rc {
+            let Some(closed) = self
+                .heap
+                .coro(coro)
+                .map(|co| co.closing && value == co.signal)
+            else {
+                return false;
+            };
+            if closed {
+                self.end_coro_counted(prog, coro, CoroState::Returned, dynv::NIL);
+            } else {
+                self.end_coro_counted(prog, coro, CoroState::Failed, value);
+            }
+            return closed;
+        }
+        let Some(co) = self.heap.coro_mut(coro) else {
+            return false;
+        };
+        let closed = co.closing && value == co.signal;
+        co.state = if closed {
+            CoroState::Returned
+        } else {
+            CoroState::Failed
+        };
+        co.result = if closed { dynv::NIL } else { value };
+        co.closing = false;
+        co.signal = dynv::NIL;
+        co.frames = Vec::new();
+        co.regs = Vec::new();
+        closed
+    }
+
+    /// [`end_coro`](Machine::end_coro) with counts (RC).
+    fn end_coro_counted(&mut self, prog: &Program, coro: u64, state: CoroState, result: u64) {
+        let Some(co) = self.heap.coro_mut(coro) else {
+            return;
+        };
+        co.state = state;
+        co.closing = false;
+        let old_result = core::mem::replace(&mut co.result, result);
+        let old_signal = core::mem::replace(&mut co.signal, dynv::NIL);
+        let frames = core::mem::take(&mut co.frames);
+        let regs = core::mem::take(&mut co.regs);
+        self.heap.swap(result, old_result);
+        self.heap.dec(old_signal);
+        for f in &frames {
+            self.heap.dec(f.closure);
+            let refs = prog.func(f.func).map_or(&[][..], |i| &i.ref_regs[..]);
+            for &r in refs {
+                if let Some(&w) = regs.get(f.base + usize::from(r)) {
+                    self.heap.dec(w);
+                }
+            }
         }
     }
 
@@ -201,7 +377,11 @@ impl Machine {
     /// `CannotSuspend` when no coroutine is running, or the `OutOfMemory`
     /// trap when the suspended stack does not fit the memory budget.
     /// `key` is the new key and largest-integer-key for a `yield`.
-    pub(crate) fn coro_suspend(
+    // Inlined into the coroutine executor, as alpha.3 had it: with one
+    // executor per memory profile there are two callers, which otherwise
+    // keeps the switch path out of line.
+    #[inline(always)]
+    pub(crate) fn coro_suspend<const RC: bool>(
         &mut self,
         stack: &mut Vec<u64>,
         state: CoroState,
@@ -212,12 +392,7 @@ impl Machine {
         let Some(&act) = self.coros.last() else {
             return Err(Fault::raise(ErrorKind::CannotSuspend));
         };
-        let Machine {
-            heap,
-            frames,
-            coros,
-            ..
-        } = self;
+        let Machine { heap, frames, .. } = self;
         let Some(body) = frames.get(act.floor) else {
             return Err(Fault::raise(ErrorKind::CannotSuspend));
         };
@@ -250,18 +425,20 @@ impl Machine {
         }));
         co.state = state;
         co.resume_dst = dst;
-        co.payload = payload;
+        let old_payload = core::mem::replace(&mut co.payload, payload);
+        let mut old_key = dynv::NIL;
         if let Some((k, max)) = key {
-            co.key = k;
+            old_key = core::mem::replace(&mut co.key, k);
             co.max_key = max;
         }
+        let mut old_signal = dynv::NIL;
         let event = if state == CoroState::Awaiting {
             Event::Awaiting(payload)
         } else if co.closing {
             // Rule 11: a coroutine being closed that yields stays suspended
             // at that yield, no longer closing, and its closer is told.
             co.closing = false;
-            co.signal = dynv::NIL;
+            old_signal = core::mem::replace(&mut co.signal, dynv::NIL);
             Event::CloseIgnored
         } else {
             Event::Yielded {
@@ -269,38 +446,56 @@ impl Machine {
                 key: co.key,
             }
         };
-        let _ = coros.pop();
+        if RC {
+            heap.suspend_counts(
+                (payload, old_payload),
+                key.map(|(k, _)| (k, old_key)),
+                old_signal,
+            );
+        }
+        let _ = self.pop_active::<RC>();
         Ok((act.driver, event))
     }
 
     /// Hands a suspension to its driver. The driver's frame (if any) is now
     /// the top frame, at the driving instruction; an error returned here is
     /// raised there.
-    pub(crate) fn deliver(
+    // Inlined into the coroutine executor, as alpha.3 had it: with one
+    // executor per memory profile there are two callers, which otherwise
+    // keeps the switch path out of line.
+    #[inline(always)]
+    pub(crate) fn deliver<const RC: bool>(
         &mut self,
         stack: &mut [u64],
+        prog: &Program,
         driver: Driver,
         event: Event,
     ) -> Result<(), Fault> {
         match driver {
             Driver::Resume(dst) => match event {
                 Event::Yielded { payload, .. } | Event::Awaiting(payload) => {
-                    self.coro_send(stack, dst, payload);
+                    self.coro_send::<RC>(stack, prog, dst, payload);
                     Ok(())
                 }
                 Event::CloseIgnored => Err(Fault::raise(ErrorKind::CloseIgnored)),
             },
             Driver::Iter { has, val, iter } => match event {
                 Event::Yielded { payload, key } => {
-                    if let Some(Object::Iter(it)) = self.heap.get_mut(iter) {
-                        it.key = Some(key);
-                    }
-                    if let Some(top) = self.frames.last() {
-                        if let Some(slot) = stack.get_mut(top.base + usize::from(val)) {
-                            *slot = payload;
+                    if RC {
+                        self.set_iter_key(iter, key);
+                        let fi = self.frames.len().wrapping_sub(1);
+                        self.set_reg(stack, prog, fi, val, payload);
+                    } else {
+                        if let Some(Object::Iter(it)) = self.heap.get_mut(iter) {
+                            it.key = Some(key);
+                        }
+                        if let Some(top) = self.frames.last() {
+                            if let Some(slot) = stack.get_mut(top.base + usize::from(val)) {
+                                *slot = payload;
+                            }
                         }
                     }
-                    self.coro_send(stack, has, 1);
+                    self.coro_send::<RC>(stack, prog, has, 1);
                     Ok(())
                 }
                 // Rule 7: an async coroutine cannot be iterated synchronously.
@@ -316,7 +511,7 @@ impl Machine {
                 Ok(())
             }
             Driver::Finalize => {
-                self.set_finalizing(false);
+                self.end_finalizer();
                 Ok(())
             }
         }
@@ -327,28 +522,40 @@ impl Machine {
     /// (rule 3).
     #[cold]
     #[inline(never)]
-    pub(crate) fn coro_returned(&mut self, stack: &mut [u64], value: u64) {
-        let Some(act) = self.coros.pop() else {
+    pub(crate) fn coro_returned(&mut self, stack: &mut [u64], prog: &Program, value: u64) {
+        let Some(&act) = self.coros.last() else {
             return;
         };
-        if let Some(co) = self.heap.coro_mut(act.coro) {
-            finish(co, CoroState::Returned, value);
+        self.end_coro(prog, act.coro, CoroState::Returned, value);
+        let _ = self.pop_active_dyn();
+        self.deliver_return(stack, prog, act.driver, value);
+    }
+
+    /// Sets the key an iterator over a coroutine reports (counted, RC).
+    #[inline(never)]
+    fn set_iter_key(&mut self, iter: u64, key: u64) {
+        let old = match self.heap.get_mut(iter) {
+            Some(Object::Iter(it)) => it.key.replace(key),
+            _ => return,
+        };
+        self.heap.inc(key);
+        if let Some(old) = old {
+            self.heap.dec(old);
         }
-        self.deliver_return(stack, act.driver, value);
     }
 
     /// Delivers a return value (never fails).
-    fn deliver_return(&mut self, stack: &mut [u64], driver: Driver, value: u64) {
+    fn deliver_return(&mut self, stack: &mut [u64], prog: &Program, driver: Driver, value: u64) {
         match driver {
-            Driver::Resume(dst) => self.coro_send(stack, dst, value),
+            Driver::Resume(dst) => self.coro_send_dyn(stack, prog, dst, value),
             Driver::Iter { has, iter, .. } => {
                 if let Some(Object::Iter(it)) = self.heap.get_mut(iter) {
                     it.done = true;
                 }
-                self.coro_send(stack, has, 0);
+                self.coro_send_dyn(stack, prog, has, 0);
             }
             Driver::Host => self.outcome = Some(Stop::Returned(value)),
-            Driver::Finalize => self.set_finalizing(false),
+            Driver::Finalize => self.end_finalizer(),
         }
     }
 
@@ -359,24 +566,20 @@ impl Machine {
     /// search continues in the driver's frame, at the driving instruction.
     #[cold]
     #[inline(never)]
-    pub(crate) fn coro_escaped(&mut self, stack: &mut [u64], value: u64, at: (u32, u32)) -> bool {
-        let Some(act) = self.coros.pop() else {
+    pub(crate) fn coro_escaped(
+        &mut self,
+        stack: &mut [u64],
+        prog: &Program,
+        value: u64,
+        at: (u32, u32),
+    ) -> bool {
+        let Some(&act) = self.coros.last() else {
             return false;
         };
-        let closed = match self.heap.coro_mut(act.coro) {
-            Some(co) => {
-                let closed = co.closing && value == co.signal;
-                if closed {
-                    finish(co, CoroState::Returned, dynv::NIL);
-                } else {
-                    finish(co, CoroState::Failed, value);
-                }
-                closed
-            }
-            None => false,
-        };
+        let closed = self.end_escaped(prog, act.coro, value);
+        let _ = self.pop_active_dyn();
         if closed {
-            self.deliver_return(stack, act.driver, dynv::NIL);
+            self.deliver_return(stack, prog, act.driver, dynv::NIL);
             return true;
         }
         match act.driver {
@@ -387,7 +590,7 @@ impl Machine {
             Driver::Finalize => {
                 // A drop-close's error has no one to go to (CPython reports
                 // it as "unraisable"); it is discarded.
-                self.set_finalizing(false);
+                self.end_finalizer();
                 true
             }
             Driver::Resume(_) | Driver::Iter { .. } => false,
@@ -396,11 +599,10 @@ impl Machine {
 
     /// Ends every running coroutine after a run aborted (a trap): their
     /// frames are gone, so they are `failed`.
-    pub(crate) fn abort_coros(&mut self) {
-        for act in self.coros.drain(..) {
-            if let Some(co) = self.heap.coro_mut(act.coro) {
-                finish(co, CoroState::Failed, dynv::NIL);
-            }
+    pub(crate) fn abort_coros(&mut self, prog: &Program) {
+        while let Some(&act) = self.coros.last() {
+            self.end_coro(prog, act.coro, CoroState::Failed, dynv::NIL);
+            let _ = self.pop_active_dyn();
         }
         self.set_finalizing(false);
         self.outcome = None;
@@ -416,48 +618,119 @@ impl Machine {
         };
         if !co.task && co.state.is_resumable() {
             co.task = true;
-            self.sched.ready.push_back((w, Wake::Send(dynv::NIL)));
+            self.sched_push(w, Wake::Send(dynv::NIL));
         }
         Ok(w)
     }
 
-    /// Enters the oldest dropped coroutine still suspended on top of the
-    /// current frames to close it (rule 13); the caller raises the close
-    /// signal (`nil`) at its suspension point, and the [`Driver::Finalize`]
-    /// delivery ends it. A coroutine the limits cannot hold is skipped (it
-    /// stays suspended and is freed when next found unreachable). Returns
-    /// whether one was entered.
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn start_finalizer(&mut self, stack: &mut Vec<u64>) -> bool {
-        self.unbank();
-        while let Some(c) = self.finalize.pop_front() {
-            let suspended = self
-                .heap
-                .coro(c)
-                .is_some_and(|co| matches!(co.state, CoroState::Yielded | CoroState::Awaiting));
-            if !suspended {
-                continue;
-            }
-            if self.coro_enter(stack, c, Driver::Finalize).is_err() {
-                continue;
-            }
-            if let Some(co) = self.heap.coro_mut(c) {
-                co.closing = true;
-                co.signal = dynv::NIL;
-            }
-            self.set_finalizing(true);
-            return true;
-        }
-        self.set_finalizing(false);
-        false
+    /// Queues a task to run (the scheduler holds it and its wake value).
+    pub(crate) fn sched_push(&mut self, task: u64, wake: Wake) {
+        self.heap.inc(task);
+        let (Wake::Send(v) | Wake::Throw(v)) = wake;
+        self.heap.inc(v);
+        self.sched.ready.push_back((task, wake));
     }
 
-    /// Records whether a drop-close is running; when none is and some are
-    /// queued, arms the next fuel charge to start one.
+    /// Gives up what a ready entry the scheduler popped held.
+    pub(crate) fn sched_release(&mut self, task: u64, wake: Wake) {
+        self.heap.dec(task);
+        let (Wake::Send(v) | Wake::Throw(v)) = wake;
+        self.heap.dec(v);
+    }
+
+    /// Records a task waiting for another (the scheduler holds both).
+    pub(crate) fn sched_wait(&mut self, target: u64, task: u64) {
+        self.heap.inc(target);
+        self.heap.inc(task);
+        self.sched.waiters.entry(target).or_default().push(task);
+    }
+
+    /// Wakes the waiters of a finished task with `wake`, giving up what the
+    /// waiting entries held.
+    pub(crate) fn sched_wake(&mut self, target: u64, wake: Wake) {
+        let Some(waiters) = self.sched.waiters.remove(&target) else {
+            return;
+        };
+        self.heap.dec(target);
+        for w in waiters {
+            self.sched_push(w, wake);
+            self.heap.dec(w);
+        }
+    }
+
+    /// Empties the scheduler (the end of `run_async`), giving up what it
+    /// held: unfinished tasks are dropped.
+    pub(crate) fn sched_clear(&mut self) {
+        let ready = core::mem::take(&mut self.sched.ready);
+        for (t, wake) in ready {
+            self.sched_release(t, wake);
+        }
+        let waiters = core::mem::take(&mut self.sched.waiters);
+        for (t, ws) in waiters {
+            self.heap.dec(t);
+            for w in ws {
+                self.heap.dec(w);
+            }
+        }
+    }
+
+    /// Starts the oldest queued finalization on top of the current frames:
+    /// a dropped coroutine still suspended is entered to be closed (rule 13;
+    /// the caller raises the close signal, `nil`, at its suspension point,
+    /// and the [`Driver::Finalize`] delivery ends it), an object with a
+    /// destructor gets a [`Cont::Finalizer`] frame calling it. One the limits
+    /// cannot hold is skipped (it is freed when next found unreachable, or,
+    /// in the RC profile, when its count reaches zero).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn start_finalizer(&mut self, stack: &mut Vec<u64>, prog: &Program) -> Started {
+        self.unbank();
+        while let Some(c) = self.finalize.pop_front() {
+            // Tracing, a dropped coroutine: the common case, started directly
+            // (the queue holds no count).
+            if !self.heap.rc {
+                if let Some(co) = self.heap.coro(c) {
+                    if !matches!(co.state, CoroState::Yielded | CoroState::Awaiting) {
+                        continue;
+                    }
+                    if self
+                        .coro_enter::<false>(stack, c, Driver::Finalize)
+                        .is_err()
+                    {
+                        continue;
+                    }
+                    if let Some(co) = self.heap.coro_mut(c) {
+                        co.closing = true;
+                        co.signal = dynv::NIL;
+                    }
+                    self.heap.stats.finalized += 1;
+                    self.set_finalizing(true);
+                    return Started::Close;
+                }
+            }
+            let started = self.start_queued(stack, prog, c);
+            // The queue's hold (RC) passes to the code now holding it.
+            self.heap.dec(c);
+            let Some(s) = started else {
+                continue;
+            };
+            self.set_finalizing(true);
+            return match s {
+                Settled::Close => Started::Close,
+                _ => Started::Call,
+            };
+        }
+        self.set_finalizing(false);
+        Started::None
+    }
+
+    /// Records whether a finalization is running; when none is and some are
+    /// queued, arms the next fuel charge to start one. The RC profile starts
+    /// queued finalizations at instruction boundaries instead, and never
+    /// arms a charge.
     pub(crate) fn set_finalizing(&mut self, running: bool) {
         self.finalizing = running;
-        self.close_ready = !running && !self.finalize.is_empty();
+        self.close_ready = !running && !self.finalize.is_empty() && !self.heap.rc;
         self.arm_close();
     }
 
@@ -487,7 +760,12 @@ impl Machine {
     /// instruction) the close stays armed for the next charge.
     #[cold]
     #[inline(never)]
-    pub(crate) fn charge_slow(&mut self, stack: &mut Vec<u64>, at: Option<(usize, u32)>) -> Charge {
+    pub(crate) fn charge_slow(
+        &mut self,
+        stack: &mut Vec<u64>,
+        prog: &Program,
+        at: Option<(usize, u32)>,
+    ) -> Charge {
         self.unbank();
         if self.fuel == 0 {
             return Charge::Spent;
@@ -497,8 +775,10 @@ impl Machine {
                 if let Some(f) = self.frames.get_mut(fi) {
                     f.pc = pc;
                 }
-                if self.start_finalizer(stack) {
-                    return Charge::Close;
+                match self.start_finalizer(stack, prog) {
+                    Started::Close => return Charge::Close,
+                    Started::Call => return Charge::Call,
+                    Started::None => {}
                 }
             }
         }
@@ -508,14 +788,15 @@ impl Machine {
     }
 }
 
-/// Marks a coroutine finished and releases its stack.
-fn finish(co: &mut CoroObj, state: CoroState, result: u64) {
-    co.state = state;
-    co.result = result;
-    co.closing = false;
-    co.signal = dynv::NIL;
-    co.frames = Vec::new();
-    co.regs = Vec::new();
+/// What [`Machine::start_finalizer`] started.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Started {
+    /// Nothing (the queue held nothing that still needs code).
+    None,
+    /// A coroutine's close: raise its drop signal at its suspension point.
+    Close,
+    /// A destructor's frame: continue in it.
+    Call,
 }
 
 /// The key of a `yield` (rule 10, PHP's generators): one more than the
@@ -531,7 +812,7 @@ fn auto_key(m: &mut Machine, largest: i64) -> Result<(u64, i64), Fault> {
 /// Executes one coroutine instruction (`0xF0`..=`0xFC`). Every one charges
 /// one unit of fuel first and is a safepoint (LSB §5.13, §5.14).
 #[allow(clippy::too_many_lines)]
-pub(crate) fn exec(
+pub(crate) fn exec<const RC: bool>(
     m: &mut Machine,
     stack: &mut Vec<u64>,
     prog: &Program,
@@ -555,17 +836,33 @@ pub(crate) fn exec(
     }
     macro_rules! charge {
         () => {
-            if let Some(step) = crate::exec::charge(m, stack, fi, pc) {
+            if let Some(step) = crate::exec::charge(m, stack, prog, fi, pc) {
                 return step;
             }
         };
     }
     macro_rules! gc {
         ($extra:expr) => {
-            if m.heap.wants_gc($extra) {
+            let wants = if RC {
+                m.heap.wants_cycles($extra)
+            } else {
+                m.heap.wants_gc($extra)
+            };
+            if wants {
                 m.collect(stack, prog);
             }
         };
+    }
+    // A register write, counted in the RC profile.
+    macro_rules! w {
+        ($dst:expr, $v:expr) => {{
+            let v = $v;
+            if RC {
+                m.set_reg(stack, prog, fi, ($dst).0, v);
+            } else {
+                stack[base + ($dst).index()] = v;
+            }
+        }};
     }
     charge!();
     match inst {
@@ -578,19 +875,22 @@ pub(crate) fn exec(
             args.extend_from_slice(&stack[first..first + usize::from(argc)]);
             let made = m.coro_create(prog, func.0, dynv::NIL, &args);
             m.scratch = args;
-            r!(dst) = t!(made);
+            w!(dst, t!(made));
             Step::Next
         }
         Inst::CoroNewIndirect { dst, callee, argc } => {
-            r!(dst) = t!(indirect(
-                m,
-                stack,
-                prog,
-                cx,
-                dst.index(),
-                callee.index(),
-                argc
-            ));
+            w!(
+                dst,
+                t!(indirect(
+                    m,
+                    stack,
+                    prog,
+                    cx,
+                    dst.index(),
+                    callee.index(),
+                    argc
+                ))
+            );
             Step::Next
         }
         Inst::Spawn { dst, callee, argc } => {
@@ -610,7 +910,7 @@ pub(crate) fn exec(
             // The hook invocation is charged as every hook invocation is. The
             // coroutine already exists, so no close may start here.
             if m.fuel == 0 {
-                if m.charge_slow(stack, None) == Charge::Spent {
+                if m.charge_slow(stack, prog, None) == Charge::Spent {
                     return Step::Fault(Fault::Trap(ErrorKind::OutOfFuel));
                 }
             } else {
@@ -620,12 +920,13 @@ pub(crate) fn exec(
                 bytecode_lang::Callee::Func(hf) => {
                     let hb = t!(m.push_frame(stack, prog, hf.0, dynv::NIL, Cont::Value(dst.0)));
                     stack[hb] = c;
+                    m.adopt_args(stack, prog, hf.0, hb, 1);
                     m.frames[fi].pc = pc as u32;
                     Step::Frame
                 }
                 bytecode_lang::Callee::Import(hi) => {
                     let res = t!(m.call_host_dyn(prog, hi.0, &[c]));
-                    t!(m.apply_cont(stack, Cont::Value(dst.0), res, Some(ValType::Dyn)));
+                    t!(m.apply_cont(stack, prog, Cont::Value(dst.0), res, Some(ValType::Dyn)));
                     Step::Next
                 }
             }
@@ -656,8 +957,8 @@ pub(crate) fn exec(
                 }
             };
             m.frames[fi].pc = pc as u32;
-            let (driver, event) = t!(m.coro_suspend(stack, state, dst.0, payload, key));
-            match m.deliver(stack, driver, event) {
+            let (driver, event) = t!(m.coro_suspend::<RC>(stack, state, dst.0, payload, key));
+            match m.deliver::<RC>(stack, prog, driver, event) {
                 Ok(()) => Step::Frame,
                 Err(f) => Step::Unwind(f),
             }
@@ -666,9 +967,9 @@ pub(crate) fn exec(
             gc!(0);
             let (c, sent) = (r!(coro), r!(src));
             m.frames[fi].pc = pc as u32;
-            match t!(m.coro_enter(stack, c, Driver::Resume(dst.0))) {
+            match t!(m.coro_enter::<RC>(stack, c, Driver::Resume(dst.0))) {
                 Entered::Fresh => {}
-                Entered::Suspended(d) => m.coro_send(stack, d, sent),
+                Entered::Suspended(d) => m.coro_send::<RC>(stack, prog, d, sent),
             }
             Step::Frame
         }
@@ -678,13 +979,11 @@ pub(crate) fn exec(
             // Rule 4: on a created coroutine nothing runs; it fails and the
             // error is raised here.
             if t!(m.coro_state(c)) == CoroState::Created {
-                if let Some(co) = m.heap.coro_mut(c) {
-                    finish(co, CoroState::Failed, err);
-                }
+                m.end_coro(prog, c, CoroState::Failed, err);
                 return Step::Fault(Fault::Throw(err));
             }
             m.frames[fi].pc = pc as u32;
-            let _ = t!(m.coro_enter(stack, c, Driver::Resume(dst.0)));
+            let _ = t!(m.coro_enter::<RC>(stack, c, Driver::Resume(dst.0)));
             // Raised at the suspension point: the suspended frames' handlers
             // are searched from the suspending pc outward.
             Step::Unwind(Fault::Throw(err))
@@ -694,23 +993,25 @@ pub(crate) fn exec(
             let (c, signal) = (r!(coro), r!(src));
             match t!(m.coro_state(c)) {
                 CoroState::Created => {
-                    if let Some(co) = m.heap.coro_mut(c) {
-                        finish(co, CoroState::Returned, dynv::NIL);
-                    }
-                    r!(dst) = dynv::NIL;
+                    m.end_coro(prog, c, CoroState::Returned, dynv::NIL);
+                    w!(dst, dynv::NIL);
                     Step::Next
                 }
                 CoroState::Returned | CoroState::Failed => {
-                    r!(dst) = dynv::NIL;
+                    w!(dst, dynv::NIL);
                     Step::Next
                 }
                 CoroState::Yielded | CoroState::Awaiting => {
                     m.frames[fi].pc = pc as u32;
-                    let _ = t!(m.coro_enter(stack, c, Driver::Resume(dst.0)));
-                    if let Some(co) = m.heap.coro_mut(c) {
-                        co.closing = true;
-                        co.signal = signal;
-                    }
+                    let _ = t!(m.coro_enter::<RC>(stack, c, Driver::Resume(dst.0)));
+                    let old = match m.heap.coro_mut(c) {
+                        Some(co) => {
+                            co.closing = true;
+                            core::mem::replace(&mut co.signal, signal)
+                        }
+                        None => dynv::NIL,
+                    };
+                    m.heap.swap(signal, old);
                     Step::Unwind(Fault::Throw(signal))
                 }
                 // Running (itself or one of its resumers): it cannot be
@@ -719,17 +1020,17 @@ pub(crate) fn exec(
             }
         }
         Inst::CoroStatus { dst, coro } => {
-            r!(dst) = u64::from(t!(m.coro_state(r!(coro))).code());
+            w!(dst, u64::from(t!(m.coro_state(r!(coro))).code()));
             Step::Next
         }
         Inst::CoroCurrent { dst } => {
-            r!(dst) = m.coros.last().map_or(dynv::NIL, |a| a.coro);
+            w!(dst, m.coros.last().map_or(dynv::NIL, |a| a.coro));
             Step::Next
         }
         Inst::CoroKey { dst, coro } => {
             let c = r!(coro);
             match m.heap.coro(c) {
-                Some(co) => r!(dst) = co.key,
+                Some(co) => w!(dst, co.key),
                 None => return Step::Fault(not_a(&m.heap, c)),
             }
             Step::Next
@@ -737,7 +1038,7 @@ pub(crate) fn exec(
         Inst::CoroResult { dst, coro } => {
             let c = r!(coro);
             match m.heap.coro(c) {
-                Some(co) if co.state == CoroState::Returned => r!(dst) = co.result,
+                Some(co) if co.state == CoroState::Returned => w!(dst, co.result),
                 Some(_) => return Step::Fault(Fault::raise(ErrorKind::InvalidCoroState)),
                 None => return Step::Fault(not_a(&m.heap, c)),
             }
@@ -752,7 +1053,7 @@ pub(crate) fn exec(
 /// `nil` and lets the delivery fill `has`/`val`. Charged like a coroutine
 /// instruction.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn iter_next(
+pub(crate) fn iter_next<const RC: bool>(
     m: &mut Machine,
     stack: &mut Vec<u64>,
     prog: &Program,
@@ -761,8 +1062,8 @@ pub(crate) fn iter_next(
     (has, iter, val): (u16, u64, u16),
     src: u64,
 ) -> Step {
-    let Cx { base, fi, .. } = *cx;
-    if let Some(step) = crate::exec::charge(m, stack, fi, pc) {
+    let Cx { fi, .. } = *cx;
+    if let Some(step) = crate::exec::charge(m, stack, prog, fi, pc) {
         return step;
     }
     let done = matches!(m.heap.get(iter), Some(Object::Iter(i)) if i.done);
@@ -774,20 +1075,20 @@ pub(crate) fn iter_next(
         if let Some(Object::Iter(i)) = m.heap.get_mut(iter) {
             i.done = true;
         }
-        stack[base + usize::from(has)] = 0;
+        m.set_reg(stack, prog, fi, has, 0);
         return Step::Next;
     }
     if state == CoroState::Awaiting {
         return Step::Fault(Fault::type_error());
     }
-    if m.heap.wants_gc(0) {
+    if m.wants_gc(0) {
         m.collect(stack, prog);
     }
     m.frames[fi].pc = pc as u32;
-    match m.coro_enter(stack, src, Driver::Iter { has, val, iter }) {
+    match m.coro_enter::<RC>(stack, src, Driver::Iter { has, val, iter }) {
         Ok(Entered::Fresh) => Step::Frame,
         Ok(Entered::Suspended(d)) => {
-            m.coro_send(stack, d, dynv::NIL);
+            m.coro_send::<RC>(stack, prog, d, dynv::NIL);
             Step::Frame
         }
         Err(f) => Step::Fault(f),
@@ -831,7 +1132,7 @@ fn indirect(
     }
     // Collect first: nothing below collects, so the references and rest
     // collections the binding allocates live until the coroutine holds them.
-    if m.heap.wants_gc(body.nregs * 8) {
+    if m.wants_gc(body.nregs * 8) {
         m.collect(stack, prog);
     }
     let first = base + dst + 1;
@@ -842,9 +1143,10 @@ fn indirect(
         let list = bind::params_of(prog, target);
         let sig = &body.regs[..body.nparams];
         let mut bound = core::mem::take(&mut m.bound);
-        let built = bind::bind(prog, list, sig.len(), None, argc, &mut bound).and_then(|mask| {
-            bind::build_args(m, prog, list, sig, window, None, &bound, mask, &mut args)
-        });
+        let built =
+            bind::bind(prog, (list, None), sig.len(), None, argc, &mut bound).and_then(|mask| {
+                bind::build_args(m, prog, list, sig, window, None, &bound, mask, &mut args)
+            });
         m.bound = bound;
         built.and_then(|()| m.coro_create(prog, func, cv, &args))
     } else {

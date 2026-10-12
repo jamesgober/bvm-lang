@@ -281,6 +281,7 @@ pub(crate) fn eq_builtin(heap: &Heap, a: u64, b: u64) -> Option<bool> {
 }
 
 /// The built-in part of `dlt` (`le` false) and `dle` (`le` true).
+#[inline(always)]
 pub(crate) fn lt_builtin(heap: &Heap, a: u64, b: u64, le: bool) -> Option<bool> {
     let ord = if let (Some(x), Some(y)) = (conv::dyn_num(heap, a), conv::dyn_num(heap, b)) {
         // NaN compares false either way.

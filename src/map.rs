@@ -127,11 +127,13 @@ impl MapStore {
         }
     }
 
-    /// Overwrites the value of the entry at `pos`.
+    /// Overwrites the value of the entry at `pos`, returning the value it
+    /// replaced (`0`, nil, when there is no such entry).
     #[inline]
-    pub(crate) fn set_value(&mut self, pos: usize, value: u64) {
-        if let Some(e) = self.entries.get_mut(pos) {
-            e.value = value;
+    pub(crate) fn set_value(&mut self, pos: usize, value: u64) -> u64 {
+        match self.entries.get_mut(pos) {
+            Some(e) => core::mem::replace(&mut e.value, value),
+            None => 0,
         }
     }
 
@@ -219,17 +221,22 @@ impl MapStore {
     }
 
     /// Removes the live entry at `pos`; the others keep their order.
-    pub(crate) fn remove(&mut self, pos: usize) {
+    /// Returns its key and value. The dead entry keeps neither (its words
+    /// become nil), so the only words a store holds are its live entries'
+    /// (what the reference-counting profile counts).
+    pub(crate) fn remove(&mut self, pos: usize) -> Option<(u64, u64)> {
         if !self.hashed {
             self.make_hashed();
         }
-        let Some(e) = self.entries.get_mut(pos) else {
-            return;
-        };
+        let e = self.entries.get_mut(pos)?;
         if !e.live {
-            return;
+            return None;
         }
         e.live = false;
+        let removed = (
+            core::mem::replace(&mut e.key, 0),
+            core::mem::replace(&mut e.value, 0),
+        );
         let hash = e.hash;
         self.live -= 1;
         self.unplace(hash, pos as u32);
@@ -237,6 +244,7 @@ impl MapStore {
         if dead > 16 && dead > self.live {
             self.compact();
         }
+        Some(removed)
     }
 
     /// The position of the next live entry after `cursor`, advancing it.
@@ -384,7 +392,7 @@ mod tests {
         for k in (0..100u64).step_by(3) {
             let pos = m.find(h(k), Some(i128::from(k)), |x| x == k);
             assert!(pos.is_some());
-            m.remove(pos.unwrap_or(0));
+            assert_eq!(m.remove(pos.unwrap_or(0)), Some((k, k * 10)));
         }
         for k in 0..100u64 {
             let expect = if k % 3 == 0 { None } else { Some(k * 10) };
@@ -412,7 +420,7 @@ mod tests {
         // Delete most entries (forces compaction), then append one.
         for k in 1..45u64 {
             if let Some(p) = m.find(h(k), None, |x| x == k) {
-                m.remove(p);
+                let _removed = m.remove(p);
             }
         }
         assert!(m.insert(h(500), 500, 500, None));

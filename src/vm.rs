@@ -10,11 +10,86 @@ use crate::dynv;
 use crate::error::VmError;
 use crate::exec;
 use crate::fault::Fault;
-use crate::heap::Object;
+use crate::heap::{NO_DTOR, Object};
 use crate::host;
 use crate::machine::{Machine, Stop, Wake};
 use crate::program::Program;
 use crate::value::{Obj, Value};
+
+/// How a VM manages memory: its *memory profile* (DECISIONS D22, the
+/// language's `[runtime] memory` key).
+///
+/// LSB semantics that depend on reference counts follow the profile: when a
+/// dropped suspended coroutine is closed (LSB §5.13 rule 13), when an
+/// object's destructor runs ([`Vm::set_destructor`]), and whether copying an
+/// array unbinds a PHP reference nothing else holds (LSB §5.17 "the one
+/// divergence"). Everything else (results, errors, fuel, globals) is the same
+/// under both: the differential tests run the same programs under both.
+///
+/// | | `Tracing` (default) | `Rc` |
+/// |---|---|---|
+/// | freeing | mark and sweep, when enough was allocated | at the last reference, before the next instruction |
+/// | garbage cycles | traced | trial-deletion cycle collector (PHP's), fuel-charged |
+/// | drop-close, destructors | at the next fuel charge point after the collection that found the object | at the last reference, before the next instruction (PHP's timing) |
+/// | copying an array or map holding a reference only it holds | the copy shares the reference (LSB's rule) | the copy holds the value (PHP's rule) |
+///
+/// # Examples
+///
+/// ```
+/// use bvm_lang::{Host, Memory, Program, Vm};
+/// use bytecode_lang::ModuleBuilder;
+///
+/// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+/// assert_eq!(Vm::new(&p).memory(), Memory::Tracing);
+/// assert_eq!(Vm::with_memory(&p, Memory::Rc).memory(), Memory::Rc);
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Memory {
+    /// A tracing collector (`[runtime] memory = "gc"`): Mercury and other
+    /// languages without deterministic finalization.
+    #[default]
+    Tracing,
+    /// Reference counting plus a cycle collector (`[runtime] memory =
+    /// "rc"`): PHP's model, for Mox and other PHP-compatible languages.
+    Rc,
+}
+
+/// What a VM's memory manager has done ([`Vm::memory_stats`]).
+///
+/// # Examples
+///
+/// ```
+/// use bvm_lang::{Host, Memory, Program, Vm};
+/// use bytecode_lang::ModuleBuilder;
+///
+/// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+/// let mut vm = Vm::with_memory(&p, Memory::Rc);
+/// vm.new_str(b"kept until the next run").unwrap();
+/// let stats = vm.memory_stats();
+/// assert_eq!((stats.live, stats.freed), (1, 0));
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct MemoryStats {
+    /// Collections run: tracing collections, or cycle collections in the
+    /// RC profile.
+    pub collections: u64,
+    /// Objects freed, by every means.
+    pub freed: u64,
+    /// Of those, freed by the RC cycle collector (garbage cycles).
+    pub cycle_freed: u64,
+    /// Finalizations started: destructors run and dropped coroutines closed.
+    pub finalized: u64,
+    /// RC: references unbound by a copy (PHP's rule that a copied array
+    /// drops a reference only it holds).
+    pub unbound: u64,
+    /// Live objects (exact in the RC profile; in the tracing profile, as of
+    /// the last collection plus what was allocated since).
+    pub live: usize,
+    /// Bytes charged against the memory budget.
+    pub bytes: usize,
+}
 
 /// The budgets a run executes under.
 ///
@@ -254,10 +329,191 @@ impl<'p> Vm<'p> {
     pub fn with_limits(program: &'p Program, limits: Limits) -> Vm<'p> {
         Vm {
             prog: program,
-            m: Machine::new(program, limits.memory),
+            m: Machine::new(program, limits.memory, false),
             limits,
             ready: false,
             fuel_used: 0,
+        }
+    }
+
+    /// An instance of `program` under a memory profile, with the default
+    /// [`Limits`]. The profile is fixed for the VM's life.
+    ///
+    /// # Examples
+    ///
+    /// Under [`Memory::Rc`] an object dies at its last reference: a string
+    /// the run made and dropped is gone when the run returns, without any
+    /// collection.
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Memory, Program, Vm};
+    /// use bytecode_lang::{Const, Inst, ModuleBuilder, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let k = m.constant(Const::Bytes(b"temporary".to_vec()));
+    /// let mut f = m.function("f", &[], &[]);
+    /// let (s, t) = (f.reg(ValType::Dyn), f.reg(ValType::Dyn));
+    /// f.emit(Inst::DLoadConst { dst: s, k });
+    /// f.emit(Inst::DConcat { dst: t, lhs: s, rhs: s });
+    /// f.emit(Inst::LoadNil { dst: t });
+    /// f.ret_void();
+    /// let f = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    ///
+    /// let mut vm = Vm::with_memory(&p, Memory::Rc);
+    /// vm.run(f, &[]).unwrap();
+    /// // The constant's string stays (its cache holds it); the concatenation
+    /// // died when `t` was overwritten.
+    /// assert_eq!(vm.heap_objects(), 1);
+    /// assert_eq!(vm.collections(), 0);
+    /// ```
+    #[must_use]
+    pub fn with_memory(program: &'p Program, memory: Memory) -> Vm<'p> {
+        let limits = Limits::new();
+        Vm {
+            prog: program,
+            m: Machine::new(program, limits.memory, memory == Memory::Rc),
+            limits,
+            ready: false,
+            fuel_used: 0,
+        }
+    }
+
+    /// The memory profile.
+    ///
+    /// # Examples
+    ///
+    /// See [`Memory`].
+    #[must_use]
+    pub fn memory(&self) -> Memory {
+        if self.m.heap.rc {
+            Memory::Rc
+        } else {
+            Memory::Tracing
+        }
+    }
+
+    /// Names the destructor method of struct types (PHP's `__destruct`,
+    /// Python's `__del__`): every struct type whose methods, its own or
+    /// inherited (as `get_prop` finds them), include one of this name has it
+    /// called with the instance as its one argument when the instance dies.
+    /// Returns how many struct types got a destructor; a name no method has
+    /// (the empty name, say) clears every destructor.
+    ///
+    /// When "dies" means follows the memory profile ([`Memory`]): under
+    /// [`Memory::Rc`] at the last reference, before the next instruction
+    /// (PHP's timing; an object in a garbage cycle when the cycle collector
+    /// finds it); under [`Memory::Tracing`] the collection that finds it
+    /// unreachable queues it, and it runs at the next fuel charge point (as
+    /// a dropped coroutine is closed), or on
+    /// [`run_finalizers`](Vm::run_finalizers). Either way a destructor runs
+    /// at most once per object; its result and any error escaping it are
+    /// discarded; it is charged fuel like any code; one the depth or
+    /// register limits cannot hold is skipped. An object a destructor stores
+    /// somewhere lives on (and is not destructed again). Objects still
+    /// reachable when the VM is dropped are not destructed (PHP's shutdown
+    /// pass is the host's call: drop its references, collect, and run the
+    /// finalizers).
+    ///
+    /// The format has no destructor flag (LSB 2); this names the method by
+    /// convention, as a language's runtime profile does.
+    ///
+    /// # Errors
+    ///
+    /// [`VmError::BadDestructor`] when a method found cannot take the
+    /// instance as its one argument (nothing is changed).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Memory, Program, Value, Vm};
+    /// use bytecode_lang::{Inst, Method, ModuleBuilder, StructDef, TypeDef, ValType};
+    ///
+    /// let mut m = ModuleBuilder::new();
+    /// let (name, dtor) = (m.string("Res"), m.string("__destruct"));
+    /// let res = m.reserve_type();
+    /// let log = m.global("log", ValType::I64, true, None);
+    /// // __destruct($this) { log = log + 1 }
+    /// let mut d = m.function("Res::__destruct", &[ValType::Dyn], &[]);
+    /// let (v, one) = (d.reg(ValType::I64), d.reg(ValType::I64));
+    /// d.emit(Inst::GetGlobal { dst: v, global: log });
+    /// d.emit(Inst::LoadInt { dst: one, val: 1, ty: bytecode_lang::IntTy::I64 });
+    /// d.emit(Inst::IAdd { dst: v, lhs: v, rhs: one, op: bytecode_lang::IntOp::new(bytecode_lang::IntTy::I64) });
+    /// d.emit(Inst::SetGlobal { global: log, src: v });
+    /// d.ret_void();
+    /// let d = m.add_function(d).unwrap();
+    /// m.define_type(res, TypeDef::Struct(StructDef {
+    ///     name,
+    ///     methods: vec![Method { name: dtor, func: d }],
+    ///     ..Default::default()
+    /// }));
+    /// // main() { o = new Res; o = nil; return log }  (the destructor runs at `o = nil`)
+    /// let mut f = m.function("main", &[], &[ValType::I64]);
+    /// let (o, r) = (f.reg(ValType::Dyn), f.reg(ValType::I64));
+    /// let ty = f.type_ref(res);
+    /// f.emit(Inst::NewStruct { dst: o, ty });
+    /// f.emit(Inst::LoadNil { dst: o });
+    /// f.emit(Inst::GetGlobal { dst: r, global: log });
+    /// f.ret(r);
+    /// let main = m.add_function(f).unwrap();
+    /// let p = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
+    ///
+    /// let mut vm = Vm::with_memory(&p, Memory::Rc);
+    /// assert_eq!(vm.set_destructor("__destruct"), Ok(1));
+    /// assert_eq!(vm.run(main, &[]), Ok(Value::Int(1)));
+    /// ```
+    pub fn set_destructor(&mut self, name: &str) -> Result<usize, VmError> {
+        let prog = self.prog;
+        let Some(id) = prog.module.strings().position(|s| s == name) else {
+            self.m.heap.dtors = Vec::new();
+            return Ok(0);
+        };
+        let id = u32::try_from(id).unwrap_or(u32::MAX);
+        let mut dtors = alloc::vec![NO_DTOR; prog.types.len()];
+        let mut found = 0;
+        for (t, slot) in dtors.iter_mut().enumerate() {
+            let t = u32::try_from(t).unwrap_or(u32::MAX);
+            if prog.struct_info(t).is_none() {
+                continue;
+            }
+            let Some(f) = exec::find_method(prog, t, id) else {
+                continue;
+            };
+            let fits = prog.func(f).is_some_and(|i| {
+                i.nparams == 1
+                    && i.captures.is_empty()
+                    && match i.regs.first() {
+                        Some(ValType::Dyn) => true,
+                        Some(ValType::Ref(a)) => prog.descends(t, a.0),
+                        _ => false,
+                    }
+            });
+            if !fits {
+                return Err(VmError::BadDestructor(FuncId(f)));
+            }
+            *slot = f;
+            found += 1;
+        }
+        self.m.heap.dtors = if found > 0 { dtors } else { Vec::new() };
+        Ok(found)
+    }
+
+    /// What the memory manager has done so far.
+    ///
+    /// # Examples
+    ///
+    /// See [`MemoryStats`].
+    #[must_use]
+    pub fn memory_stats(&self) -> MemoryStats {
+        let s = self.m.heap.stats;
+        MemoryStats {
+            collections: s.collections,
+            freed: s.freed,
+            cycle_freed: s.cycle_freed,
+            finalized: s.finalized,
+            unbound: s.unbound,
+            live: self.m.heap.len(),
+            bytes: self.m.heap.used(),
         }
     }
 
@@ -382,7 +638,7 @@ impl<'p> Vm<'p> {
         let words = self.entry_words(func, args)?;
         let prog = self.prog;
         let result = prog.func(func.0).and_then(|i| i.result);
-        let out = exec::execute(&mut self.m, prog, func.0, &words, fuel)?;
+        let out = exec::execute(&mut self.m, prog, func.0, &words, fuel, true)?;
         Ok(match (out, result) {
             (Some(w), Some(ty)) => conv::value_of(&self.m.heap, ty, w),
             _ => Value::Nil,
@@ -403,7 +659,7 @@ impl<'p> Vm<'p> {
                 kind: fault_kind(f),
             })?;
         if let Some(start) = prog.module.start() {
-            let _ = exec::execute(&mut self.m, prog, start.0, &[], fuel)?;
+            let _ = exec::execute(&mut self.m, prog, start.0, &[], fuel, false)?;
         }
         self.ready = true;
         Ok(())
@@ -495,7 +751,10 @@ impl<'p> Vm<'p> {
         self.m.max_stack = limits.stack;
         let mut fuel = limits.fuel;
         let result = self.async_inner(func, args, &mut fuel);
-        self.m.sched.clear();
+        // Unfinished tasks are dropped (closed when they die: at once in
+        // the RC profile, at a later collection when tracing).
+        self.m.sched_clear();
+        exec::settle_quiet(&mut self.m, self.prog);
         self.fuel_used = limits.fuel - fuel;
         result
     }
@@ -520,7 +779,9 @@ impl<'p> Vm<'p> {
         if let Some(c) = self.m.heap.coro_mut(main) {
             c.task = true;
         }
-        self.m.sched.ready.push_back((main, Wake::Send(dynv::NIL)));
+        self.m.sched_push(main, Wake::Send(dynv::NIL));
+        // The main task holds its arguments now (RC).
+        self.m.release_pins();
         loop {
             let Some((task, wake)) = self.m.sched.ready.pop_front() else {
                 // Nothing is ready, so every task left (the main one
@@ -529,61 +790,83 @@ impl<'p> Vm<'p> {
                     waiting: self.m.sched.len(),
                 });
             };
-            let stop = match self.m.heap.coro(task).map(|c| (c.state, c.result)) {
-                Some((CoroState::Returned, v)) => Stop::Returned(v),
-                Some((CoroState::Failed, e)) => Stop::Failed(e, func.0, 0),
-                // A task some bytecode is running cannot be resumed from
-                // here; it is not one the scheduler still owns.
-                Some((CoroState::Running, _)) | None => continue,
-                Some((CoroState::Created, _)) if matches!(wake, Wake::Throw(_)) => {
-                    let Wake::Throw(e) = wake else { continue };
-                    if let Some(c) = self.m.heap.coro_mut(task) {
-                        c.state = CoroState::Failed;
-                        c.result = e;
-                        c.frames = Vec::new();
-                        c.regs = Vec::new();
-                    }
-                    Stop::Failed(e, func.0, 0)
-                }
-                Some(_) => exec::drive(&mut self.m, prog, task, wake, fuel)?,
+            self.m.waking = Some((task, wake));
+            let stop = self.wake(func, task, wake, fuel);
+            // The popped entry's hold goes once the task has run (RC).
+            self.m.waking = None;
+            self.m.sched_release(task, wake);
+            let stop = match stop? {
+                Some(s) => s,
+                None => continue,
             };
-            let sched = &mut self.m.sched;
             match stop {
                 Stop::Yielded(_) | Stop::CloseIgnored => {
-                    sched.ready.push_back((task, Wake::Send(dynv::NIL)));
+                    self.m.sched_push(task, Wake::Send(dynv::NIL));
                 }
                 Stop::Awaiting(target) => match self.m.heap.coro_mut(target) {
                     Some(t) => match t.state {
-                        CoroState::Returned => sched.ready.push_back((task, Wake::Send(t.result))),
-                        CoroState::Failed => sched.ready.push_back((task, Wake::Throw(t.result))),
+                        CoroState::Returned => {
+                            let r = t.result;
+                            self.m.sched_push(task, Wake::Send(r));
+                        }
+                        CoroState::Failed => {
+                            let r = t.result;
+                            self.m.sched_push(task, Wake::Throw(r));
+                        }
                         _ => {
-                            if !t.task && t.state.is_resumable() {
+                            let start = !t.task && t.state.is_resumable();
+                            if start {
                                 t.task = true;
-                                sched.ready.push_back((target, Wake::Send(dynv::NIL)));
+                                self.m.sched_push(target, Wake::Send(dynv::NIL));
                             }
-                            sched.waiters.entry(target).or_default().push(task);
+                            self.m.sched_wait(target, task);
                         }
                     },
-                    None => sched.ready.push_back((task, Wake::Send(target))),
+                    None => self.m.sched_push(task, Wake::Send(target)),
                 },
                 Stop::Returned(v) => {
                     if task == main {
+                        self.m.pin(v);
                         return Ok(conv::dyn_value(&self.m.heap, v));
                     }
-                    for w in sched.waiters.remove(&task).unwrap_or_default() {
-                        sched.ready.push_back((w, Wake::Send(v)));
-                    }
+                    self.m.sched_wake(task, Wake::Send(v));
                 }
                 Stop::Failed(e, at_func, at_pc) => {
                     if task == main {
                         return Err(self.m.uncaught(e, at_func, at_pc));
                     }
-                    for w in sched.waiters.remove(&task).unwrap_or_default() {
-                        sched.ready.push_back((w, Wake::Throw(e)));
-                    }
+                    self.m.sched_wake(task, Wake::Throw(e));
                 }
             }
         }
+    }
+
+    /// Runs one ready task; `None` when the scheduler no longer owns it.
+    fn wake(
+        &mut self,
+        func: FuncId,
+        task: u64,
+        wake: Wake,
+        fuel: &mut u64,
+    ) -> Result<Option<Stop>, VmError> {
+        let prog = self.prog;
+        Ok(Some(
+            match self.m.heap.coro(task).map(|c| (c.state, c.result)) {
+                Some((CoroState::Returned, v)) => Stop::Returned(v),
+                Some((CoroState::Failed, e)) => Stop::Failed(e, func.0, 0),
+                // A task some bytecode is running cannot be resumed from
+                // here; it is not one the scheduler still owns.
+                Some((CoroState::Running, _)) | None => return Ok(None),
+                Some((CoroState::Created, _)) if matches!(wake, Wake::Throw(_)) => {
+                    let Wake::Throw(e) = wake else {
+                        return Ok(None);
+                    };
+                    self.m.end_coro(prog, task, CoroState::Failed, e);
+                    Stop::Failed(e, func.0, 0)
+                }
+                Some(_) => exec::drive(&mut self.m, prog, task, wake, fuel)?,
+            },
+        ))
     }
 
     /// Closes the dropped suspended coroutines a collection has queued
@@ -611,6 +894,10 @@ impl<'p> Vm<'p> {
     /// assert_eq!(vm.pending_finalizers(), 0);
     /// assert_eq!(vm.run_finalizers(), Ok(0));
     /// ```
+    ///
+    /// In the RC profile the queue holds what died outside a run (or when a
+    /// run ended abnormally) and the finalizable garbage a cycle collection
+    /// found; it is also drained at the next run's first instruction.
     pub fn run_finalizers(&mut self) -> Result<usize, VmError> {
         let limits = self.limits;
         self.m.heap.limit = limits.memory;
@@ -622,7 +909,8 @@ impl<'p> Vm<'p> {
         result
     }
 
-    /// Dropped suspended coroutines waiting to be closed (see
+    /// Dropped suspended coroutines waiting to be closed and objects
+    /// waiting for their destructor (see
     /// [`run_finalizers`](Vm::run_finalizers)).
     ///
     /// # Examples
@@ -752,13 +1040,31 @@ impl<'p> Vm<'p> {
     /// Collects now, keeping what globals and constant caches reach. Values
     /// from earlier runs that nothing else references are freed (their
     /// handles then read as `nil`), except suspended coroutines, which are
-    /// queued to be closed (LSB §5.13 rule 13): at the next run's first fuel
-    /// charge, or now with [`run_finalizers`](Vm::run_finalizers).
+    /// queued to be closed (LSB §5.13 rule 13), and objects with a
+    /// destructor, which are queued for it: at the next run's first fuel
+    /// charge (RC: first instruction), or now with
+    /// [`run_finalizers`](Vm::run_finalizers).
+    ///
+    /// In the RC profile everything else is already freed at its last
+    /// reference: this lets go of the values earlier runs handed out and
+    /// runs the cycle collector over every possible root.
     ///
     /// # Examples
     ///
     /// See [`heap_objects`](Vm::heap_objects).
     pub fn collect_garbage(&mut self) {
+        if self.m.heap.rc {
+            self.m.release_pins();
+            exec::settle_quiet(&mut self.m, self.prog);
+            self.m.collect_cycles(self.prog, true);
+            exec::settle_quiet(&mut self.m, self.prog);
+            #[cfg(debug_assertions)]
+            if self.m.heap.slots.len() <= 50_000 {
+                let checked = self.m.check_reachable(self.prog);
+                debug_assert!(checked.is_ok(), "{checked:?}");
+            }
+            return;
+        }
         let stack = core::mem::take(&mut self.m.stack);
         self.m.collect(&stack, self.prog);
         self.m.stack = stack;
@@ -833,15 +1139,14 @@ impl<'p> Vm<'p> {
     /// See [`kind`](Vm::kind).
     pub fn new_str(&mut self, bytes: &[u8]) -> Result<Value, VmError> {
         self.m.heap.limit = self.limits.memory;
-        self.m
-            .heap
-            .alloc_str(bytes)
-            .map(|w| Value::Obj(Obj(w)))
-            .map_err(|f| VmError::Trap {
-                kind: fault_kind(f),
-                func: FuncId(u32::MAX),
-                pc: 0,
-            })
+        let w = self.m.heap.alloc_str(bytes).map_err(|f| VmError::Trap {
+            kind: fault_kind(f),
+            func: FuncId(u32::MAX),
+            pc: 0,
+        })?;
+        // Held for the host until the next run (RC), like a run's result.
+        self.m.pin(w);
+        Ok(Value::Obj(Obj(w)))
     }
 
     /// The elements of an array value, as values (a reference slot as its
@@ -1071,5 +1376,83 @@ fn fault_kind(f: Fault) -> bytecode_lang::ErrorKind {
     match f {
         Fault::Raise(k) | Fault::RaiseWith(k, _) | Fault::Trap(k) => k,
         Fault::Throw(_) => bytecode_lang::ErrorKind::TypeError,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytecode_lang::{ErrorKind, Inst, IntTy, ModuleBuilder, TypeDef};
+
+    /// A program holding one array `n` times in another, then returning.
+    fn holders(n: usize) -> (Program, FuncId) {
+        let mut m = ModuleBuilder::new();
+        let at = m.add_type(TypeDef::Array(ValType::Dyn));
+        let mut f = m.function("main", &[], &[]);
+        let ty = f.type_ref(at);
+        let (len, a, x) = (
+            f.reg(ValType::I64),
+            f.reg(ValType::Dyn),
+            f.reg(ValType::Dyn),
+        );
+        let _ = f.emit(Inst::LoadInt {
+            dst: len,
+            val: 0,
+            ty: IntTy::I64,
+        });
+        let _ = f.emit(Inst::NewArray { dst: a, len, ty });
+        let _ = f.emit(Inst::NewArray { dst: x, len, ty });
+        for _ in 0..n {
+            let _ = f.emit(Inst::ArrayPush { arr: a, src: x });
+        }
+        let _ = f.ret_void();
+        let main = m.add_function(f).unwrap_or(FuncId(0));
+        let p = Program::load(m.finish().unwrap_or_default(), &crate::Host::new());
+        (p.unwrap_or_else(|e| panic!("{e}")), main)
+    }
+
+    /// A count that would pass its maximum sticks there: the object is never
+    /// freed again (its count is no longer exact), and the run ends with the
+    /// `OutOfMemory` trap at the next instruction boundary, never with
+    /// undefined behaviour or a panic. The VM stays usable.
+    #[test]
+    fn test_a_saturated_count_traps_and_its_object_is_never_freed() {
+        let (p, main) = holders(10);
+        let mut vm = Vm::with_memory(&p, Memory::Rc);
+        vm.m.heap.rc_max = 4;
+        // The register holds it once, the first three pushes take it to 4,
+        // the fourth push saturates: the trap comes before the fifth.
+        assert_eq!(
+            vm.run(main, &[]),
+            Err(VmError::Trap {
+                kind: ErrorKind::OutOfMemory,
+                func: main,
+                pc: 7,
+            })
+        );
+        let live = vm.heap_objects();
+        vm.collect_garbage();
+        assert_eq!(
+            vm.heap_objects(),
+            1,
+            "only the stuck array is left ({live} before)"
+        );
+        // Under the ceiling nothing traps, and everything goes.
+        let (p, main) = holders(2);
+        let mut vm = Vm::with_memory(&p, Memory::Rc);
+        vm.m.heap.rc_max = 4;
+        assert_eq!(vm.run(main, &[]), Ok(Value::Nil));
+        assert_eq!(vm.heap_objects(), 0);
+        assert_eq!(vm.run(main, &[]), Ok(Value::Nil), "the VM stays usable");
+    }
+
+    /// The tracing profile keeps no counts at all.
+    #[test]
+    fn test_tracing_keeps_no_counts() {
+        let (p, main) = holders(10);
+        let mut vm = Vm::new(&p);
+        vm.m.heap.rc_max = 1;
+        assert_eq!(vm.run(main, &[]), Ok(Value::Nil));
+        assert!(vm.m.heap.slots.iter().all(|s| s.rc == 0 && s.flags == 0));
     }
 }

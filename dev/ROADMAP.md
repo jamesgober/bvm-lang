@@ -252,11 +252,140 @@ Delivered:
 - `ls_pow` is correctly rounded except within about 2^-85 of a rounding
   boundary (one such case is in the vector table); deterministic either way.
 
-## v2.0.0-alpha.4 - Reference-counting memory profile (D22)
-- [ ] Refcounts plus a cycle collector behind the `contents_shared`/
+## v2.0.0-alpha.4 - Reference-counting memory profile (DONE, prepared 2026-10-12)
+DECISIONS D22, ISSUES P30 (the VM side), P33, and P34's runtime side.
+
+- [x] Refcounts plus a cycle collector behind the `contents_shared`/
       `is_aliased` seam, selected per program (`memory = "rc"`).
-- [ ] PHP's reference unbinding on copy, destructor and close-on-drop
-      timing at the last reference, as LSB specifies per profile.
+- [x] PHP's reference unbinding on copy, destructor and close-on-drop
+      timing at the last reference.
+- [x] Fuel-proportional parameter binding (P33).
+
+Delivered:
+- **The RC profile** (`Memory::Rc`, `Vm::with_memory`, `Vm::memory`):
+  counts in the existing slots (a `u32` and three collector bits in the
+  slot's padding, so the slot did not grow), kept by `Heap::inc`/`dec` at
+  every store of a counted location: reference-typed registers (the
+  dispatch loop's `w!` macro; the loop is compiled once per profile, so the
+  tracing loop is unchanged), frames' arguments and closures (adopted at
+  push, released at pop, tail call, unwind, and abnormal end), suspended
+  coroutine frames (moved, not recounted), object slots (fresh contents
+  adopted at allocation; struct, closure, and coroutine children through
+  `Heap::adopt`), array and map *storage* counted once per `Arc` (adopted
+  by the container that creates it, released by the one that drops the
+  last `Arc`, recounted by a copy-on-write copy), globals, caches (held for
+  the VM's life), the resume chain, the scheduler, and host values (pinned
+  until the next run or `collect_garbage`, the RC version of "valid until
+  the next run").
+- **Deferred freeing at instruction boundaries**: a count reaching zero
+  puts the word on the zero list; the RC dispatch loop settles it before
+  the next instruction (`Machine::settle`), so no word an instruction holds
+  goes stale mid-instruction, and order inside an instruction never
+  matters. Settling is iterative (the list is the work list) and follows
+  PHP's order (frames release their last register first so the first
+  settles first; objects release children in reverse for the same reason).
+  Destructors and drop-closes started there push a *floor* on the zero
+  list, so objects that died together are finalized one after another,
+  each with what its freeing releases, never nested in each other, while
+  what the running code drops is finalized inside it (PHP). Queued
+  finalizations start one at a time.
+- **The cycle collector** (`src/cycle.rs`): synchronous trial deletion
+  (Bacon and Rajan 2001), with shared storage as nodes keyed by `Arc`
+  address, finalizable garbage rescued with what it reaches (marked
+  destructed/finalized, queued), PHP's adaptive root threshold, work lists
+  everywhere, one unit of fuel per 64 visits. Runs at the existing `gc!`
+  points (the start of allocating instructions, where every live object is
+  counted), on a full buffer, a tight budget after a recount, or
+  `collect_garbage`.
+- **Memory accounting** under RC: frees refund what is certainly theirs, so
+  the estimate is never low; exact recounts rationed like tracing
+  collections (a `dup`-heavy loop no longer drifts into a spurious
+  `OutOfMemory`; a test fails without the rationing).
+- **Destructors in both profiles** (`Vm::set_destructor`, validated:
+  `VmError::BadDestructor`): RC at the last reference; tracing through the
+  finalization queue after the coroutines (the collector scans the slots
+  for unmarked structs with a destructor only when one is set).
+- **Close on drop at the last reference** (RC), through the same settle.
+- **PHP's unbinding on copy** (RC): copy-on-write copies and struct `dup`
+  replace reference slots whose box has count 1 by its value (separated by
+  `coll::share` when an array or map); writes through such a slot of
+  shared contents copy first. `MemoryStats::unbound` counts them.
+- **The seam**: `contents_shared` and `Heap::is_aliased` keep answering
+  with LSB §5.16's bits in both profiles. A count-based answer (`cow` and a
+  second `Arc` holder; `aliased` and a count above one, which LSB allows)
+  was built first and failed the RC differential test: on a generated
+  program that stores a container without `dup` (outside the value
+  discipline LSB's guarantee assumes) it separated differently from
+  tracing and the reference, and a count also sees dead temporary
+  registers as holders. Counts decide only whether a copy is physical,
+  which is where PHP's unbinding happens.
+- **Saturation**: a count past `rc_max` (`u32::MAX`) sticks (`STUCK`), the
+  object is never freed again, and the run traps `OutOfMemory` at the next
+  boundary; tested with the ceiling lowered.
+- **P33**: `bind_named` (hashed `NameIndex` per callable with more than 8
+  named parameters, built at load; ordered set for rest names), property-
+  tested against `ParamList::bind` with and without the index;
+  `charge_items` (`n / 64` extra units for a flattened call of `n` items,
+  before binding); empty rest collections share the machine's empty
+  storage until written.
+- **`MemoryStats`/`Vm::memory_stats`.**
+- **Tests**: `tests/memory_rc.rs` (26), `tests/binding.rs` (3), RC
+  differential properties over both whole-module generators (with a
+  coverage guard), RC fuzzing in `tests/untrusted.rs`, and two debug-build
+  invariant checks every RC run and collection performs (an exact recount
+  of every count; nothing unreachable kept), both mutation-checked.
+- **Benches**: `profile/*/{tracing,rc}` and `call/dcall_spread_named_200k`.
+
+### Dependency wiring
+- **bytecode-lang `0.3`**, unchanged. Format 2 has no `[runtime]` section,
+  no memory-profile flag, and no destructor flag, so both are chosen by
+  the host: `Vm::with_memory` (the runner maps `[runtime] memory`) and
+  `Vm::set_destructor` (the language's destructor method name). Recorded
+  for LSB (owner/LSB maintainer's call, not this crate's): a module-level
+  `memory` profile and destructor method once LSB carries runtime
+  metadata; D22's "specified per profile in LSB" text for destructor
+  timing, reference unbinding (§5.17), and close-on-drop (§5.13 rule 13
+  already has it); and §5.14 additions for the two new charges (`n / 64`
+  per large dynamic call, one per 64 cycle-collector visits under RC).
+- **gc-lang, value-lang, host-lang**: unchanged (reasons under alpha.1 and
+  alpha.2). gc-lang 1 has no counts either; the RC heap stays VM-specific.
+
+### Known limitations (recorded, not deferred work of this milestone)
+- Errors escaping a destructor are discarded (as LSB §5.13 rule 13 does for
+  drop-closes); PHP raises them where the object died. Raising them there
+  would need a precise point after an instruction has completed; revisit
+  with the consumer (Mox).
+- Objects still reachable when a VM is dropped are not destructed; PHP's
+  shutdown pass is left to the host (`collect_garbage` +
+  `run_finalizers`).
+- A destructor whose frame is suspended by a `yield` (a destructor running
+  inside a coroutine that suspends) keeps the zero list's floor until it
+  resumes or the run ends: objects that died before it are freed late, not
+  lost.
+- RC counts registers the way the tracing collector roots them: a dead
+  register still holding a value keeps it alive until overwritten or its
+  frame returns, so destructor timing follows the code generator's register
+  reuse (PHP frees temporaries at once). bcgen-lang can clear dead
+  registers (`load_nil`) where PHP timing matters.
+- A program building a long chain one node at a time fills the
+  possible-roots buffer (each node loses its register holder), so the cycle
+  collector runs O(sqrt(n)) times over the chain built so far: O(n^1.5)
+  work in all, fuel-charged (PHP behaves the same; measured in
+  `tests/memory_rc.rs`).
+- Tracing against alpha.3 (alternating harness, minimum of four rounds):
+  `map/int_keys_100k_set_get` ~4% slower and `php/foreach_by_ref_100k`
+  ~5-8% slower, the cost left of routing the shared store helpers by
+  profile (the rest is at parity or faster: `fib(25)` ~8% faster). Not
+  recovered in this milestone.
+- The exact recount and the reachability check run in debug builds only
+  (and only on heaps of at most 50,000 slots); release builds trust the
+  counts.
+
+## Moved to 2.0.0 (recorded per the anti-deferral rule)
+- `[runtime] cycles = "leak"` (LSF2 §17: RC without a cycle collector) is
+  not exposed: it was not in this milestone's scope, and with no consumer
+  asking for it the switch would be untested surface. Adding it is one flag
+  that keeps `collect_cycles` from running automatically.
 
 ## v2.0.0 - Stable (per D18: after coroutines and a real consumer)
 - [ ] A real consumer runs end to end on it (Mox through the LexerSketch app).

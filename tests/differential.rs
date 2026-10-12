@@ -7,7 +7,7 @@
 
 mod common;
 
-use bvm_lang::{Host, Limits, Program, Value, Vm, VmError};
+use bvm_lang::{Host, Limits, Memory, Program, Value, Vm, VmError};
 use bytecode_lang::{
     DivZero, FloatConv, FloatToInt, FloatTy, FuncId, Inst, IntConv, IntOp, IntTy, ModuleBuilder,
     Overflow, Policy, Prim, Reg, Shift, Target, ValType,
@@ -2313,11 +2313,26 @@ mod whole {
     /// coroutines are closed is the VM's own timing; the reference never
     /// collects).
     pub(super) fn vm_run(p: &Program, args: (i32, i32), fuel: u64, depth: usize) -> Option<WRun> {
-        let mut vm = Vm::new(p);
+        vm_run_in(p, args, fuel, depth, Memory::Tracing).map(|(r, _)| r)
+    }
+
+    /// [`vm_run`] under a memory profile; also returns the live objects
+    /// once the host lets go of everything and collects. `None` when the
+    /// profiles may legitimately differ: a collection ran (tracing), or a
+    /// drop-close, destructor, or reference unbinding happened (RC).
+    pub(super) fn vm_run_in(
+        p: &Program,
+        args: (i32, i32),
+        fuel: u64,
+        depth: usize,
+        memory: Memory,
+    ) -> Option<(WRun, usize)> {
+        let mut vm = Vm::with_memory(p, memory);
         let limits = Limits::new().with_fuel(fuel).with_depth(depth);
         let argv = [Value::Int(args.0.into()), Value::Int(args.1.into())];
         let out = vm.run_with(FuncId(0), &argv, limits);
-        if vm.collections() > 0 {
+        let stats = vm.memory_stats();
+        if stats.collections > 0 || stats.finalized > 0 || stats.unbound > 0 {
             return None;
         }
         let end = match out {
@@ -2340,7 +2355,9 @@ mod whole {
                 vm_shape(&vm, g, full::SHAPE_DEPTH)
             })
             .collect();
-        Some((end, vm.fuel_used(), globals))
+        let used = vm.fuel_used();
+        vm.collect_garbage();
+        Some(((end, used, globals), vm.heap_objects()))
     }
 
     pub(super) fn ref_run(p: &Program, args: (i32, i32), fuel: u64, depth: usize) -> WRun {
@@ -2416,5 +2433,98 @@ proptest! {
             let r = whole::ref_run(&p, args, fuel, depth);
             prop_assert_eq!(vm, r);
         }
+    }
+
+    /// The same programs under the reference-counting profile: the outcome,
+    /// fuel, and globals match the reference whenever no drop-close or
+    /// reference unbinding (the profile-specific behaviours) happened (so
+    /// nothing was freed early), and once the host lets go and collects,
+    /// both profiles keep exactly as many objects (nothing leaks). In debug
+    /// builds every RC run also recounts every count when it ends, and the
+    /// collection checks that every object it kept is reachable.
+    #[test]
+    fn prop_whole_programs_under_rc_match_the_reference(
+        b in bodies(),
+        args in (-3i32..5, -3i32..5),
+        fuel in 0u64..3_000,
+        depth in 2usize..40,
+    ) {
+        let p = whole::build(&b);
+        if let Some((rc, rc_live)) = whole::vm_run_in(&p, args, fuel, depth, Memory::Rc) {
+            let r = whole::ref_run(&p, args, fuel, depth);
+            prop_assert_eq!(&rc, &r);
+            if let Some((_, gc_live)) = whole::vm_run_in(&p, args, fuel, depth, Memory::Tracing) {
+                prop_assert_eq!(rc_live, gc_live);
+            }
+        }
+    }
+
+    /// PHP-style programs under the reference-counting profile, as above.
+    #[test]
+    fn prop_php_programs_under_rc_match_the_reference(
+        b in php_bodies(),
+        args in (-3i32..5, -3i32..5),
+        fuel in 200u64..3_000,
+    ) {
+        let p = whole::build(&b);
+        if let Some((rc, rc_live)) = whole::vm_run_in(&p, args, fuel, 40, Memory::Rc) {
+            let r = whole::ref_run(&p, args, fuel, 40);
+            prop_assert_eq!(&rc, &r);
+            if let Some((_, gc_live)) = whole::vm_run_in(&p, args, fuel, 40, Memory::Tracing) {
+                prop_assert_eq!(rc_live, gc_live);
+            }
+        }
+    }
+}
+
+/// The RC differential above skips programs where a drop-close or a
+/// reference unbinding happened (behaviour LSB specifies per profile): it
+/// must still compare the great majority of programs, or it proves little.
+#[test]
+fn the_rc_differential_compares_most_programs() {
+    use proptest::strategy::ValueTree;
+    use proptest::test_runner::TestRunner;
+    let mut runner = TestRunner::deterministic();
+    let mut compared = 0;
+    for i in 0..1000 {
+        let b = if i % 2 == 0 {
+            php_bodies().new_tree(&mut runner).unwrap().current()
+        } else {
+            bodies().new_tree(&mut runner).unwrap().current()
+        };
+        let p = whole::build(&b);
+        if whole::vm_run_in(&p, (1, 2), 2000, 30, Memory::Rc).is_some() {
+            compared += 1;
+        }
+    }
+    assert!(compared >= 950, "only {compared} of 1000 compared");
+}
+
+/// A program the RC differential found: it stores an array into another
+/// without `dup` (outside LSB §5.16's value discipline), lets the only other
+/// sharer of the outer storage die, then takes a reference into it and
+/// writes the inner array through another path. Separation decided by
+/// counts (which LSB allows under the discipline) copied less than tracing
+/// and the reference do, so the write showed through; both profiles now
+/// decide with the bits and agree.
+#[test]
+fn rc_separates_like_tracing_outside_the_value_discipline() {
+    use whole::Op;
+    let main = vec![
+        (Op::DCallN(17, 166, 31, [175, 0, 0, 183]), true),
+        (Op::Mov(183, 226), true),
+        (Op::Dup(11, 41), true),
+        (Op::NewSt(0), true),
+        (Op::RefIdx(0, 232, 13, 0), true),
+        (Op::Push(0, 0), true),
+        (Op::Load(0, 0), true),
+        (Op::NewMap(0), true),
+    ];
+    let b = [main, vec![], vec![], vec![], vec![], vec![]];
+    let p = whole::build(&b);
+    let reference = whole::ref_run(&p, (0, 0), 200, 40);
+    for memory in [Memory::Rc, Memory::Tracing] {
+        let (run, _) = whole::vm_run_in(&p, (0, 0), 200, 40, memory).expect("compared");
+        assert_eq!(run, reference, "{memory:?}");
     }
 }
