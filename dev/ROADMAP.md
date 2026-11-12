@@ -1,7 +1,6 @@
 # bvm-lang - Roadmap
 
 > Path from scaffold to a stable 1.0, then to 2.0: the VM that executes LSB. Hard parts are front-loaded; each phase has hard exit criteria.
-> Master plans: ../../_strategy/LANG_COLLECTION.md and ../../_lexersketch/ROADMAP.md (item 4.4).
 >
 > **Anti-deferral rule:** no listed hard task moves to a later phase unless this file records the move and the reason.
 
@@ -105,8 +104,8 @@ Delivered:
   `yield`, `yield_kv`, `await`, `resume`, `resume_throw`, `coro_status`,
   `coro_current`, `spawn`, `coro_close`, `coro_key`, `coro_result`, iteration over
   coroutines (LSB §5.13 rule 7), and the close-on-drop decision (LSB §10.9: closed
-  at the next safepoint for tracing-GC runtimes). Reason: the coordinator scoped
-  alpha.1 to everything else; this is a scope split, not a dependency block.
+  at the next safepoint for tracing-GC runtimes). Reason: alpha.1 was scoped
+  to everything else; this is a scope split, not a dependency block.
   alpha.1 loads modules containing them and ends a run that reaches one with
   `VmError::Unsupported` naming the opcode, function, and pc. Frames already live
   in a flat stack with explicit continuations (`Cont`), which is what stackful
