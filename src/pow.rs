@@ -2,7 +2,7 @@
 //! the exact integer power that `overflow = promote` rounds.
 //!
 //! **`ls_pow`** is specified operation by operation in
-//! `_lexersketch/specs/ops-vectors/pow.md`, so every tier computes the same
+//! the `pow` vector table, so every tier computes the same
 //! bits (OPS §4 forbids a platform libm for `pow`, whose results differ
 //! between libraries). The routine uses only IEEE 754 binary64 `+ - * /`
 //! with round-to-nearest-even, comparisons, and integer arithmetic on bit

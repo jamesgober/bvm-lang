@@ -5,8 +5,8 @@
 > (bytecode-lang 0.3) under two memory profiles, tracing and reference
 > counting. The surface may still change before
 > `2.0.0` (see [Stability](#stability) and [`STABILITY.md`](./STABILITY.md)).
-> Instruction semantics are those of LSB (`_lexersketch/specs/LSB.md`) and OPS
-> (`_lexersketch/specs/OPS.md`); this file documents the Rust API around them.
+> Instruction semantics are those of LSB (the LSB specification) and OPS
+> (the OPS specification); this file documents the Rust API around them.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -416,7 +416,7 @@ every policy, `trap` included). `dpow` takes it on two ints, with `promote`
 giving the `f64` nearest the exact power and, for a negative exponent, the
 float rule (PHP's `2 ** -1` is `0.5`). Float powers (`fpow`, `dpow` with a
 float) use `ls_pow`, the family's shared routine specified operation by
-operation in `_lexersketch/specs/ops-vectors/pow.md` so every tier produces
+operation in the `pow` vector table so every tier produces
 the same bits; this VM's implementation passes the spec's vector table.
 `dabs` is `abs` with `abs(i64::MIN)` per the overflow policy (`promote`:
 `2^63` as an `f64`). The shift policy `saturate` is PHP's `<<`/`>>`: an
