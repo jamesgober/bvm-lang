@@ -17,7 +17,7 @@ replaced by LSB (ISSUES M52, F07), and the 1.0 audit found no fuel (H09) and no
 `pc` in errors (M62).
 
 ## v2.0.0-alpha.1 - Execute LSB (DONE, prepared 2026-10-08)
-The VM becomes the T1 tier of LexerSketch (ARCHITECTURE §7): it executes
+The VM becomes the T1 tier of the toolchain (ARCHITECTURE §7): it executes
 bytecode-lang modules, typed and dynamic code alike, under explicit budgets.
 
 Delivered:
@@ -205,7 +205,7 @@ Delivered:
   `HostCtx` access to references and containers.
 - **OPS v2**: `ipow`/`fpow`/`dpow`/`dabs`, `shift = saturate`,
   `NegativeExponent`; the shared `ls_pow` routine, specified with a vector
-  table in `_lexersketch/specs/ops-vectors/pow.md` (written in this
+  table in the `pow` vector table (written in this
   milestone: pseudocode, constants, 122 vectors, verification).
 - **`raise` and error payloads** (`err_payload`, `VmError::Raised { payload }`,
   `Vm::error_payload`).
@@ -387,7 +387,7 @@ Delivered:
   that keeps `collect_cycles` from running automatically.
 
 ## v2.0.0 - Stable (per D18: after coroutines and a real consumer)
-- [ ] A real consumer runs end to end on it (Mox through the LexerSketch app).
+- [ ] A real consumer runs end to end on it (Mox through the toolchain's app).
 - [ ] bytecode-lang 0.5 verifier integrated: verified modules may skip the
       loader's overlapping checks; the VM's own checks stay for unverified input.
 - [ ] API review against that consumer; freeze, with STABILITY.md updated.

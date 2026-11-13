@@ -94,7 +94,7 @@
 - **Import parameter lists and host functions as values**: `load_import` of any import is a function value every dynamic call form accepts; a host function called through a parameter list receives references, rest collections, and the presence mask. `HostCtx::ref_get`, `HostCtx::ref_set`, `HostCtx::elements`, `HostCtx::entries`, `HostCtx::new_array`, and `HostCtx::new_map` let host functions use them.
 - **References** (LSB §5.17): kind `reference`; reference slots in arrays, maps, and `dyn` struct fields are transparent to every slot read and write (typed and dynamic, `iter_next`, spreads, and `Vm::elements`/`entries`/`field`); copies share reference slots; references are traced, so cycles through them are collected. `Vm::ref_value`.
 - **Copy-on-write separation** (LSB §5.16): arrays and maps carry the `cow` and `aliased` bits of the spec's conforming implementation for tracing collectors; `dsep_*` separate exactly the aliased elements, so `$g[$i % 64][] = $i` copies no contents after its first pass. The decisions follow the bits, not reference counts or collection timing, and are therefore deterministic. They are asked only through `contents_shared` (on the array and map objects) and `Heap::is_aliased`, the seam the reference-counting memory profile (D22, alpha.4) replaces.
-- **OPS v2 arithmetic**: `pow` at every integer type under every overflow policy (exact by repeated squaring; `wrap` keeps the low bits; `promote` rounds the exact power, a negative exponent takes the float rule; otherwise `NegativeExponent`, E0006, never a trap), float `pow` by the shared `ls_pow` routine (specified in `_lexersketch/specs/ops-vectors/pow.md`, with a 122-row vector table this VM passes bit for bit), `dabs` with `promote`, and `shift = saturate` on `ishl`/`ishr`/`dshl`/`dshr`.
+- **OPS v2 arithmetic**: `pow` at every integer type under every overflow policy (exact by repeated squaring; `wrap` keeps the low bits; `promote` rounds the exact power, a negative exponent takes the float rule; otherwise `NegativeExponent`, E0006, never a trap), float `pow` by the shared `ls_pow` routine (specified in the `pow` vector table, with a 122-row vector table this VM passes bit for bit), `dabs` with `promote`, and `shift = saturate` on `ishl`/`ishr`/`dshl`/`dshr`.
 - **`raise` and error payloads**: `raise kind, src` raises any catchable kind with a payload; `err_payload` reads it; `Vm::error_payload`; payloads are traced.
 - Tests: `tests/php_semantics.rs` (PHP programs lowered as a PHP code generator lowers them, with PHP 8.3's results), `tests/format2.rs` (loading, hooks, fuel point, `dparam_ref`, coroutine binding, payloads, reference and separation corners), `tests/pow_vectors.rs` (the spec's vectors through `fpow` and `dpow`); the scalar differential reference gains `pow`, `abs`, and saturating shifts (with its own transcription of `ls_pow` from the spec), and the whole-module reference gains every format 2 feature (independent binder, reference slots, the two copy-on-write bits) with a new PHP-focused property; mutation-checked (32 deliberate bugs; every one that changes behaviour fails the suite).
 - Benchmarks `call/dcall_plain_100k`, `call/dcall_bind_100k`, `call/dcall_shape_named_100k`, `php/nested_append_100k`, `php/nested_append_dup_100k`, `php/foreach_by_ref_100k`. Example `php_calls`.
@@ -130,14 +130,14 @@
 
 ### Changed
 
-- LSB §5.13 rule 13 is rewritten for the close-on-drop decision and LSB gains §5.14, the fuel rule every tier shares (both in `_lexersketch/specs/LSB.md`).
+- LSB §5.13 rule 13 is rewritten for the close-on-drop decision and LSB gains §5.14, the fuel rule every tier shares (both in the LSB specification).
 - A pending close is started from the fuel counter's cold branch, so the dispatch loop has no test of its own for it; the fuel counter now lives in the VM instance during a run.
 
 ---
 
 ## [2.0.0-alpha.1] - 2026-10-08
 
-**The VM now executes LSB**, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang) 0.2: typed and dynamic code, calls, closures, structs, arrays, PHP-style ordered maps, strings, exceptions, a tracing garbage collector, and explicit budgets for untrusted code. A pre-release: the coroutine instructions arrive in alpha.2 and the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
+**The VM now executes LSB**, the toolchain's bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang) 0.2: typed and dynamic code, calls, closures, structs, arrays, PHP-style ordered maps, strings, exceptions, a tracing garbage collector, and explicit budgets for untrusted code. A pre-release: the coroutine instructions arrive in alpha.2 and the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
 
 ### Breaking
 

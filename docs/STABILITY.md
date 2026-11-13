@@ -14,7 +14,7 @@
 </div>
 <br>
 
-`bvm-lang` **2.0** is a new major version: the 1.x instruction set (`Op`, `Chunk`) is gone, replaced by LSB, the LexerSketch bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang). The 1.x line stays frozen as it was released; it receives no further features.
+`bvm-lang` **2.0** is a new major version: the 1.x instruction set (`Op`, `Chunk`) is gone, replaced by LSB, the toolchain's bytecode of [`bytecode-lang`](https://crates.io/crates/bytecode-lang). The 1.x line stays frozen as it was released; it receives no further features.
 
 ## 2.0.0-alpha.5 is a pre-release
 
@@ -22,7 +22,7 @@ Per decision D18 (a crate is frozen only after a real consumer has exercised it)
 
 1. the coroutine instructions land (done in `2.0.0-alpha.2`),
 2. LSB format 2 executes (done in `2.0.0-alpha.3`) and the reference-counting memory profile of decision D22 lands (done in `2.0.0-alpha.4`), and
-3. a real consumer (Mox, through the LexerSketch app) has run end to end on it.
+3. a real consumer (Mox, through the toolchain's app) has run end to end on it.
 
 Until then, names and signatures may change between alpha releases. Every change will be listed in the CHANGELOG with migration notes. Depend on an exact alpha version (`bvm-lang = "=2.0.0-alpha.5"`).
 
@@ -30,7 +30,7 @@ Until then, names and signatures may change between alpha releases. Every change
 
 These are properties of the implementation that will not be weakened before or after 2.0.0:
 
-- **Semantics are LSB's and OPS's.** Every executed instruction behaves as `_lexersketch/specs/LSB.md` and `OPS.md` define it. Where the VM and the specification disagree, the VM has a bug. A change to an instruction's meaning comes with a new LSB format version, never silently.
+- **Semantics are LSB's and OPS's.** Every executed instruction behaves as the LSB specification and `OPS.md` define it. Where the VM and the specification disagree, the VM has a bug. A change to an instruction's meaning comes with a new LSB format version, never silently.
 - **No panics, no unsafe.** `#![forbid(unsafe_code)]`; no module, however malformed or hostile, can make loading or running panic or read outside the VM. Loading refuses what the interpreter cannot index safely; everything else is a value (`LoadError`, `VmError`).
 - **Bounded work.** With finite `Limits`, every run ends: fuel bounds instructions (and, under `Memory::Rc`, the cycle collector's work and the binding of large dynamic calls), the memory budget bounds the heap, depth and stack limits bound frames.
 - **The tracing profile is the default.** `Vm::new` and `Vm::with_limits` keep the tracing collector; a program gets reference counting only when its host asks for `Memory::Rc`.

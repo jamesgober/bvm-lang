@@ -1,4 +1,4 @@
-//! The `ls_pow` test vectors of `_lexersketch/specs/ops-vectors/pow.md`
+//! The `ls_pow` test vectors of the `pow` vector table
 //! (§9), run through the VM: `fpow` at `f64` must give every row's bits,
 //! `fpow` at `f32` must equal `ls_pow` of the widened operands rounded once,
 //! and `dpow` on two floats takes the same routine (NaN canonical).

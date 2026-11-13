@@ -1,6 +1,6 @@
 //! # bvm_lang
 //!
-//! The virtual machine that executes **LSB**, the LexerSketch bytecode
+//! The virtual machine that executes **LSB**, the toolchain's bytecode
 //! defined by [`bytecode-lang`](https://docs.rs/bytecode-lang): the T1
 //! interpreter of the `-lang` family, for static languages (typed registers,
 //! unboxed integers and floats) and dynamic ones (`dyn` registers, PHP-style

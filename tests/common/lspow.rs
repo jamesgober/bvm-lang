@@ -1,4 +1,4 @@
-//! `ls_pow` transcribed from `_lexersketch/specs/ops-vectors/pow.md` (§2-§6)
+//! `ls_pow` transcribed from the `pow` vector table (§2-§6)
 //! for the reference interpreters, without reading the crate's `src/pow.rs`:
 //! the spec's pseudocode, operation for operation, with `std`'s IEEE
 //! `round_ties_even`/`trunc` and unbounded-enough `u128` integers. The
