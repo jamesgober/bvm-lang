@@ -43,6 +43,7 @@
   - [`Vm::with_limits`](#vmwith_limits)
   - [`Vm::with_memory`](#vmwith_memory)
   - [`Vm::set_destructor`](#vmset_destructor)
+  - [`Vm::set_hash_seed`](#vmset_hash_seed)
   - [`Vm::run`](#vmrun)
   - [`Vm::run_with`](#vmrun_with)
   - [`Vm::run_export`](#vmrun_export)
@@ -219,7 +220,23 @@ invocation is the charge). Between two charges a
 run executes at most one function's length of instructions, so fuel bounds
 total work even for modules a verifier would reject for lacking safepoints.
 
-Two charges go beyond LSB §5.14 (both recorded for LSB in the ROADMAP):
+Three charges go beyond LSB §5.14 (all recorded for LSB in the ROADMAP):
+
+- **Data work.** An instruction that copies, hashes, or compares data
+  pays one unit per 256 bytes on top of any unit it already costs: every
+  byte it builds or copies (a concatenation, a slice, a new array, a struct
+  copied by `dup`, the copy that separates shared copy-on-write storage),
+  every string key it hashes or compares in a map, and every string it
+  compares (`str_eq`, `str_cmp`, and the string cases of `deq`, `dlt` and
+  their kin). Work a host function does is the host's and is not charged. The work is
+  recorded as it happens and paid when the instruction finishes, so a
+  short program that copies a megabyte per iteration spends fuel in
+  proportion to the bytes, not the iterations. When what is left cannot
+  pay, the run ends with `OutOfFuel` at that instruction, which has
+  completed. The charge is rounded down per instruction, so an
+  instruction that moves less than 256 bytes costs nothing extra and
+  ordinary code keeps the exact fuel LSB §5.14 states.
+  [`Limits::with_data_fuel(false)`](#limits) turns this charge off.
 
 - **Large dynamic calls** (ISSUES P33). A `dcall_shape` whose flattened
   call has `n` items is charged `n / 64` units more, right after flattening
@@ -771,7 +788,7 @@ objects earlier runs left. A `Vm` is `Send`.
 pub fn new(program: &'p Program) -> Vm<'p>
 ```
 
-An instance with [`Limits::new`](#limits).
+An instance with [`Limits::new`](#limits): finite fuel and memory.
 
 ```rust
 use bvm_lang::{Host, Program, Vm};
@@ -780,7 +797,11 @@ use bytecode_lang::ModuleBuilder;
 let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
 let vm = Vm::new(&p);
 assert_eq!(vm.limits(), bvm_lang::Limits::new());
+assert!(vm.limits().fuel() < u64::MAX); // the defaults are finite
 ```
+
+For code you do not control, prefer
+`Vm::with_limits(&program, Limits::untrusted())`.
 
 ### `Vm::with_limits`
 
@@ -801,7 +822,7 @@ use bytecode_lang::ModuleBuilder;
 let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
 let mut vm = Vm::with_limits(&p, Limits::new().with_fuel(10_000));
 assert_eq!(vm.limits().fuel(), 10_000);
-vm.set_limits(Limits::new());
+vm.set_limits(Limits::trusted());
 assert_eq!(vm.limits().fuel(), u64::MAX);
 ```
 
@@ -909,6 +930,28 @@ assert_eq!(gc.run(main, &[]), Ok(Value::Int(9)));
 gc.collect_garbage();
 assert_eq!(gc.run_finalizers(), Ok(1));
 assert_eq!(gc.global(log), Some(Value::Int(91)));
+```
+
+### `Vm::set_hash_seed`
+
+```rust,ignore
+pub fn set_hash_seed(&mut self, seed: u128) -> bool
+```
+
+Sets the key map keys are hashed with. With the `std` feature every VM gets
+a random key; without it the key is a fixed constant, so a module that knows
+it can pick colliding string keys and make building a map quadratic. A
+`no_std` host that runs untrusted modules should pass its own random value
+before the first run. Returns `false`, changing nothing, once the heap holds
+a map.
+
+```rust
+use bvm_lang::{Host, Program, Vm};
+use bytecode_lang::ModuleBuilder;
+
+let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+let mut vm = Vm::new(&p);
+assert!(vm.set_hash_seed(0x5eed));
 ```
 
 ### `Vm::run`
@@ -1171,27 +1214,48 @@ What the memory manager has done: see [`MemoryStats`](#memorystats).
 pub struct Limits { /* private */ }
 impl Limits {
     pub const fn new() -> Limits;
+    pub const fn untrusted() -> Limits;
+    pub const fn trusted() -> Limits;
     pub const fn with_fuel(self, fuel: u64) -> Limits;
     pub const fn with_memory(self, bytes: usize) -> Limits;
     pub const fn with_depth(self, frames: usize) -> Limits;   // at least 1
     pub const fn with_stack(self, slots: usize) -> Limits;
+    pub const fn with_data_fuel(self, on: bool) -> Limits;
     pub const fn fuel(&self) -> u64;
     pub const fn memory(&self) -> usize;
     pub const fn depth(&self) -> usize;
     pub const fn stack(&self) -> usize;
+    pub const fn data_fuel(&self) -> bool;
 }
 ```
 
 The budgets of a run (see [Fuel and the other budgets](#fuel-and-the-other-budgets)).
-Defaults (`new`, `Default`): unlimited fuel, 1 GiB of heap, 10,000 frames,
-4 Mi register slots (32 MiB). Set fuel and memory for untrusted code; the
-memory budget is only as hard as the host can honour, so keep it below the
-memory actually available.
+Three presets:
+
+| preset | fuel | memory | depth | register slots |
+|---|---|---|---|---|
+| `untrusted` | 10,000,000 | 64 MiB | 1,000 | 1 Mi (8 MiB) |
+| `new`, `Default` | 100,000,000 | 256 MiB | 10,000 | 4 Mi (32 MiB) |
+| `trusted` | unlimited | 1 GiB | 10,000 | 4 Mi (32 MiB) |
+
+The guarantees for untrusted modules hold under finite limits, which both
+`new` and `untrusted` are. Start from `untrusted` for code you do not
+control and size the fuel to the time a run may take; `trusted` has no fuel
+limit, so a module that loops forever runs forever under it.
+`with_data_fuel(false)` turns off the data-work charge, leaving exactly
+LSB §5.14's charge points (the count every tier agrees on); with it off the
+work one unit pays for is bounded only by the memory budget, so keep it on
+for code you do not control. The memory
+budget is only as hard as the host can honour, so keep it below the memory
+actually available.
 
 ```rust
 use bvm_lang::Limits;
 
-let l = Limits::default().with_fuel(1_000).with_memory(64 << 20).with_depth(256).with_stack(1 << 20);
+assert_eq!(Limits::default(), Limits::new());
+assert_eq!(Limits::new().fuel(), 100_000_000);
+assert_eq!(Limits::trusted().fuel(), u64::MAX);
+let l = Limits::untrusted().with_fuel(1_000).with_memory(64 << 20).with_depth(256).with_stack(1 << 20);
 assert_eq!((l.fuel(), l.memory(), l.depth(), l.stack()), (1_000, 64 << 20, 256, 1 << 20));
 ```
 

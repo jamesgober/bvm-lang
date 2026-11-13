@@ -208,7 +208,10 @@ fn spread(m: &mut Machine, w: u64, named: bool, out: &mut Flat) -> Result<(), Fa
 /// A map key's bytes when it is a string.
 fn key_str(m: &Machine, kty: ValType, k: u64) -> Option<Box<[u8]>> {
     match kty {
-        ValType::Str | ValType::Dyn => m.heap.str(k).map(Box::from),
+        ValType::Str | ValType::Dyn => m.heap.str(k).map(|b| {
+            m.heap.note_work(b.len());
+            Box::from(b)
+        }),
         _ => None,
     }
 }

@@ -752,6 +752,27 @@ impl Machine {
         }
     }
 
+    /// Pays for `bytes` of data work one instruction did (one unit per
+    /// [`WORK_BYTES_PER_FUEL`](crate::heap::WORK_BYTES_PER_FUEL) bytes
+    /// copied, hashed, or compared, rounded down), from the fuel set aside
+    /// while a close is armed if there is some. Returns `false`, with the
+    /// fuel spent, when what is left cannot cover it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn pay_work(&mut self, bytes: usize) -> bool {
+        let units = (bytes / crate::heap::WORK_BYTES_PER_FUEL) as u64;
+        let pool = match self.bank.as_mut() {
+            Some(banked) => banked,
+            None => &mut self.fuel,
+        };
+        if *pool < units {
+            *pool = 0;
+            return false;
+        }
+        *pool -= units;
+        true
+    }
+
     /// The cold branch of a fuel charge, taken when the counter reads 0:
     /// either the budget is spent, or a close is armed. With `at` (the
     /// running frame and the charging instruction, which has done nothing

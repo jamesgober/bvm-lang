@@ -21,6 +21,27 @@
 
 ---
 
+## [2.0.0-alpha.5] - 2026-11-12
+
+**Fuel now pays for data work, and the default limits are finite.** Until now one unit of fuel paid for one instruction however much data it moved, so a loop that copied a megabyte per iteration cost the same fuel as one that added 1, and `Vm::new` ran with no fuel limit and a 1 GiB heap. Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
+
+### Breaking
+
+- **Data work costs fuel.** An instruction pays one more unit per 256 bytes it copies, hashes, or compares: every byte it builds or copies (concatenations, slices, new arrays, a struct copied by `dup`, the copy that separates shared copy-on-write storage), string keys hashed or compared in maps, and strings compared by `str_eq`, `str_cmp`, and the string cases of the dynamic comparisons. Work done inside host functions is not charged. The work is recorded as it happens and paid when the instruction finishes, rounded down, so an instruction that moves less than 256 bytes costs nothing extra; when the fuel left cannot pay, the run ends with `OutOfFuel` at that instruction, which has completed. Programs that build or compare long strings, or copy large arrays and maps, use more fuel than before, and `fuel_used` reports it. Migration: a host whose budgets were exact for such code raises them.
+- **`Limits::new()` (and so `Vm::new`, `Vm::with_memory`, and `Limits::default()`) is finite**: 100,000,000 units of fuel and 256 MiB of heap, down from unlimited fuel and 1 GiB. Depth (10,000 frames) and register slots (4 Mi) are unchanged. Migration: a host that wants the old behaviour for code it trusts uses `Limits::trusted()`.
+
+### Added
+
+- `Limits::untrusted()`: 10,000,000 units of fuel, 64 MiB of heap, 1,000 frames, and 1 Mi register slots. The README, the crate docs, and every example now start from it.
+- `Limits::trusted()`: no fuel limit and 1 GiB of heap, the old defaults.
+- `Limits::with_data_fuel(bool)` and `Limits::data_fuel()`: turn the data-work charge off to count only LSB §5.14's charge points, the count every tier agrees on (the differential tests against the reference interpreters do this). On in every preset.
+- `Vm::set_hash_seed(u128)`: a host-supplied key for hashing map keys. Without the `std` feature the key was a fixed constant with no way to change it, so a module that knew it could choose colliding string keys. Returns `false`, changing nothing, once the heap holds a map.
+- Tests: `tests/fuel_work.rs` (the bytes a loop copies or compares are bounded by its fuel in both memory profiles, the defaults are finite, a host seed works).
+
+### Changed
+
+- The guarantee for untrusted modules now says that it holds under finite limits, and the `Limits` docs list the three presets.
+
 ## [2.0.0-alpha.4] - 2026-10-12
 
 **The reference-counting memory profile** (DECISIONS D22). A VM made with `Vm::with_memory(&program, Memory::Rc)` counts references and collects garbage cycles by trial deletion, PHP's model: objects die at their last reference, before the next instruction, so a destructor named with `Vm::set_destructor` runs where PHP runs `__destruct` and a dropped generator closes where PHP destroys it; copying an array unbinds a PHP reference nothing else holds, as PHP does (LSB §5.17's divergence closed at run time, ISSUES P34). The tracing profile stays the default and is unchanged unless asked for a destructor. Dynamic-call binding is now fuel-proportional (ISSUES P33). Still a pre-release: the API freezes at 2.0.0 (see [`docs/STABILITY.md`](docs/STABILITY.md)).
@@ -229,7 +250,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.4...HEAD
+[Unreleased]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.5...HEAD
+[2.0.0-alpha.5]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.4...v2.0.0-alpha.5
 [2.0.0-alpha.4]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.3...v2.0.0-alpha.4
 [2.0.0-alpha.3]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.2...v2.0.0-alpha.3
 [2.0.0-alpha.2]: https://github.com/jamesgober/bvm-lang/compare/v2.0.0-alpha.1...v2.0.0-alpha.2

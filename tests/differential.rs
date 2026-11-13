@@ -537,7 +537,9 @@ type Run = (Outcome, u64, Vec<Rv>);
 
 fn vm_outcome(p: &Program, arg: i64, fuel: u64) -> Run {
     let mut vm = Vm::new(p);
-    let out = vm.run_with(FuncId(0), &[Value::Int(arg)], Limits::new().with_fuel(fuel));
+    // The references count LSB §5.14's charge points only.
+    let limits = Limits::new().with_fuel(fuel).with_data_fuel(false);
+    let out = vm.run_with(FuncId(0), &[Value::Int(arg)], limits);
     let o = match out {
         Ok(Value::Int(i)) => Outcome::Ret(Rv::Int(i128::from(i))),
         Ok(other) => panic!("unexpected result {other:?}"),
@@ -2328,7 +2330,11 @@ mod whole {
         memory: Memory,
     ) -> Option<(WRun, usize)> {
         let mut vm = Vm::with_memory(p, memory);
-        let limits = Limits::new().with_fuel(fuel).with_depth(depth);
+        // The reference counts LSB §5.14's charge points only.
+        let limits = Limits::new()
+            .with_fuel(fuel)
+            .with_depth(depth)
+            .with_data_fuel(false);
         let argv = [Value::Int(args.0.into()), Value::Int(args.1.into())];
         let out = vm.run_with(FuncId(0), &argv, limits);
         let stats = vm.memory_stats();

@@ -3,7 +3,7 @@
 //!
 //! `cargo run --example coroutines`
 
-use bvm_lang::{Host, Program, Value, Vm};
+use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{Callee, Const, Hook, Inst, ModuleBuilder, Policy, Reg, TypeDef, ValType};
 
 const D: ValType = ValType::Dyn;
@@ -120,7 +120,7 @@ fn generator() -> Result<(), Box<dyn std::error::Error>> {
     let main = m.add_function(f)?;
 
     let program = Program::load(m.finish()?, &Host::new())?;
-    let mut vm = Vm::new(&program);
+    let mut vm = Vm::with_limits(&program, Limits::untrusted());
     let out = vm.run(main, &[])?;
     println!("foreach (squares(4) as $k => $v):");
     for (k, v) in vm.entries(out).unwrap_or_default() {
@@ -219,7 +219,7 @@ fn tasks() -> Result<(), Box<dyn std::error::Error>> {
     let main = m.add_function(f)?;
 
     let program = Program::load(m.finish()?, &host)?;
-    let mut vm = Vm::new(&program);
+    let mut vm = Vm::with_limits(&program, Limits::untrusted());
     vm.run_async(main, &[])?;
     let order: Vec<String> = vm
         .global(log)

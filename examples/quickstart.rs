@@ -2,7 +2,7 @@
 //!
 //! `cargo run --example quickstart`
 
-use bvm_lang::{Host, Program, Value, Vm};
+use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{ExportItem, Inst, IntOp, IntTy, ModuleBuilder, Reg, ValType};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -52,7 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The bytes are what a compiler would write to disk.
     let bytes = bytecode_lang::encode(&m.finish()?);
     let program = Program::decode(&bytes, &Host::new())?;
-    let mut vm = Vm::new(&program);
+    let mut vm = Vm::with_limits(&program, Limits::untrusted());
     let out = vm.run_export("sum_to", &[Value::Int(1_000)])?;
     println!("sum_to(1000) = {out}"); // 500500
     println!("fuel used: {}", vm.fuel_used());

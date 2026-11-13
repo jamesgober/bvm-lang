@@ -31,7 +31,7 @@
 //! charged):
 //!
 //! ```
-//! use bvm_lang::{Host, Program, Value, Vm};
+//! use bvm_lang::{Host, Limits, Program, Value, Vm};
 //! use bytecode_lang::{Inst, IntOp, IntTy, ModuleBuilder, ValType};
 //!
 //! let mut m = ModuleBuilder::new();
@@ -53,7 +53,7 @@
 //! let sum = m.add_function(f).unwrap();
 //!
 //! let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
-//! let mut vm = Vm::new(&program);
+//! let mut vm = Vm::with_limits(&program, Limits::untrusted());
 //! assert_eq!(vm.run(sum, &[Value::Int(100)]), Ok(Value::Int(4950)));
 //! ```
 //!
@@ -64,10 +64,14 @@
 //!   dynamic instructions) bit for bit as OPS defines them; float results are
 //!   IEEE 754 with correctly rounded `sqrt` and `fma`, CPython's float floor
 //!   division, and the IEEE `remainder`.
-//! - **No panics, no unbounded work on untrusted modules.** Loading rejects
-//!   any module whose indices the interpreter could not trust; at run time
-//!   fuel bounds work, the memory budget bounds the heap, and depth and
-//!   stack limits bound frames. The crate is `#![forbid(unsafe_code)]`.
+//! - **No panics, and no unbounded work on untrusted modules under finite
+//!   limits.** Loading rejects any module whose indices the interpreter
+//!   could not trust; at run time fuel bounds work (instructions, and the
+//!   bytes they copy, hash, or compare), the memory budget bounds the heap,
+//!   and depth and stack limits bound frames. The default [`Limits`] are
+//!   finite; [`Limits::untrusted`] is the preset for code you do not
+//!   control, and [`Limits::trusted`] lifts the fuel limit for code you
+//!   trust. The crate is `#![forbid(unsafe_code)]`.
 //! - **Precise errors.** A failing instruction raises at its own pc without
 //!   writing its destination, so handlers see the registers as they were.
 //! - **LSB format 2** (bytecode-lang 0.3): dynamic calls bind to parameter

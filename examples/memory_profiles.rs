@@ -18,7 +18,7 @@
 //!
 //! `cargo run --example memory_profiles`
 
-use bvm_lang::{Host, HostCtx, Memory, Program, Value, Vm};
+use bvm_lang::{Host, HostCtx, Limits, Memory, Program, Value, Vm};
 use bytecode_lang::{
     Field, FieldIdx, Inst, IntTy, Method, ModuleBuilder, Reg, StructDef, TypeDef, ValType,
 };
@@ -149,6 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (p, main) = program()?;
     for memory in [Memory::Rc, Memory::Tracing] {
         let mut vm = Vm::with_memory(&p, memory);
+        vm.set_limits(Limits::untrusted());
         vm.set_destructor("__destruct")?;
         print!("{memory:?}: prints ");
         let x0 = vm.run(main, &[])?;

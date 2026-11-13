@@ -29,7 +29,7 @@
         <strong>MSRV is 1.85+</strong> (Rust 2024 edition). <code>no_std</code>-compatible (needs only <code>alloc</code>), <code>#![forbid(unsafe_code)]</code>, one dependency from the family: <a href="https://crates.io/crates/bytecode-lang"><code>bytecode-lang</code></a>.
     </p>
     <blockquote>
-        <strong>2.0.0-alpha.4 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB, and the alphas execute all 200 instructions of LSB format 2 (<code>bytecode-lang</code> 0.3); format 1 files are refused and must be regenerated. alpha.4 adds the reference-counting memory profile (decision D22). The API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what the alphas promise and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
+        <strong>2.0.0-alpha.5 is a pre-release.</strong> 2.0 replaces the 1.0 instruction set (<code>Op</code>/<code>Chunk</code>) with LSB, and the alphas execute all 200 instructions of LSB format 2 (<code>bytecode-lang</code> 0.3); format 1 files are refused and must be regenerated. alpha.4 added the reference-counting memory profile, and alpha.5 makes fuel pay for the data an instruction copies, hashes, or compares and makes the default limits finite. The API freezes at 2.0.0 after a real consumer has used it. See <a href="./docs/STABILITY.md"><code>docs/STABILITY.md</code></a> for what the alphas promise and <a href="./CHANGELOG.md"><code>CHANGELOG.md</code></a> for migrating from 1.0.
     </blockquote>
 </div>
 
@@ -67,6 +67,7 @@ What it guarantees, and how each guarantee is checked:
 | Maps behave like PHP arrays. | `tests/php_arrays.rs` checks random insert/push/delete sequences against a PHP 8.3 model, plus key kinds, signed zero and NaN keys, iteration while mutating, and value semantics through `dup`. |
 | `finally` works as LSB lowers it. | `tests/exceptions.rs` runs the canonical lowering for every exit (normal, return, throw, runtime error, break) with a plain finally, one that returns (overriding), and one that throws (replacing). |
 | Untrusted modules cannot panic, hang, or exhaust host memory. | `tests/untrusted.rs` runs random code over every opcode and randomly mutated encodings under tight limits; `tests/limits.rs` covers infinite loops without safepoints, infinite recursion, wide frames, hostile array lengths, and string doubling. |
+| Fuel bounds data work, not only instructions, and the default limits are finite. | `tests/fuel_work.rs`: loops that copy, compare, or hash 64 KiB strings stop within one unit per 256 bytes under both memory profiles; with the charge turned off the count is LSB's; the presets are finite. |
 | Garbage is reclaimed; live objects are not. | `tests/gc.rs`: a 50,000-link chain survives collections, cycles are collected, a loop allocating 200,000 arrays stays inside a 2 MiB budget, and every root kind keeps its objects. |
 
 <hr>
@@ -76,7 +77,7 @@ What it guarantees, and how each guarantee is checked:
 
 ```toml
 [dependencies]
-bvm-lang = "=2.0.0-alpha.4"
+bvm-lang = "=2.0.0-alpha.5"
 bytecode-lang = "0.3"
 ```
 
@@ -84,7 +85,7 @@ Without the standard library:
 
 ```toml
 [dependencies]
-bvm-lang = { version = "=2.0.0-alpha.4", default-features = false }
+bvm-lang = { version = "=2.0.0-alpha.5", default-features = false }
 ```
 
 <hr>
@@ -95,7 +96,7 @@ bvm-lang = { version = "=2.0.0-alpha.4", default-features = false }
 Build a module with `bytecode-lang`, load it, run it:
 
 ```rust
-use bvm_lang::{Host, Program, Value, Vm};
+use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{Inst, IntOp, IntTy, ModuleBuilder, Reg, ValType};
 
 // fn sum_to(n: i64) -> i64 { let mut s = 0; for i in 0..=n { s += i } s }
@@ -117,9 +118,14 @@ f.ret(s);
 let sum_to = m.add_function(f).unwrap();
 
 let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
-let mut vm = Vm::new(&program);
+let mut vm = Vm::with_limits(&program, Limits::untrusted());
 assert_eq!(vm.run(sum_to, &[Value::Int(100)]), Ok(Value::Int(5050)));
 ```
+
+`Limits::untrusted()` is the preset for code you do not control (10 million
+units of fuel, 64 MiB of heap). `Vm::new` uses `Limits::new()`, which is also
+finite (100 million units, 256 MiB); `Limits::trusted()` lifts the fuel limit
+for code you trust.
 
 ### Dynamic code: a PHP array
 
@@ -310,7 +316,9 @@ a PHP reference nothing else holds under `Memory::Rc`; the
 
 ### Untrusted code
 
-Budgets turn a hostile program into an error value with a location:
+Budgets turn a hostile program into an error value with a location. Fuel is
+charged per instruction and per 256 bytes an instruction copies, hashes, or
+compares, so a fixed budget bounds the time a run takes:
 
 ```rust
 use bvm_lang::{Host, Limits, Program, Vm, VmError};
@@ -322,7 +330,7 @@ f.emit(Inst::Jmp { target: Target(0) }); // no safepoint: fuel still bounds it
 let spin = m.add_function(f).unwrap();
 let program = Program::load(m.finish().unwrap(), &Host::new()).unwrap();
 
-let limits = Limits::new().with_fuel(1_000_000).with_memory(16 << 20).with_depth(512);
+let limits = Limits::untrusted().with_fuel(1_000_000).with_memory(16 << 20).with_depth(512);
 let err = Vm::with_limits(&program, limits).run(spin, &[]).unwrap_err();
 assert_eq!(err, VmError::Trap { kind: ErrorKind::OutOfFuel, func: spin, pc: 0 });
 assert_eq!(err.code(), Some(107)); // E0107
@@ -408,7 +416,7 @@ cargo bench --bench bench
 
 - **One 64-bit slot per register.** Every register, of every type, is a 64-bit word whose meaning comes from its declared LSB type. `dyn`, `str`, and `ref` registers share one encoding (LSB §2.1) in which the all-zero word is `nil`, so every LSB default (`false`, `0`, `+0.0`, `U+0000`, `nil`) is zero and new frames and objects are zero-filled.
 - **Load-time checks, run-time speed.** LSB's verifier is not written yet (bytecode-lang 0.5), and its decoder checks structure only. The loader therefore proves, once, every index the interpreter uses; the dispatch loop then indexes registers, globals, tables, and type lists without fallible lookups. It does not check the verifier's type discipline: a word of the wrong type decodes to *some* value, and heap accesses check object kinds, so an ill-typed module computes garbage or raises `TypeError` but cannot escape the VM.
-- **Fuel without a verifier.** LSB §5.14 charges fuel at safepoints, calls, hook invocations, taken backward branches, handler entries, and coroutine instructions, so no loop can avoid it, verified or not, and every tier reports `OutOfFuel` at the same pc.
+- **Fuel without a verifier.** LSB §5.14 charges fuel at safepoints, calls, hook invocations, taken backward branches, handler entries, and coroutine instructions, so no loop can avoid it, verified or not, and every tier reports `OutOfFuel` at the same pc. On top of that, an instruction that builds, copies, hashes, or compares data pays one unit per 256 bytes, so fuel bounds time even when one instruction moves a megabyte; `Limits::with_data_fuel(false)` turns that charge off for hosts that need the LSB count exactly.
 - **Coroutines copy on suspension.** A running coroutine's frames sit on the one flat frame stack above its resumer's; a `yield` moves them (registers included) into the coroutine object and a `resume` moves them back. The dispatch loop is unchanged (a register read is still one indexed load), and once a coroutine's buffers have grown to its deepest stack a switch allocates nothing.
 - **Close on drop from a finalization queue (tracing).** A traced heap cannot observe a coroutine's last reference going away when it happens. The collection that finds a suspended coroutine unreachable keeps it alive and queues it; while a close is queued, the fuel counter is set aside so the next charge takes its cold branch, which starts the close before that instruction. Closing costs nothing when nothing is queued. Under `Memory::Rc` the close starts at the last reference instead, through the same settling step as destructors.
 - **Precise errors.** A failing instruction breaks out before writing its destination, records its pc, and the unwinder searches that function's handlers in order, then each caller's at its call instruction.

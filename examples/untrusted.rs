@@ -43,7 +43,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let boom = m.add_function(boom)?;
 
     let program = Program::load(m.finish()?, &Host::new())?;
-    let limits = Limits::new()
+    let limits = Limits::untrusted()
         .with_fuel(1_000_000)
         .with_memory(8 << 20)
         .with_depth(256);
