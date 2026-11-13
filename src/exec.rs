@@ -62,7 +62,7 @@ use crate::dynv;
 use crate::error::VmError;
 use crate::fault::Fault;
 use crate::fmath;
-use crate::heap::{Callable, CellObj, FuncObj, Object, StructObj};
+use crate::heap::{Callable, CellObj, FuncObj, Object, StructObj, WORK_BYTES_PER_FUEL};
 use crate::int::{self, Bin, Cmp, Un};
 use crate::machine::{Charge, Cont, Driver, Machine, Next, Stop, Wake};
 use crate::pow;
@@ -140,6 +140,7 @@ fn begin(m: &mut Machine, fuel: u64) -> Vec<u64> {
     m.outcome = None;
     m.fuel = fuel;
     m.bank = None;
+    m.heap.clear_work();
     m.exit = None;
     m.floors.clear();
     m.set_finalizing(false);
@@ -489,8 +490,16 @@ fn run<const RC: bool>(
                         closure,
                         fi,
                     };
-                    match cold::<RC>(m, stack, prog, &cx, pc, inst) {
-                        Step::Next => {}
+                    let step = cold::<RC>(m, stack, prog, &cx, pc, inst);
+                    // Work proportional to data (copies, hashing,
+                    // comparing) is paid once the instruction is done.
+                    let work = m.heap.take_work();
+                    match step {
+                        Step::Next => {
+                            if work >= WORK_BYTES_PER_FUEL && m.data_fuel && !m.pay_work(work) {
+                                break 'dispatch (Fault::Trap(ErrorKind::OutOfFuel), true);
+                            }
+                        }
                         Step::Frame => continue 'frame,
                         Step::Fault(f) => break 'dispatch (f, true),
                         Step::Unwind(f) => break 'dispatch (f, false),
@@ -1900,7 +1909,10 @@ fn cold<const RC: bool>(
         Inst::StrEq { dst, lhs, rhs } => {
             let (a, b) = (r!(lhs), r!(rhs));
             let eq = match (m.heap.str(a), m.heap.str(b)) {
-                (Some(x), Some(y)) => x == y,
+                (Some(x), Some(y)) => {
+                    m.heap.note_work(x.len().min(y.len()));
+                    x == y
+                }
                 (None, _) => fail!(not_a(&m.heap, a)),
                 (_, None) => fail!(not_a(&m.heap, b)),
             };
@@ -1909,7 +1921,10 @@ fn cold<const RC: bool>(
         Inst::StrCmp { dst, lhs, rhs } => {
             let (a, b) = (r!(lhs), r!(rhs));
             let o = match (m.heap.str(a), m.heap.str(b)) {
-                (Some(x), Some(y)) => x.cmp(y),
+                (Some(x), Some(y)) => {
+                    m.heap.note_work(x.len().min(y.len()));
+                    x.cmp(y)
+                }
                 (None, _) => fail!(not_a(&m.heap, a)),
                 (_, None) => fail!(not_a(&m.heap, b)),
             };
@@ -1939,6 +1954,7 @@ fn cold<const RC: bool>(
                 (lo, hi)
             };
             gc!(hi - lo);
+            m.heap.note_work(hi - lo);
             let piece: alloc::boxed::Box<[u8]> = match m.heap.str(v) {
                 Some(b) => b[lo..hi].into(),
                 None => fail!(not_a(&m.heap, v)),
@@ -2398,6 +2414,7 @@ fn concat(m: &mut Machine, parts: &[u64], n: usize) -> Result<u64, Fault> {
     if !m.heap.fits(n.saturating_add(crate::heap::SLOT_BYTES)) {
         return Err(Fault::Trap(ErrorKind::OutOfMemory));
     }
+    m.heap.note_work(n);
     let mut out = Vec::with_capacity(n);
     for &p in parts {
         if let Some(b) = m.heap.str(p) {

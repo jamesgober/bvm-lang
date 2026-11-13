@@ -18,7 +18,7 @@
 //!
 //! `cargo run --example php_calls`
 
-use bvm_lang::{Host, Program, Value, Vm};
+use bvm_lang::{Host, Limits, Program, Value, Vm};
 use bytecode_lang::{
     ArgKind, Const, Inst, IntTy, ModuleBuilder, Param, ParamKind, ParamList, Policy, Prim, Reg,
     TypeDef, ValType,
@@ -304,7 +304,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main = m.add_function(f)?;
 
     let program = Program::load(m.finish()?, &Host::new())?;
-    let mut vm = Vm::new(&program);
+    let mut vm = Vm::with_limits(&program, Limits::untrusted());
     let result = vm.run(main, &[])?;
     println!("{}", show(&vm, result));
     // [[a => 6, b => 1], [[0, 2, 4], [1, 3, 5]], 2]

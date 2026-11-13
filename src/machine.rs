@@ -195,6 +195,9 @@ pub(crate) struct Machine {
     pub(crate) close_ready: bool,
     /// The fuel left in the current run (LSB §5.14).
     pub(crate) fuel: u64,
+    /// Data work (bytes copied, hashed, compared) costs fuel in this run
+    /// ([`Limits::data_fuel`](crate::Limits::data_fuel)).
+    pub(crate) data_fuel: bool,
     /// Fuel set aside while a drop-close is armed ([`Machine::arm_close`]).
     pub(crate) bank: Option<u64>,
     /// What the coroutine driven by the host did (set by its delivery).
@@ -275,6 +278,7 @@ impl Machine {
             finalizing: false,
             close_ready: false,
             fuel: 0,
+            data_fuel: true,
             bank: None,
             outcome: None,
             sched: Sched::default(),
@@ -700,7 +704,11 @@ impl Machine {
                     seed,
                     ..
                 } = self;
+                // What the host function does is the host's cost, not the
+                // module's: its data work is not charged as fuel.
+                let owed = heap.take_work();
                 let res = f(&mut HostCtx { heap, seed: *seed }, host_args);
+                heap.restore_work(owed);
                 host_args.clear();
                 res
             }

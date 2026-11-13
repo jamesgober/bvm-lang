@@ -102,6 +102,7 @@ pub(crate) fn dup(m: &mut Machine, prog: &Program, v: u64) -> Result<u64, Fault>
             if !m.heap.fits(s.fields.len().saturating_mul(8)) {
                 return Err(Fault::Trap(ErrorKind::OutOfMemory));
             }
+            m.heap.note_work(s.fields.len().saturating_mul(8));
             let mut fields = s.fields.clone();
             let ty = s.ty;
             if m.heap.rc {

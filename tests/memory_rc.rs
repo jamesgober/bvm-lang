@@ -1421,7 +1421,9 @@ fn the_memory_budget_follows_what_counting_frees() {
     let mut vm = Vm::with_memory(&p, Memory::Rc);
     vm.set_limits(Limits::new().with_memory(2 << 20));
     assert_eq!(vm.run(main, &[]), Ok(Value::Nil));
-    assert_eq!(vm.fuel_used(), 2_000, "every pass ran");
+    // Two units per pass, and 400 for the 12,800-element array (one per
+    // 256 bytes built).
+    assert_eq!(vm.fuel_used(), 2_400, "every pass ran");
     assert!(vm.heap_bytes() < 2 << 20);
     assert!(vm.memory_stats().freed >= 100_000);
 }

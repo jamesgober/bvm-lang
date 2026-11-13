@@ -12,7 +12,7 @@
 //!
 //! `cargo run --example php_arrays`
 
-use bvm_lang::{Host, HostError, Program, Value, Vm};
+use bvm_lang::{Host, HostError, Limits, Program, Value, Vm};
 use bytecode_lang::{
     Callee, Const, ErrorKind, Hook, Inst, ModuleBuilder, Policy, TypeDef, ValType,
 };
@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let main = m.add_function(f)?;
 
     let program = Program::load(m.finish()?, &host)?;
-    let mut vm = Vm::new(&program);
+    let mut vm = Vm::with_limits(&program, Limits::untrusted());
     let hits = vm.run(main, &[])?;
     println!("hits = {hits}"); // 1
     Ok(())

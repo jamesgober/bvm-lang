@@ -6,7 +6,8 @@
 //! key; integers, floats, and identities, which are far more frequent and
 //! cheap to compare, go through a keyed 64-bit mixer. With the `std` feature
 //! the key is random per VM; without it the key is fixed (documented), since
-//! `core` has no entropy source.
+//! `core` has no entropy source, and the host can supply one with
+//! [`Vm::set_hash_seed`](crate::Vm::set_hash_seed).
 //!
 //! Map iteration order is insertion order and never depends on hashes, so the
 //! key changes nothing a program can observe except timing.
@@ -40,6 +41,14 @@ impl Seed {
                 k0: 0x0706_0504_0302_0100,
                 k1: 0x0F0E_0D0C_0B0A_0908,
             }
+        }
+    }
+
+    /// A key the host supplies (low 64 bits first).
+    pub(crate) fn from_u128(key: u128) -> Seed {
+        Seed {
+            k0: key as u64,
+            k1: (key >> 64) as u64,
         }
     }
 

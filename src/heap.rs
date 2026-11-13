@@ -68,6 +68,7 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use bytecode_lang::{CoroState, ErrorKind, Kind, ValType};
 
@@ -299,6 +300,14 @@ impl Object {
     }
 }
 
+/// Bytes of data work (copied, hashed, or compared) that cost one extra unit
+/// of fuel, per instruction, rounded down: an instruction that moves less
+/// costs nothing extra, so ordinary code keeps LSB's exact fuel, while one
+/// that copies a megabyte pays 4,096 units. Copying 256 bytes takes about as
+/// long as running a few instructions, which is what one unit pays for in a
+/// short loop.
+pub(crate) const WORK_BYTES_PER_FUEL: usize = 256;
+
 /// Bytes charged per object for its slot and header.
 pub(crate) const SLOT_BYTES: usize = core::mem::size_of::<Slot>() + 16;
 
@@ -399,6 +408,10 @@ pub(crate) struct Heap {
     pub(crate) dtors: Vec<u32>,
     /// Pooled word list for gathering an object's children.
     scratch: Vec<u64>,
+    /// Bytes of data work (copies, hashing, comparing) not yet paid for in
+    /// fuel. Atomic only so the read-only lookups can add to it; it is
+    /// never shared between threads, and plain loads and stores suffice.
+    work_bytes: AtomicUsize,
 }
 
 impl Heap {
@@ -424,7 +437,43 @@ impl Heap {
             rc_max: u32::MAX,
             dtors: Vec::new(),
             scratch: Vec::new(),
+            work_bytes: AtomicUsize::new(0),
         }
+    }
+
+    /// Whether any live object is a map.
+    pub(crate) fn holds_map(&self) -> bool {
+        self.slots
+            .iter()
+            .any(|s| matches!(s.obj, Some(Object::Map(_))))
+    }
+
+    /// Records `bytes` of data work (a copy, a hash, a comparison). The
+    /// dispatch loop takes it when the instruction finishes and charges
+    /// fuel for it.
+    #[inline]
+    pub(crate) fn note_work(&self, bytes: usize) {
+        let w = self.work_bytes.load(Ordering::Relaxed);
+        self.work_bytes
+            .store(w.saturating_add(bytes), Ordering::Relaxed);
+    }
+
+    /// Takes the data work recorded since the last take (the work of one
+    /// instruction), leaving zero.
+    #[inline]
+    pub(crate) fn take_work(&mut self) -> usize {
+        core::mem::take(self.work_bytes.get_mut())
+    }
+
+    /// Puts back work taken with [`take_work`](Heap::take_work) (a host
+    /// call's own work is not the module's to pay for).
+    pub(crate) fn restore_work(&mut self, bytes: usize) {
+        *self.work_bytes.get_mut() = bytes;
+    }
+
+    /// Forgets recorded work (the start of a run).
+    pub(crate) fn clear_work(&mut self) {
+        *self.work_bytes.get_mut() = 0;
     }
 
     /// Bytes currently charged.

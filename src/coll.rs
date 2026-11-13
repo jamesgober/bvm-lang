@@ -125,7 +125,10 @@ pub(crate) fn normalize_key(kty: ValType, key: u64) -> u64 {
 pub(crate) fn hash_key(heap: &Heap, seed: Seed, kty: ValType, key: u64) -> u64 {
     match kty {
         ValType::Str => match heap.str(key) {
-            Some(b) => seed.bytes(b),
+            Some(b) => {
+                heap.note_work(b.len());
+                seed.bytes(b)
+            }
             None => seed.word(key),
         },
         ValType::Dyn => {
@@ -133,7 +136,10 @@ pub(crate) fn hash_key(heap: &Heap, seed: Seed, kty: ValType, key: u64) -> u64 {
                 return seed.word(dynv::inline_int_value(key) as u64);
             }
             match heap.get(key) {
-                Some(Object::Str(b)) => seed.bytes(b),
+                Some(Object::Str(b)) => {
+                    heap.note_work(b.len());
+                    seed.bytes(b)
+                }
                 Some(Object::Int(i)) => seed.word(*i as u64),
                 _ => seed.word(key),
             }
@@ -149,9 +155,12 @@ pub(crate) fn key_eq(heap: &Heap, kty: ValType, a: u64, b: u64) -> bool {
         return true;
     }
     match kty {
-        ValType::Str => matches!((heap.str(a), heap.str(b)), (Some(x), Some(y)) if x == y),
+        ValType::Str => match (heap.str(a), heap.str(b)) {
+            (Some(x), Some(y)) => str_eq(heap, x, y),
+            _ => false,
+        },
         ValType::Dyn => match (heap.get(a), heap.get(b)) {
-            (Some(Object::Str(x)), Some(Object::Str(y))) => x == y,
+            (Some(Object::Str(x)), Some(Object::Str(y))) => str_eq(heap, x, y),
             // Ints in the inline range are always inline, so a boxed int
             // can only equal another boxed int.
             (Some(Object::Int(x)), Some(Object::Int(y))) => x == y,
@@ -159,6 +168,17 @@ pub(crate) fn key_eq(heap: &Heap, kty: ValType, a: u64, b: u64) -> bool {
         },
         _ => false,
     }
+}
+
+/// Byte-string equality, recording the comparison as data work (only equal
+/// lengths compare bytes).
+#[inline]
+fn str_eq(heap: &Heap, x: &[u8], y: &[u8]) -> bool {
+    if x.len() != y.len() {
+        return false;
+    }
+    heap.note_work(x.len());
+    x == y
 }
 
 /// The integer value of a key, for the next-integer-key rule.
@@ -261,10 +281,13 @@ pub(crate) fn map_get_bytes(heap: &Heap, seed: Seed, map: u64, name: &[u8]) -> O
     if !matches!(m.key, ValType::Str | ValType::Dyn) {
         return None;
     }
+    heap.note_work(name.len());
     let hash = seed.bytes(name);
     let w = m
         .store
-        .find(hash, None, |k| heap.str(k) == Some(name))
+        .find(hash, None, |k| {
+            heap.str(k).is_some_and(|b| str_eq(heap, b, name))
+        })
         .and_then(|p| m.store.entry(p))
         .map(|e| e.value)?;
     Some(if m.value == ValType::Dyn {
@@ -306,6 +329,8 @@ pub(crate) fn map_store_mut(
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    // Separating shared storage copies it.
+    heap.note_work(shared_bytes);
     if let Some(old) = old {
         heap.mark_aliased(
             old.entries()
@@ -349,6 +374,8 @@ fn map_store_mut_counted(heap: &mut Heap, map: u64, extra: usize) -> Result<&mut
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    // Separating shared storage copies it.
+    heap.note_work(shared_bytes);
     let mut unbound = Vec::new();
     if let Some(old) = old {
         // `old` is one more holder of the storage: physically shared means
@@ -768,6 +795,8 @@ pub(crate) fn array_items_mut(
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    // Separating shared storage copies it.
+    heap.note_work(shared_bytes);
     if let Some(old) = old {
         heap.mark_aliased(old.iter().copied());
     }
@@ -807,6 +836,8 @@ fn array_items_mut_counted(
         return Err(Fault::type_error());
     }
     heap.charge(shared_bytes.saturating_add(extra))?;
+    // Separating shared storage copies it.
+    heap.note_work(shared_bytes);
     let mut unbound = Vec::new();
     if let Some(old) = old {
         // `old` is one more holder of the storage: physically shared means
@@ -963,6 +994,7 @@ pub(crate) fn new_array(heap: &mut Heap, elem: ValType, len: i64) -> Result<u64,
     if n > isize::MAX as usize / 8 || !heap.fits(n.saturating_mul(8)) {
         return Err(Fault::Trap(ErrorKind::OutOfMemory));
     }
+    heap.note_work(n.saturating_mul(8));
     heap.alloc(Object::Array(ArrayObj {
         elem,
         frozen: false,
@@ -978,6 +1010,7 @@ pub(crate) fn new_dyn_array(heap: &mut Heap, items: Vec<u64>) -> Result<u64, Fau
     if !heap.fits(items.len().saturating_mul(8)) {
         return Err(Fault::Trap(ErrorKind::OutOfMemory));
     }
+    heap.note_work(items.len().saturating_mul(8));
     heap.alloc(Object::Array(ArrayObj {
         elem: ValType::Dyn,
         frozen: false,

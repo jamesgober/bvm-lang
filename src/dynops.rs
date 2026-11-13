@@ -273,7 +273,10 @@ pub(crate) fn eq_builtin(heap: &Heap, a: u64, b: u64) -> Option<bool> {
         (Raw::Bool(x), Raw::Bool(y)) => Some(x == y),
         (Raw::Char(x), Raw::Char(y)) => Some(x == y),
         (Raw::Ref(..), Raw::Ref(..)) => match (heap.str(a), heap.str(b)) {
-            (Some(x), Some(y)) => Some(x == y),
+            (Some(x), Some(y)) => {
+                heap.note_work(x.len().min(y.len()));
+                Some(x == y)
+            }
             _ => None,
         },
         _ => None,
@@ -293,7 +296,10 @@ pub(crate) fn lt_builtin(heap: &Heap, a: u64, b: u64, le: bool) -> Option<bool> 
         match (dynv::decode(a), dynv::decode(b)) {
             (Raw::Char(x), Raw::Char(y)) => x.cmp(&y),
             (Raw::Ref(..), Raw::Ref(..)) => match (heap.str(a), heap.str(b)) {
-                (Some(x), Some(y)) => x.cmp(y),
+                (Some(x), Some(y)) => {
+                    heap.note_work(x.len().min(y.len()));
+                    x.cmp(y)
+                }
                 _ => return None,
             },
             _ => return None,

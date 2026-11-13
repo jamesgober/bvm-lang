@@ -10,6 +10,7 @@ use crate::dynv;
 use crate::error::VmError;
 use crate::exec;
 use crate::fault::Fault;
+use crate::hash::Seed;
 use crate::heap::{NO_DTOR, Object};
 use crate::host;
 use crate::machine::{Machine, Stop, Wake};
@@ -93,15 +94,22 @@ pub struct MemoryStats {
 
 /// The budgets a run executes under.
 ///
-/// Every budget is enforced deterministically, so an untrusted module cannot
-/// run forever, exhaust memory, or overflow the native stack:
+/// Every budget is enforced deterministically, so with finite limits an
+/// untrusted module cannot run forever, exhaust memory, or overflow the
+/// native stack:
 ///
-/// - **fuel**: units charged at every `safepoint`, call-family instruction
+/// - **fuel**: one unit at every `safepoint`, call-family instruction
 ///   (calls, tail calls, host calls, hook invocations), taken backward
 ///   branch, handler entry, coroutine instruction, and `iter_next` over a
-///   coroutine (the rule of LSB §5.14). Exhausting it is the `OutOfFuel`
-///   trap (E0107). Execution between two charges is bounded by the length of
-///   one function, so fuel bounds total work.
+///   coroutine (the rule of LSB §5.14), plus one unit per 256 bytes of data
+///   an instruction builds, copies, hashes, or compares, rounded down per
+///   instruction (building or slicing a string, a new array, separating
+///   shared array or map storage, hashing or comparing a string key; work
+///   inside host functions is not charged). Exhausting it is the
+///   `OutOfFuel` trap (E0107). Execution
+///   between two charges is bounded by the length of one function, and the
+///   data work is paid for when the instruction that did it finishes, so
+///   fuel bounds total work.
 /// - **memory**: bytes of heap objects (strings, arrays, maps, structs,
 ///   closures, cells, iterators, error values, boxed ints). Exceeding it is
 ///   the `OutOfMemory` trap (E0106). Accounting is approximate (headers and
@@ -114,14 +122,23 @@ pub struct MemoryStats {
 ///   it also raises `StackOverflow`. Suspended coroutines' registers count
 ///   against the memory budget instead.
 ///
+/// Three presets:
+///
+/// | preset | fuel | memory | depth | register slots |
+/// |---|---|---|---|---|
+/// | [`untrusted`](Limits::untrusted) | 10,000,000 | 64 MiB | 1,000 | 1 Mi (8 MiB) |
+/// | [`new`](Limits::new) (the default) | 100,000,000 | 256 MiB | 10,000 | 4 Mi (32 MiB) |
+/// | [`trusted`](Limits::trusted) | unlimited | 1 GiB | 10,000 | 4 Mi (32 MiB) |
+///
 /// # Examples
 ///
 /// ```
 /// use bvm_lang::Limits;
 ///
-/// let tight = Limits::new().with_fuel(10_000).with_memory(1 << 20).with_depth(64);
+/// let tight = Limits::untrusted().with_fuel(10_000).with_memory(1 << 20).with_depth(64);
 /// assert_eq!(tight.fuel(), 10_000);
-/// assert_eq!(Limits::default().fuel(), u64::MAX);
+/// assert_eq!(Limits::default().fuel(), 100_000_000);
+/// assert_eq!(Limits::trusted().fuel(), u64::MAX);
 /// ```
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -129,6 +146,7 @@ pub struct Limits {
     memory: usize,
     depth: usize,
     stack: usize,
+    data_fuel: bool,
 }
 
 impl Default for Limits {
@@ -138,9 +156,11 @@ impl Default for Limits {
 }
 
 impl Limits {
-    /// The defaults: unlimited fuel, 1 GiB of heap, 10,000 frames, and 4 Mi
-    /// register slots (32 MiB). Set fuel and memory explicitly for untrusted
-    /// code.
+    /// The defaults: 100,000,000 units of fuel, 256 MiB of heap, 10,000
+    /// frames, and 4 Mi register slots (32 MiB). Every budget is finite, so
+    /// a module that loops forever ends with `OutOfFuel`. For code you do
+    /// not control, start from [`untrusted`](Limits::untrusted) and size the
+    /// fuel to the time you can spend.
     ///
     /// # Examples
     ///
@@ -148,14 +168,61 @@ impl Limits {
     /// use bvm_lang::Limits;
     ///
     /// assert_eq!(Limits::new().depth(), 10_000);
+    /// assert_eq!(Limits::new().memory(), 256 << 20);
     /// ```
     #[must_use]
     pub const fn new() -> Limits {
+        Limits {
+            fuel: 100_000_000,
+            memory: 256 << 20,
+            depth: 10_000,
+            stack: 4 << 20,
+            data_fuel: true,
+        }
+    }
+
+    /// Tight budgets for code you do not control: 10,000,000 units of fuel,
+    /// 64 MiB of heap, 1,000 frames, and 1 Mi register slots (8 MiB).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::Limits;
+    ///
+    /// let l = Limits::untrusted();
+    /// assert_eq!((l.fuel(), l.memory(), l.depth()), (10_000_000, 64 << 20, 1_000));
+    /// ```
+    #[must_use]
+    pub const fn untrusted() -> Limits {
+        Limits {
+            fuel: 10_000_000,
+            memory: 64 << 20,
+            depth: 1_000,
+            stack: 1 << 20,
+            data_fuel: true,
+        }
+    }
+
+    /// No fuel limit and 1 GiB of heap, with the default depth and register
+    /// slots: for code you trust to finish. A module that loops forever runs
+    /// forever under these limits.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::Limits;
+    ///
+    /// assert_eq!(Limits::trusted().fuel(), u64::MAX);
+    /// assert_eq!(Limits::trusted().memory(), 1 << 30);
+    /// ```
+    #[must_use]
+    pub const fn trusted() -> Limits {
         Limits {
             fuel: u64::MAX,
             memory: 1 << 30,
             depth: 10_000,
             stack: 4 << 20,
+            data_fuel: true,
         }
     }
 
@@ -216,12 +283,43 @@ impl Limits {
         }
     }
 
+    /// Sets whether data work costs fuel (on in every preset): one unit
+    /// per 256 bytes an instruction builds, copies, hashes, or compares.
+    /// Off, fuel is charged at LSB §5.14's points only, the count every
+    /// tier agrees on, and the work one unit pays for is bounded only by
+    /// the memory budget, so turn it off only for code you trust.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let lsb = bvm_lang::Limits::new().with_data_fuel(false);
+    /// assert!(!lsb.data_fuel());
+    /// assert!(bvm_lang::Limits::untrusted().data_fuel());
+    /// ```
+    #[must_use]
+    pub const fn with_data_fuel(self, on: bool) -> Limits {
+        Limits {
+            data_fuel: on,
+            ..self
+        }
+    }
+
+    /// Whether data work costs fuel.
+    ///
+    /// # Examples
+    ///
+    /// See [`with_data_fuel`](Limits::with_data_fuel).
+    #[must_use]
+    pub const fn data_fuel(&self) -> bool {
+        self.data_fuel
+    }
+
     /// The fuel budget.
     ///
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(bvm_lang::Limits::new().fuel(), u64::MAX);
+    /// assert_eq!(bvm_lang::Limits::new().fuel(), 100_000_000);
     /// ```
     #[must_use]
     pub const fn fuel(&self) -> u64 {
@@ -233,7 +331,7 @@ impl Limits {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(bvm_lang::Limits::new().memory(), 1 << 30);
+    /// assert_eq!(bvm_lang::Limits::new().memory(), 256 << 20);
     /// ```
     #[must_use]
     pub const fn memory(&self) -> usize {
@@ -303,7 +401,9 @@ pub struct Vm<'p> {
 }
 
 impl<'p> Vm<'p> {
-    /// An instance of `program` with the default [`Limits`].
+    /// An instance of `program` with the default [`Limits`]: finite fuel
+    /// and memory ([`Limits::new`]). Use [`with_limits`](Vm::with_limits)
+    /// and [`Limits::untrusted`] for code you do not control.
     ///
     /// # Examples
     ///
@@ -377,6 +477,34 @@ impl<'p> Vm<'p> {
             ready: false,
             fuel_used: 0,
         }
+    }
+
+    /// Sets the 128-bit key that map keys are hashed with, for a host that
+    /// has its own entropy. With the `std` feature every VM already gets a
+    /// random key; without it the key is a fixed constant, and a module that
+    /// knows it can choose string keys that collide, which makes building a
+    /// map quadratic. A `no_std` host that runs untrusted modules should
+    /// call this with a random value before the first run.
+    ///
+    /// Returns `false`, changing nothing, once the heap holds a map (its
+    /// entries are placed under the old key).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use bvm_lang::{Host, Program, Vm};
+    /// use bytecode_lang::ModuleBuilder;
+    ///
+    /// let p = Program::load(ModuleBuilder::new().finish().unwrap(), &Host::new()).unwrap();
+    /// let mut vm = Vm::new(&p);
+    /// assert!(vm.set_hash_seed(0x0123_4567_89ab_cdef_0f1e_2d3c_4b5a_6978));
+    /// ```
+    pub fn set_hash_seed(&mut self, seed: u128) -> bool {
+        if self.m.heap.holds_map() {
+            return false;
+        }
+        self.m.seed = Seed::from_u128(seed);
+        true
     }
 
     /// The memory profile.
@@ -622,6 +750,7 @@ impl<'p> Vm<'p> {
         self.m.heap.limit = limits.memory;
         self.m.max_depth = limits.depth;
         self.m.max_stack = limits.stack;
+        self.m.data_fuel = limits.data_fuel;
         let mut fuel = limits.fuel;
         let result = self.run_inner(func, args, &mut fuel);
         self.fuel_used = limits.fuel - fuel;
@@ -749,6 +878,7 @@ impl<'p> Vm<'p> {
         self.m.heap.limit = limits.memory;
         self.m.max_depth = limits.depth;
         self.m.max_stack = limits.stack;
+        self.m.data_fuel = limits.data_fuel;
         let mut fuel = limits.fuel;
         let result = self.async_inner(func, args, &mut fuel);
         // Unfinished tasks are dropped (closed when they die: at once in
@@ -903,6 +1033,7 @@ impl<'p> Vm<'p> {
         self.m.heap.limit = limits.memory;
         self.m.max_depth = limits.depth;
         self.m.max_stack = limits.stack;
+        self.m.data_fuel = limits.data_fuel;
         let mut fuel = limits.fuel;
         let result = exec::finalize_all(&mut self.m, self.prog, &mut fuel);
         self.fuel_used = limits.fuel - fuel;
